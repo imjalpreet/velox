@@ -19,6 +19,7 @@
 #include "velox/common/base/Fs.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HiveDataSink.h"
+#include "velox/connectors/hive/iceberg/IcebergDataSink.h"
 #include "velox/connectors/hive/HiveDataSource.h"
 #include "velox/connectors/hive/HivePartitionFunction.h"
 #include "velox/dwio/dwrf/RegisterDwrfReader.h"
@@ -100,16 +101,27 @@ std::unique_ptr<DataSink> HiveConnector::createDataSink(
     std::shared_ptr<ConnectorInsertTableHandle> connectorInsertTableHandle,
     ConnectorQueryCtx* connectorQueryCtx,
     CommitStrategy commitStrategy) {
-  auto hiveInsertHandle = std::dynamic_pointer_cast<HiveInsertTableHandle>(
-      connectorInsertTableHandle);
-  VELOX_CHECK_NOT_NULL(
-      hiveInsertHandle, "Hive connector expecting hive write handle!");
-  return std::make_unique<HiveDataSink>(
-      inputType,
-      hiveInsertHandle,
-      connectorQueryCtx,
-      commitStrategy,
-      hiveConfig_);
+  if (auto icebergInsertHandle = std::dynamic_pointer_cast<iceberg::IcebergInsertTableHandle>(connectorInsertTableHandle)) {
+    VELOX_CHECK_NOT_NULL(
+        icebergInsertHandle, "Hive Iceberg connector expecting iceberg write handle!");
+    return std::make_unique<iceberg::IcebergDataSink>(
+        inputType,
+        icebergInsertHandle,
+        connectorQueryCtx,
+        commitStrategy,
+        hiveConfig_);
+  }
+
+  if (auto hiveInsertHandle = std::dynamic_pointer_cast<HiveInsertTableHandle>(connectorInsertTableHandle)) {
+    VELOX_CHECK_NOT_NULL(
+        hiveInsertHandle, "Hive connector expecting hive write handle!");
+    return std::make_unique<HiveDataSink>(
+        inputType,
+        hiveInsertHandle,
+        connectorQueryCtx,
+        commitStrategy,
+        hiveConfig_);
+  }
 }
 
 std::unique_ptr<core::PartitionFunction> HivePartitionFunctionSpec::create(

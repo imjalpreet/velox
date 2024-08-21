@@ -436,7 +436,7 @@ class HiveDataSink : public DataSink {
 
   bool canReclaim() const;
 
- private:
+ protected:
   enum class State { kRunning = 0, kAborted = 1, kClosed = 2 };
   friend struct fmt::formatter<
       facebook::velox::connector::hive::HiveDataSink::State>;
@@ -554,7 +554,7 @@ class HiveDataSink : public DataSink {
   }
 
   // Invoked to write 'input' to the specified file writer.
-  void write(size_t index, RowVectorPtr input);
+  virtual void write(size_t index, RowVectorPtr input);
 
   void closeInternal();
 

@@ -13,10 +13,10 @@
 # limitations under the License.
 
 add_library(
-  velox_hive_iceberg_splitreader IcebergSplitReader.cpp IcebergSplit.cpp
-                                 PositionalDeleteFileReader.cpp)
+  velox_hive_iceberg_connector IcebergSplitReader.cpp IcebergSplit.cpp
+                                 PositionalDeleteFileReader.cpp IcebergDataSink.cpp)
 
-target_link_libraries(velox_hive_iceberg_splitreader velox_connector
+target_link_libraries(velox_hive_iceberg_connector velox_connector
                       Folly::folly)
 
 if(${VELOX_BUILD_TESTING})
