@@ -19,6 +19,7 @@
 #include "velox/exec/VectorHasher.h"
 #include "velox/exec/tests/utils/RowContainerTestBase.h"
 #include "velox/expression/VectorReaders.h"
+#include "velox/type/tests/utils/CustomTypesForTesting.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
 using namespace facebook::velox;
@@ -1951,15 +1952,15 @@ TEST_F(RowContainerTest, nextRowVector) {
   };
 
   auto validateNextRowVector = [&]() {
-    for (int i = 0; i < rows.size(); i++) {
+    for (int i = 0; i < rows.size(); ++i) {
       auto vector = data->getNextRowVector(rows[i]);
       if (vector) {
         auto iter = std::find(vector->begin(), vector->end(), rows[i]);
-        EXPECT_NE(iter, vector->end());
-        EXPECT_TRUE(vector->size() <= 2 && vector->size() > 0);
+        ASSERT_NE(iter, vector->end());
+        ASSERT_TRUE(vector->size() <= 2 && vector->size() > 0);
         for (auto next : *vector) {
-          EXPECT_EQ(data->getNextRowVector(next), vector);
-          EXPECT_TRUE(std::find(rows.begin(), rows.end(), next) != rows.end());
+          ASSERT_EQ(data->getNextRowVector(next), vector);
+          ASSERT_TRUE(std::find(rows.begin(), rows.end(), next) != rows.end());
         }
       }
     }
@@ -1969,18 +1970,18 @@ TEST_F(RowContainerTest, nextRowVector) {
     for (int i = 0; i < numRows; ++i) {
       rows.push_back(data->newRow());
       rowSet.insert(rows.back());
-      EXPECT_EQ(data->getNextRowVector(rows.back()), nullptr);
+      ASSERT_EQ(data->getNextRowVector(rows.back()), nullptr);
     }
-    EXPECT_EQ(numRows, data->numRows());
+    ASSERT_EQ(numRows, data->numRows());
     std::vector<char*> rowsFromContainer(numRows);
     RowContainerIterator iter;
-    EXPECT_EQ(
+    ASSERT_EQ(
         data->listRows(&iter, numRows, rowsFromContainer.data()), numRows);
-    EXPECT_EQ(0, data->listRows(&iter, numRows, rows.data()));
-    EXPECT_EQ(rows, rowsFromContainer);
+    ASSERT_EQ(0, data->listRows(&iter, numRows, rows.data()));
+    ASSERT_EQ(rows, rowsFromContainer);
 
     for (int i = 0; i + 2 <= numRows; i += 2) {
-      data->appendNextRow(rows[i], rows[i + 1]);
+      data->appendNextRow(rows[i], rows[i + 1], &data->stringAllocator());
     }
     validateNextRowVector();
   };
@@ -2008,7 +2009,6 @@ TEST_F(RowContainerTest, nextRowVector) {
   std::vector<int> eraseRows(numRows);
   std::iota(eraseRows.begin(), eraseRows.end(), 0);
   nextRowVectorEraseValidation(eraseRows);
-
   VELOX_ASSERT_THROW(
       nextRowVectorEraseValidation({1}),
       "All rows with the same keys must be present in 'rows'");
@@ -2169,4 +2169,124 @@ TEST_F(RowContainerTest, store) {
       assertEqualVectors(rowVector->childAt(i), vector);
     }
   }
+}
+
+TEST_F(RowContainerTest, customComparison) {
+  auto values = makeNullableFlatVector<int64_t>(
+      {std::nullopt,
+       256 * 4 + 3,
+       256 * 2 + 4,
+       256 + 2,
+       5,
+       256 * 5,
+       256 * 2 + 1},
+      BIGINT_TYPE_WITH_CUSTOM_COMPARISON());
+
+  // The custom comparison compares the values mod 256.
+  std::vector<std::optional<int64_t>> ascNullsFirstOrder = {
+      std::nullopt, 256 * 5, 256 * 2 + 1, 256 + 2, 256 * 4 + 3, 256 * 2 + 4, 5};
+
+  testOrderAndEqualsWithNullsFirstVariations<int64_t>(
+      BIGINT_TYPE_WITH_CUSTOM_COMPARISON(),
+      values,
+      ascNullsFirstOrder,
+      [&](const auto& expectedOrder) {
+        return makeNullableFlatVector<int64_t>(
+            expectedOrder, BIGINT_TYPE_WITH_CUSTOM_COMPARISON());
+      });
+}
+
+TEST_F(RowContainerTest, customComparisonArray) {
+  auto values = makeNullableArrayVector<int64_t>(
+      {std::nullopt,
+       {{std::nullopt}},
+       {{256 * 4 + 3}},
+       {{256 * 2 + 4}},
+       {{256 + 2}},
+       {{5}},
+       {{256 * 5}},
+       {{256 * 2 + 1}}},
+      ARRAY(BIGINT_TYPE_WITH_CUSTOM_COMPARISON()));
+
+  // The custom comparison compares the values mod 256.
+  std::vector<std::optional<std::vector<std::optional<int64_t>>>>
+      ascNullsFirstOrder = {
+          std::nullopt,
+          {{std::nullopt}},
+          {{256 * 5}},
+          {{256 * 2 + 1}},
+          {{256 + 2}},
+          {{256 * 4 + 3}},
+          {{256 * 2 + 4}},
+          {{5}}};
+
+  testOrderAndEqualsWithNullsFirstVariations<
+      std::vector<std::optional<int64_t>>>(
+      ARRAY(BIGINT_TYPE_WITH_CUSTOM_COMPARISON()),
+      values,
+      ascNullsFirstOrder,
+      [&](const auto& expectedOrder) {
+        return makeNullableArrayVector<int64_t>(
+            expectedOrder, ARRAY(BIGINT_TYPE_WITH_CUSTOM_COMPARISON()));
+      });
+}
+
+TEST_F(RowContainerTest, customComparisonMap) {
+  auto values = makeNullableMapVector<int64_t, int32_t>(
+      {{{std::nullopt}},
+       {{{256 * 4 + 3, 1}}},
+       {{{256 * 2 + 4, 2}}},
+       {{{256 + 2, 3}}},
+       {{{5, 4}}},
+       {{{256 * 5, 5}}},
+       {{{256 * 2 + 1, 6}}}},
+      MAP(BIGINT_TYPE_WITH_CUSTOM_COMPARISON(), INTEGER()));
+
+  // The custom comparison compares the values mod 256.
+  std::vector<
+      std::optional<std::vector<std::pair<int64_t, std::optional<int32_t>>>>>
+      ascNullsFirstOrder = {
+          {{std::nullopt}},
+          {{{256 * 5, 5}}},
+          {{{256 * 2 + 1, 6}}},
+          {{{256 + 2, 3}}},
+          {{{256 * 4 + 3, 1}}},
+          {{{256 * 2 + 4, 2}}},
+          {{{5, 4}}}};
+
+  testOrderAndEqualsWithNullsFirstVariations<
+      std::vector<std::pair<int64_t, std::optional<int32_t>>>>(
+      MAP(BIGINT_TYPE_WITH_CUSTOM_COMPARISON(), INTEGER()),
+      values,
+      ascNullsFirstOrder,
+      [&](const auto& expectedOrder) {
+        return makeNullableMapVector<int64_t, int32_t>(
+            expectedOrder,
+            MAP(BIGINT_TYPE_WITH_CUSTOM_COMPARISON(), INTEGER()));
+      });
+}
+
+TEST_F(RowContainerTest, customComparisonRow) {
+  auto values = makeRowVector({makeNullableFlatVector<int64_t>(
+      {std::nullopt,
+       256 * 4 + 3,
+       256 * 2 + 4,
+       256 + 2,
+       5,
+       256 * 5,
+       256 * 2 + 1},
+      BIGINT_TYPE_WITH_CUSTOM_COMPARISON())});
+
+  // The custom comparison compares the values mod 256.
+  std::vector<std::optional<int64_t>> ascNullsFirstOrder = {
+      std::nullopt, 256 * 5, 256 * 2 + 1, 256 + 2, 256 * 4 + 3, 256 * 2 + 4, 5};
+
+  testOrderAndEqualsWithNullsFirstVariations<int64_t>(
+      ROW({BIGINT_TYPE_WITH_CUSTOM_COMPARISON()}),
+      values,
+      ascNullsFirstOrder,
+      [&](const auto& expectedOrder) {
+        return makeRowVector({makeNullableFlatVector<int64_t>(
+            expectedOrder, BIGINT_TYPE_WITH_CUSTOM_COMPARISON())});
+      });
 }
