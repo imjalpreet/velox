@@ -18,6 +18,10 @@
 
 #include "velox/dwio/common/SelectiveColumnReader.h"
 
+namespace facebook::nimble {
+class DeduplicatedReadHelper;
+}
+
 namespace facebook::velox::dwio::common {
 
 // Abstract superclass for list and map readers. Encapsulates common
@@ -37,11 +41,8 @@ class SelectiveRepeatedColumnReader : public SelectiveColumnReader {
       FormatParams& params,
       velox::common::ScanSpec& scanSpec,
       std::shared_ptr<const dwio::common::TypeWithId> type)
-      : SelectiveColumnReader(
-            requestedType,
-            std::move(type),
-            params,
-            scanSpec) {}
+      : SelectiveColumnReader(requestedType, std::move(type), params, scanSpec),
+        nestedRowsHolder_(memoryPool_) {}
 
   /// Reads 'numLengths' next lengths into 'result'. If 'nulls' is
   /// non-null, each kNull bit signifies a null with a length of 0 to
@@ -52,7 +53,7 @@ class SelectiveRepeatedColumnReader : public SelectiveColumnReader {
   readLengths(int32_t* lengths, int32_t numLengths, const uint64_t* nulls) = 0;
 
   /// Create row set for child columns based on the row set of parent column.
-  void makeNestedRowSet(const RowSet& rows, int32_t maxRow);
+  virtual void makeNestedRowSet(const RowSet& rows, int32_t maxRow);
 
   /// Compute the offsets and lengths based on the current filtered rows passed
   /// in.
@@ -69,17 +70,37 @@ class SelectiveRepeatedColumnReader : public SelectiveColumnReader {
   // in subclasses.
   RowSet applyFilter(const RowSet& rows);
 
+  vector_size_t prunedLengthAt(vector_size_t i) const {
+    return std::min(scanSpec_->maxArrayElementsCount(), allLengths_[i]);
+  }
+
+  static vector_size_t
+  advanceNestedRows(const RowSet& rows, vector_size_t i, vector_size_t last) {
+    while (i + 16 < rows.size() && rows[i + 16] < last) {
+      i += 16;
+    }
+    while (i < rows.size() && rows[i] < last) {
+      ++i;
+    }
+    return i;
+  }
+
+  void ensureAllLengthsBuffer(vector_size_t size);
+
   BufferPtr allLengthsHolder_;
   vector_size_t* allLengths_;
   RowSet nestedRows_;
   raw_vector<vector_size_t> nestedRowsHolder_;
+  bool nestedRowsAllSelected_;
 
   // The position in the child readers that corresponds to the position in the
   // length stream. The child readers can be behind if the last parents were
   // null, so that the child stream was only read up to the last position
   // corresponding to the last non-null parent.
-  vector_size_t childTargetReadOffset_ = 0;
+  int64_t childTargetReadOffset_ = 0;
   std::vector<SelectiveColumnReader*> children_;
+
+  friend class facebook::nimble::DeduplicatedReadHelper;
 };
 
 class SelectiveListColumnReader : public SelectiveRepeatedColumnReader {
@@ -96,8 +117,8 @@ class SelectiveListColumnReader : public SelectiveRepeatedColumnReader {
 
   uint64_t skip(uint64_t numValues) override;
 
-  void read(
-      vector_size_t offset,
+  virtual void read(
+      int64_t offset,
       const RowSet& rows,
       const uint64_t* incomingNulls) override;
 
@@ -122,10 +143,8 @@ class SelectiveMapColumnReader : public SelectiveRepeatedColumnReader {
 
   uint64_t skip(uint64_t numValues) override;
 
-  void read(
-      vector_size_t offset,
-      const RowSet& rows,
-      const uint64_t* incomingNulls) override;
+  void read(int64_t offset, const RowSet& rows, const uint64_t* incomingNulls)
+      override;
 
   void getValues(const RowSet& rows, VectorPtr* result) override;
 

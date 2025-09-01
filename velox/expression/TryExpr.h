@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/expression/ExprConstants.h"
 #include "velox/expression/FunctionCallToSpecialForm.h"
 #include "velox/expression/SpecialForm.h"
 
@@ -25,9 +26,10 @@ class TryExpr : public SpecialForm {
   /// Try expression adds nulls, hence, doesn't support flat-no-nulls fast path.
   TryExpr(TypePtr type, ExprPtr&& input)
       : SpecialForm(
+            SpecialFormKind::kTry,
             std::move(type),
             {std::move(input)},
-            "try",
+            expression::kTry,
             false /* supportsFlatNoNullsFastPath */,
             false /* trackCpuUsage */) {}
 

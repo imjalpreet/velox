@@ -18,12 +18,15 @@
 
 #pragma once
 
+#include <string>
+#include <utility>
+
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include <folly/Expected.h>
 #include <folly/Likely.h>
-#include <string>
-#include <utility>
+
+#include "velox/common/base/ExceptionHelper.h"
 
 namespace facebook::velox {
 
@@ -81,6 +84,49 @@ namespace facebook::velox {
 ///  VELOX_RETURN_NOT_OK(operation1());
 ///  VELOX_RETURN_NOT_OK(operation2());
 ///  VELOX_RETURN_NOT_OK(operation3());
+///  ...
+///
+/// folly::Expected<T, Status> holds either a result or an error status and is
+/// aliased as Expected<T> to simplify usage.
+///
+/// For operations return a value if successful, or error status if not,
+/// use Expected<T>:
+///
+/// Simple usage:
+///
+///  Expected<bool> operation() {
+///    if (noMoreMemory) {
+///      return folly::makeUnexpected(
+///        Status::OutOfMemory("Not enough memory to run 'operation'!"));
+///    }
+///    return true;
+///  }
+///
+/// Call site:
+///
+///  auto expected = operation();
+///  if (expected.hasError()) {
+///    auto error = expected.error();
+///    (handle error status)
+///  } else {
+///    auto value = expected.value();
+///    (handle value on success)
+///  }
+///
+/// The same logic above can be implemented using helper macros:
+///
+///  Expected<bool> operation() {
+///    VELOX_RETURN_UNEXPECTED_IF(noMoreMemory,
+///      Status::OutOfMemory("Not enough memory to run 'operation'!"));
+///    return true;
+///  }
+///
+/// To ensure operations succeed (or if not, return the same status wrapped in
+/// folly::Unexpected from the current function):
+///
+///  ...
+///  VELOX_RETURN_UNEXPECTED(operationReturnExpected());
+///  VELOX_RETURN_UNEXPECTED_NOT_OK(operationReturnStatus());
 ///  ...
 
 /// This enum represents common categories of errors found in the library. These
@@ -169,9 +215,6 @@ class [[nodiscard]] Status {
   inline Status& operator=(Status&& s) noexcept;
 
   inline bool operator==(const Status& other) const noexcept;
-  inline bool operator!=(const Status& other) const noexcept {
-    return !(*this == other);
-  }
 
   // AND the statuses.
   inline Status operator&(const Status& s) const noexcept;
@@ -348,7 +391,7 @@ class [[nodiscard]] Status {
 
   /// Return the specific error message attached to this status.
   const std::string& message() const {
-    static const std::string kNoMessage = "";
+    static const std::string kNoMessage;
     return ok() ? kNoMessage : state_->msg;
   }
 
@@ -484,6 +527,74 @@ void Status::moveFrom(Status& s) {
     VELOX_RETURN_IF(!__s.ok(), __s);                          \
   } while (false)
 
+#define _VELOX_RETURN_IMPL(expr, exprStr, error, ...)                    \
+  do {                                                                   \
+    if (FOLLY_UNLIKELY(expr)) {                                          \
+      auto message = ::facebook::velox::errorMessage(__VA_ARGS__);       \
+      return error(                                                      \
+          ::facebook::velox::internal::generateError(message, exprStr)); \
+    }                                                                    \
+  } while (0)
+
+/// If the caller passes a custom message (4 *or more* arguments), we
+/// have to construct a format string from ours ("({} vs. {})") plus
+/// theirs by adding a space and shuffling arguments. If they don't (exactly 3
+/// arguments), we can just pass our own format string and arguments straight
+/// through.
+#define _VELOX_RETURN_OP_WITH_USER_FMT_HELPER(  \
+    implmacro, expr1, expr2, op, user_fmt, ...) \
+  implmacro(                                    \
+      (expr1)op(expr2),                         \
+      #expr1 " " #op " " #expr2,                \
+      "({} vs. {}) " user_fmt,                  \
+      expr1,                                    \
+      expr2,                                    \
+      ##__VA_ARGS__)
+
+#define _VELOX_RETURN_OP_HELPER(implmacro, expr1, expr2, op, ...) \
+  do {                                                            \
+    if constexpr (FOLLY_PP_DETAIL_NARGS(__VA_ARGS__) > 0) {       \
+      _VELOX_RETURN_OP_WITH_USER_FMT_HELPER(                      \
+          implmacro, expr1, expr2, op, __VA_ARGS__);              \
+    } else {                                                      \
+      implmacro(                                                  \
+          (expr1)op(expr2),                                       \
+          #expr1 " " #op " " #expr2,                              \
+          "({} vs. {})",                                          \
+          expr1,                                                  \
+          expr2);                                                 \
+    }                                                             \
+  } while (0)
+
+#define _VELOX_USER_RETURN_IMPL(expr, exprStr, ...) \
+  _VELOX_RETURN_IMPL(                               \
+      expr, exprStr, ::facebook::velox::Status::UserError, ##__VA_ARGS__)
+
+#define _VELOX_USER_RETURN_OP(expr1, expr2, op, ...) \
+  _VELOX_RETURN_OP_HELPER(                           \
+      _VELOX_USER_RETURN_IMPL, expr1, expr2, op, ##__VA_ARGS__)
+
+// For all below macros, an additional message can be passed using a
+// format string and arguments, as with `fmt::format`.
+#define VELOX_USER_RETURN(expr, ...) \
+  _VELOX_USER_RETURN_IMPL(expr, #expr, ##__VA_ARGS__)
+#define VELOX_USER_RETURN_GT(e1, e2, ...) \
+  _VELOX_USER_RETURN_OP(e1, e2, >, ##__VA_ARGS__)
+#define VELOX_USER_RETURN_GE(e1, e2, ...) \
+  _VELOX_USER_RETURN_OP(e1, e2, >=, ##__VA_ARGS__)
+#define VELOX_USER_RETURN_LT(e1, e2, ...) \
+  _VELOX_USER_RETURN_OP(e1, e2, <, ##__VA_ARGS__)
+#define VELOX_USER_RETURN_LE(e1, e2, ...) \
+  _VELOX_USER_RETURN_OP(e1, e2, <=, ##__VA_ARGS__)
+#define VELOX_USER_RETURN_EQ(e1, e2, ...) \
+  _VELOX_USER_RETURN_OP(e1, e2, ==, ##__VA_ARGS__)
+#define VELOX_USER_RETURN_NE(e1, e2, ...) \
+  _VELOX_USER_RETURN_OP(e1, e2, !=, ##__VA_ARGS__)
+#define VELOX_USER_RETURN_NULL(e, ...) \
+  VELOX_USER_RETURN(e == nullptr, ##__VA_ARGS__)
+#define VELOX_USER_RETURN_NOT_NULL(e, ...) \
+  VELOX_USER_RETURN(e != nullptr, ##__VA_ARGS__)
+
 namespace internal {
 
 /// Common API for extracting Status from either Status or Result<T> (the latter
@@ -495,6 +606,8 @@ inline const Status& genericToStatus(const Status& st) {
 inline Status genericToStatus(Status&& st) {
   return std::move(st);
 }
+
+std::string generateError(std::string message, std::string exprStr);
 
 } // namespace internal
 
@@ -515,11 +628,34 @@ inline Status genericToStatus(Status&& st) {
 template <typename T>
 using Expected = folly::Expected<T, Status>;
 
+/// Return with given status wrapped in folly::Unexpected if condition is met.
+#define VELOX_RETURN_UNEXPECTED_IF(condition, status) \
+  do {                                                \
+    if (FOLLY_UNLIKELY(condition)) {                  \
+      return (::folly::makeUnexpected(status));       \
+    }                                                 \
+  } while (false)
+
+/// Propagate any non-successful Status wrapped in folly::Unexpected to the
+/// caller.
+#define VELOX_RETURN_UNEXPECTED_NOT_OK(status)                \
+  do {                                                        \
+    ::facebook::velox::Status __s =                           \
+        ::facebook::velox::internal::genericToStatus(status); \
+    VELOX_RETURN_IF(!__s.ok(), ::folly::makeUnexpected(__s)); \
+  } while (false)
+
+#define VELOX_RETURN_UNEXPECTED(expected)                    \
+  do {                                                       \
+    auto res = (expected);                                   \
+    VELOX_RETURN_UNEXPECTED_IF(res.hasError(), res.error()); \
+  } while (false)
+
 } // namespace facebook::velox
 
 template <>
 struct fmt::formatter<facebook::velox::Status> : fmt::formatter<std::string> {
-  auto format(const facebook::velox::Status& s, format_context& ctx) {
+  auto format(const facebook::velox::Status& s, format_context& ctx) const {
     return formatter<std::string>::format(s.toString(), ctx);
   }
 };
@@ -527,7 +663,7 @@ struct fmt::formatter<facebook::velox::Status> : fmt::formatter<std::string> {
 template <>
 struct fmt::formatter<facebook::velox::StatusCode>
     : fmt::formatter<std::string_view> {
-  auto format(facebook::velox::StatusCode code, format_context& ctx) {
+  auto format(facebook::velox::StatusCode code, format_context& ctx) const {
     return formatter<std::string_view>::format(
         facebook::velox::toString(code), ctx);
   }

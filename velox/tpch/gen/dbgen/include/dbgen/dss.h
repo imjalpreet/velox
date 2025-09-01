@@ -118,6 +118,8 @@
 #define RANDOM(tgt, lower, upper, seed) dss_random(&tgt, lower, upper, seed)
 #define RANDOM64(tgt, lower, upper, seed) dss_random64(&tgt, lower, upper, seed)
 
+namespace facebook::velox::tpch::dbgen {
+
 typedef struct {
   long weight;
   char* text;
@@ -133,7 +135,7 @@ typedef struct {
  * some handy access functions
  */
 #define DIST_SIZE(d) d->count
-#define DIST_MEMBER(d, i) ((set_member*)((d)->list + i))->text
+#define DIST_MEMBER(d, i) (reinterpret_cast<set_member*>((d)->list + i))->text
 #define DIST_PERMUTE(d, i) (d->permute[i])
 
 typedef struct {
@@ -433,9 +435,21 @@ int dbg_print(int dt, FILE* tgt, void* data, int len, int eol);
 #define PR_STRT(fp) /* any line prep for a record goes here */
 #define PR_END(fp) fprintf(fp, "\n") /* finish the record here */
 #ifdef MDY_DATE
-#define PR_DATE(tgt, yr, mn, dy) sprintf(tgt, "%02d-%02d-19%02d", mn, dy, yr)
+#define PR_DATE(tgt, yr, mn, dy)                                \
+  do {                                                          \
+    auto res = sprintf(tgt, "19%02ld-%02ld-%02ld", yr, mn, dy); \
+    if (res < 0) {                                              \
+      tgt[0] = '\0';                                            \
+    }                                                           \
+  } while (0)
 #else
-#define PR_DATE(tgt, yr, mn, dy) sprintf(tgt, "19%02ld-%02ld-%02ld", yr, mn, dy)
+#define PR_DATE(tgt, yr, mn, dy)                                \
+  do {                                                          \
+    auto res = sprintf(tgt, "19%02ld-%02ld-%02ld", yr, mn, dy); \
+    if (res < 0) {                                              \
+      tgt[0] = '\0';                                            \
+    }                                                           \
+  } while (0)
 #endif /* DATE_FORMAT */
 
 /*
@@ -577,5 +591,7 @@ struct DBGenContext {
 
   long scale_factor = 1;
 };
+
+} // namespace facebook::velox::tpch::dbgen
 
 #endif /* DSS_H */

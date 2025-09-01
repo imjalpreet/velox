@@ -14,9 +14,15 @@
  * limitations under the License.
  */
 #include "velox/expression/VectorFunction.h"
+#include "velox/functions/prestosql/types/BigintEnumType.h"
+#include "velox/functions/prestosql/types/BingTileType.h"
+#include "velox/functions/prestosql/types/GeometryType.h"
 #include "velox/functions/prestosql/types/HyperLogLogType.h"
 #include "velox/functions/prestosql/types/IPAddressType.h"
+#include "velox/functions/prestosql/types/IPPrefixType.h"
 #include "velox/functions/prestosql/types/JsonType.h"
+#include "velox/functions/prestosql/types/QDigestType.h"
+#include "velox/functions/prestosql/types/TDigestType.h"
 #include "velox/functions/prestosql/types/TimestampWithTimeZoneType.h"
 #include "velox/functions/prestosql/types/UuidType.h"
 
@@ -51,7 +57,14 @@ std::string typeName(const TypePtr& type) {
         return fmt::format(
             "decimal({},{})", shortDecimal.precision(), shortDecimal.scale());
       }
+      if (isBingTileType(type)) {
+        return "bingtile";
+      }
+      if (isBigintEnumType(*type)) {
+        return asBigintEnum(type)->enumName();
+      }
       return "bigint";
+
     case TypeKind::HUGEINT: {
       if (isUuidType(type)) {
         return "uuid";
@@ -79,6 +92,21 @@ std::string typeName(const TypePtr& type) {
       if (isHyperLogLogType(type)) {
         return "HyperLogLog";
       }
+      if (isGeometryType(type)) {
+        return "geometry";
+      }
+      if (*type == *TDIGEST(DOUBLE())) {
+        return "tdigest(double)";
+      }
+      if (*type == *QDIGEST(BIGINT())) {
+        return "qdigest(bigint)";
+      }
+      if (*type == *QDIGEST(REAL())) {
+        return "qdigest(real)";
+      }
+      if (*type == *QDIGEST(DOUBLE())) {
+        return "qdigest(double)";
+      }
       return "varbinary";
     case TypeKind::TIMESTAMP:
       return "timestamp";
@@ -90,6 +118,9 @@ std::string typeName(const TypePtr& type) {
           typeName(type->childAt(0)),
           typeName(type->childAt(1)));
     case TypeKind::ROW: {
+      if (isIPPrefixType(type)) {
+        return "ipprefix";
+      }
       const auto& rowType = type->asRow();
       std::ostringstream out;
       out << "row(";
@@ -108,7 +139,7 @@ std::string typeName(const TypePtr& type) {
     case TypeKind::UNKNOWN:
       return "unknown";
     default:
-      VELOX_UNSUPPORTED("Unsupported type: {}", type->toString())
+      VELOX_UNSUPPORTED("Unsupported type: {}", type->toString());
   }
 }
 

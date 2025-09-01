@@ -44,7 +44,6 @@ std::string DataSink::Stats::toString() const {
 }
 
 bool registerConnectorFactory(std::shared_ptr<ConnectorFactory> factory) {
-  factory->initialize();
   bool ok =
       connectorFactories().insert({factory->connectorName(), factory}).second;
   VELOX_CHECK(
@@ -173,5 +172,19 @@ folly::dynamic ConnectorTableHandle::serializeBase(
 
 folly::dynamic ConnectorTableHandle::serialize() const {
   return serializeBase("ConnectorTableHandle");
+}
+
+// static
+ConnectorTableHandlePtr ConnectorTableHandle::create(
+    const folly::dynamic& obj,
+    void* /*unused*/) {
+  const auto connectorId = obj["connectorId"].asString();
+  return std::make_shared<const ConnectorTableHandle>(connectorId);
+}
+
+// static
+void ConnectorTableHandle::registerSerDe() {
+  auto& registry = DeserializationWithContextRegistryForSharedPtr();
+  registry.Register("ConnectorTableHandle", create);
 }
 } // namespace facebook::velox::connector

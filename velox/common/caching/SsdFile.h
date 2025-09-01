@@ -22,11 +22,15 @@
 #include "velox/common/caching/AsyncDataCache.h"
 #include "velox/common/caching/SsdFileTracker.h"
 #include "velox/common/file/File.h"
-
-DECLARE_bool(ssd_odirect);
-DECLARE_bool(ssd_verify_write);
+#include "velox/common/file/FileInputStream.h"
+#include "velox/common/file/FileSystems.h"
 
 namespace facebook::velox::cache {
+
+namespace test {
+class SsdFileTestHelper;
+class SsdCacheTestHelper;
+} // namespace test
 
 /// A 64 bit word describing a SSD cache entry in an SsdFile. The low 23 bits
 /// are the size, for a maximum entry size of 8MB. The high bits are the offset.
@@ -53,6 +57,7 @@ class SsdRun {
     fileBits_ = other.fileBits_;
     checksum_ = other.checksum_;
   }
+
   void operator=(SsdRun&& other) {
     fileBits_ = other.fileBits_;
     checksum_ = other.checksum_;
@@ -156,7 +161,7 @@ struct SsdCacheStats {
     openFileErrors = tsanAtomicValue(other.openFileErrors);
     openCheckpointErrors = tsanAtomicValue(other.openCheckpointErrors);
     openLogErrors = tsanAtomicValue(other.openLogErrors);
-    deleteCheckpointErrors = tsanAtomicValue(other.deleteCheckpointErrors);
+    deleteMetaFileErrors = tsanAtomicValue(other.deleteMetaFileErrors);
     growFileErrors = tsanAtomicValue(other.growFileErrors);
     writeSsdErrors = tsanAtomicValue(other.writeSsdErrors);
     writeSsdDropped = tsanAtomicValue(other.writeSsdDropped);
@@ -184,8 +189,8 @@ struct SsdCacheStats {
     result.openCheckpointErrors =
         openCheckpointErrors - other.openCheckpointErrors;
     result.openLogErrors = openLogErrors - other.openLogErrors;
-    result.deleteCheckpointErrors =
-        deleteCheckpointErrors - other.deleteCheckpointErrors;
+    result.deleteMetaFileErrors =
+        deleteMetaFileErrors - other.deleteMetaFileErrors;
     result.growFileErrors = growFileErrors - other.growFileErrors;
     result.writeSsdErrors = writeSsdErrors - other.writeSsdErrors;
     result.writeSsdDropped = writeSsdDropped - other.writeSsdDropped;
@@ -224,7 +229,7 @@ struct SsdCacheStats {
   tsan_atomic<uint32_t> openFileErrors{0};
   tsan_atomic<uint32_t> openCheckpointErrors{0};
   tsan_atomic<uint32_t> openLogErrors{0};
-  tsan_atomic<uint32_t> deleteCheckpointErrors{0};
+  tsan_atomic<uint32_t> deleteMetaFileErrors{0};
   tsan_atomic<uint32_t> growFileErrors{0};
   tsan_atomic<uint32_t> writeSsdErrors{0};
   tsan_atomic<uint32_t> writeSsdDropped{0};
@@ -360,41 +365,19 @@ class SsdFile {
   }
 
   /// Returns the eviction log file path.
-  std::string getEvictLogFilePath() const {
+  std::string evictLogFilePath() const {
     return fileName_ + kLogExtension;
   }
 
   /// Returns the checkpoint file path.
-  std::string getCheckpointFilePath() const {
+  std::string checkpointFilePath() const {
     return fileName_ + kCheckpointExtension;
   }
-
-  /// Deletes the backing file. Used in testing.
-  void testingDeleteFile();
 
   /// Resets this' to a post-construction empty state. See SsdCache::clear().
   ///
   /// NOTE: this is only used by test and Prestissimo worker operation.
   void clear();
-
-  /// Returns true if copy on write is disabled for this file. Used in testing.
-  bool testingIsCowDisabled() const;
-
-  std::vector<double> testingCopyScores() {
-    return tracker_.copyScores();
-  }
-
-  int32_t testingNumWritableRegions() const {
-    return writableRegions_.size();
-  }
-
-  const folly::F14FastMap<FileCacheKey, SsdRun>& testingEntries() {
-    return entries_;
-  }
-
-  bool testingChecksumReadVerificationEnabled() const {
-    return checksumReadVerificationEnabled_;
-  }
 
  private:
   // Magic number separating file names from cache entry data in checkpoint
@@ -454,10 +437,9 @@ class SsdFile {
   // Verifies that 'entry' has the data at 'run'.
   void verifyWrite(AsyncDataCacheEntry& entry, SsdRun run);
 
-  // Reads a checkpoint state file and sets 'this' accordingly if read is
-  // successful. Return true for successful read. A failed read deletes the
-  // checkpoint and leaves the log truncated open.
-  void readCheckpoint(std::ifstream& state);
+  // Reads a checkpoint file and sets 'this' accordingly if read succeeds. A
+  // failed read deletes the checkpoint and leaves the truncated log open.
+  void readCheckpoint();
 
   // Logs an error message, deletes the checkpoint and stop making new
   // checkpoints.
@@ -472,12 +454,11 @@ class SsdFile {
 
   // Writes 'iovecs' to the SSD file at the 'offset'. Returns true if the write
   // succeeds; otherwise, log the error and return false.
-  bool
-  write(uint64_t offset, uint64_t length, const std::vector<iovec>& iovecs);
+  bool write(int64_t offset, int64_t length, const std::vector<iovec>& iovecs);
 
   // Synchronously logs that 'regions' are no longer valid in a possibly
   // existing checkpoint.
-  void logEviction(const std::vector<int32_t>& regions);
+  void logEviction(std::vector<int32_t>& regions);
 
   // Computes the checksum of data in cache 'entry'.
   uint32_t checksumEntry(const AsyncDataCacheEntry& entry) const;
@@ -499,6 +480,46 @@ class SsdFile {
       const AsyncDataCacheEntry& entry,
       const SsdRun& ssdRun);
 
+  // Disable 'copy on write'. Will throw if failed for any reason, including
+  // file system not supporting cow feature.
+  void disableFileCow();
+
+  // Truncates the given file to 0.
+  void truncateFile(WriteFile* file);
+
+  // Deletes the given file if it exists.
+  void deleteFile(std::unique_ptr<WriteFile> file);
+
+  // Allocates 'kCheckpointBufferSize' buffer from cache memory pool for
+  // checkpointing.
+  void allocateCheckpointBuffer();
+
+  // Frees checkpoint buffer.
+  void freeCheckpointBuffer();
+
+  // Appends 'size' bytes from source buffer to the checkpoint buffer and
+  // flushes the buffered data to disk if necessary.
+  void appendToCheckpointBuffer(const void* source, int32_t size);
+
+  void appendToCheckpointBuffer(const std::string& string);
+
+  template <typename T>
+  void appendToCheckpointBuffer(const std::vector<T>& vector) {
+    appendToCheckpointBuffer(vector.data(), vector.size() * sizeof(T));
+  }
+
+  template <typename T>
+  void appendToCheckpointBuffer(const T& data) {
+    appendToCheckpointBuffer(&data, sizeof(data));
+  }
+
+  // Flushs the buffered data to write file if the buffered data has exceeded
+  // 'kCheckpointBufferSize' or 'force' is set true.
+  void maybeFlushCheckpointBuffer(uint32_t appendBytes, bool force = false);
+
+  // Flushs the buffered data to disk.
+  void flushCheckpointFile();
+
   // Returns true if checksum write is enabled for the given version.
   static bool isChecksumEnabledOnCheckpointVersion(
       const std::string& checkpointVersion) {
@@ -507,6 +528,7 @@ class SsdFile {
 
   static constexpr const char* kLogExtension = ".log";
   static constexpr const char* kCheckpointExtension = ".cpt";
+  static constexpr uint32_t kCheckpointBufferSize = 1 << 20; // 1MB
 
   // Name of cache file, used as prefix for checkpoint files.
   const std::string fileName_;
@@ -556,14 +578,23 @@ class SsdFile {
   // Map of file number and offset to location in file.
   folly::F14FastMap<FileCacheKey, SsdRun> entries_;
 
-  // File descriptor. 0 (stdin) means file not open.
-  int32_t fd_{0};
+  // File system.
+  std::shared_ptr<filesystems::FileSystem> fs_;
 
   // Size of the backing file in bytes. Must be multiple of kRegionSize.
   uint64_t fileSize_{0};
 
-  // ReadFile made from 'fd_'.
+  // ReadFile for cache data file.
   std::unique_ptr<ReadFile> readFile_;
+
+  // WriteFile for cache data file.
+  std::unique_ptr<WriteFile> writeFile_;
+
+  // WriteFile for evict log file.
+  std::unique_ptr<WriteFile> evictLogWriteFile_;
+
+  // WriteFile for checkpoint file.
+  std::unique_ptr<WriteFile> checkpointWriteFile_;
 
   // Counters.
   SsdCacheStats stats_;
@@ -578,11 +609,17 @@ class SsdFile {
   // Count of bytes written after last checkpoint.
   std::atomic<uint64_t> bytesAfterCheckpoint_{0};
 
-  // fd for logging evictions.
-  int32_t evictLogFd_{-1};
-
   // True if there was an error with checkpoint and the checkpoint was deleted.
   bool checkpointDeleted_{false};
+
+  // Used for checkpoint buffer and is only set during the checkpoint write.
+  void* checkpointBuffer_ = nullptr;
+
+  // Buffered data size for checkpoint.
+  uint32_t checkpointBufferedDataSize_;
+
+  friend class test::SsdFileTestHelper;
+  friend class test::SsdCacheTestHelper;
 };
 
 } // namespace facebook::velox::cache

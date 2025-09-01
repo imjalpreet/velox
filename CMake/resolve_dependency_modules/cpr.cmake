@@ -14,18 +14,21 @@
 include_guard(GLOBAL)
 
 set(VELOX_CPR_VERSION 1.10.5)
-set(VELOX_CPR_BUILD_SHA256_CHECKSUM
-    c8590568996cea918d7cf7ec6845d954b9b95ab2c4980b365f582a665dea08d8)
-set(VELOX_CPR_SOURCE_URL
-    "https://github.com/libcpr/cpr/archive/refs/tags/${VELOX_CPR_VERSION}.tar.gz"
+set(
+  VELOX_CPR_BUILD_SHA256_CHECKSUM
+  c8590568996cea918d7cf7ec6845d954b9b95ab2c4980b365f582a665dea08d8
+)
+set(
+  VELOX_CPR_SOURCE_URL
+  "https://github.com/libcpr/cpr/archive/refs/tags/${VELOX_CPR_VERSION}.tar.gz"
 )
 
 # Add the dependency for curl, so that we can define the source URL for curl in
 # curl.cmake. This will override the curl version declared by cpr.
 set(curl_SOURCE BUNDLED)
-resolve_dependency(curl)
+velox_resolve_dependency(curl)
 
-resolve_dependency_url(CPR)
+velox_resolve_dependency_url(CPR)
 
 message(STATUS "Building cpr from source")
 FetchContent_Declare(
@@ -33,9 +36,10 @@ FetchContent_Declare(
   URL ${VELOX_CPR_SOURCE_URL}
   URL_HASH ${VELOX_CPR_BUILD_SHA256_CHECKSUM}
   PATCH_COMMAND
-    git apply ${CMAKE_CURRENT_LIST_DIR}/cpr/cpr-libcurl-compatible.patch && git
-    apply ${CMAKE_CURRENT_LIST_DIR}/cpr/cpr-remove-sancheck.patch)
-set(BUILD_SHARED_LIBS OFF)
+    git apply ${CMAKE_CURRENT_LIST_DIR}/cpr/cpr-libcurl-compatible.patch && git apply
+    ${CMAKE_CURRENT_LIST_DIR}/cpr/cpr-remove-sancheck.patch
+)
+set(BUILD_SHARED_LIBS ${VELOX_BUILD_SHARED})
 set(CPR_USE_SYSTEM_CURL OFF)
 # ZLIB has already been found by find_package(ZLIB, REQUIRED), set CURL_ZLIB=OFF
 # to save compile time.
@@ -44,3 +48,4 @@ FetchContent_MakeAvailable(cpr)
 # libcpr in its CMakeLists.txt file disables the BUILD_TESTING globally when
 # CPR_USE_SYSTEM_CURL=OFF. unset BUILD_TESTING here.
 unset(BUILD_TESTING)
+unset(BUILD_SHARED_LIBS)

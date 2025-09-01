@@ -31,6 +31,11 @@ using FunctionSignatureMap = std::
 /// The mapping is function name -> list of function signatures
 FunctionSignatureMap getFunctionSignatures();
 
+/// Returns a list of function signatures for a given function name. Returns
+/// empty list if function with specified name not found.
+std::vector<const exec::FunctionSignature*> getFunctionSignatures(
+    const std::string& functionName);
+
 /// Returns a mapping of all Vector functions registered in Velox
 /// The mapping is function name -> list of function signatures
 FunctionSignatureMap getVectorFunctionSignatures();
@@ -46,6 +51,26 @@ std::optional<bool> isDeterministic(const std::string& functionName);
 TypePtr resolveFunction(
     const std::string& functionName,
     const std::vector<TypePtr>& argTypes);
+
+/// Like 'resolveFunction', but with support for applying type conversions if no
+/// signature matches 'argTypes' exactly.
+///
+/// @param coercions A list of optional type coercions that were applied to
+/// resolve the function successfully. Contains one entry per argument. The
+/// entry is null if no coercion is required for that argument. The entry is not
+/// null if coercions is necessary.
+///
+/// Example, given functin plus(bigint, bigint) -> bigint and arguments
+/// (integer, bigint), returns bigint with coercions = {bigint, null}. The first
+/// argument needs to be coersed to bigint, while the second argument doesn't
+/// require coercion.
+///
+/// TODO: Add support for coercion for complex and user-defined types,
+/// signatures with generic types and variadic arguments.
+TypePtr resolveFunctionWithCoercions(
+    const std::string& functionName,
+    const std::vector<TypePtr>& argTypes,
+    std::vector<TypePtr>& coercions);
 
 /// Given a function name and argument types, returns a pair of return
 /// type and metadata if function exists. Otherwise, returns std::nullopt.
@@ -91,6 +116,10 @@ std::optional<std::pair<TypePtr, exec::VectorFunctionMetadata>>
 resolveVectorFunctionWithMetadata(
     const std::string& functionName,
     const std::vector<TypePtr>& argTypes);
+
+/// Given name of a function, removes it from both the simple and vector
+/// function registries (including all signatures).
+void removeFunction(const std::string& functionName);
 
 /// Clears the function registry.
 void clearFunctionRegistry();

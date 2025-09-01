@@ -43,12 +43,15 @@ class HiveConnector : public Connector {
     return true;
   }
 
+  ConnectorMetadata* metadata() const override {
+    VELOX_CHECK_NOT_NULL(metadata_);
+    return metadata_.get();
+  }
+
   std::unique_ptr<DataSource> createDataSource(
       const RowTypePtr& outputType,
-      const std::shared_ptr<ConnectorTableHandle>& tableHandle,
-      const std::unordered_map<
-          std::string,
-          std::shared_ptr<connector::ColumnHandle>>& columnHandles,
+      const ConnectorTableHandlePtr& tableHandle,
+      const connector::ColumnHandleMap& columnHandles,
       ConnectorQueryCtx* connectorQueryCtx) override;
 
   bool supportsSplitPreload() override {
@@ -57,9 +60,9 @@ class HiveConnector : public Connector {
 
   std::unique_ptr<DataSink> createDataSink(
       RowTypePtr inputType,
-      std::shared_ptr<ConnectorInsertTableHandle> connectorInsertTableHandle,
+      ConnectorInsertTableHandlePtr connectorInsertTableHandle,
       ConnectorQueryCtx* connectorQueryCtx,
-      CommitStrategy commitStrategy) override final;
+      CommitStrategy commitStrategy) override;
 
   folly::Executor* executor() const override {
     return executor_;
@@ -79,34 +82,25 @@ class HiveConnector : public Connector {
   const std::shared_ptr<HiveConfig> hiveConfig_;
   FileHandleFactory fileHandleFactory_;
   folly::Executor* executor_;
+  std::shared_ptr<ConnectorMetadata> metadata_;
 };
 
 class HiveConnectorFactory : public ConnectorFactory {
  public:
   static constexpr const char* kHiveConnectorName = "hive";
-  static constexpr const char* kHiveHadoop2ConnectorName = "hive-hadoop2";
 
   HiveConnectorFactory() : ConnectorFactory(kHiveConnectorName) {}
 
   explicit HiveConnectorFactory(const char* connectorName)
       : ConnectorFactory(connectorName) {}
 
-  /// Register HiveConnector components such as Dwrf, Parquet readers and
-  /// writers and FileSystems.
-  void initialize() override;
-
   std::shared_ptr<Connector> newConnector(
       const std::string& id,
       std::shared_ptr<const config::ConfigBase> config,
-      folly::Executor* executor = nullptr) override {
-    return std::make_shared<HiveConnector>(id, config, executor);
+      folly::Executor* ioExecutor = nullptr,
+      folly::Executor* cpuExecutor = nullptr) override {
+    return std::make_shared<HiveConnector>(id, config, ioExecutor);
   }
-};
-
-class HiveHadoop2ConnectorFactory : public HiveConnectorFactory {
- public:
-  HiveHadoop2ConnectorFactory()
-      : HiveConnectorFactory(kHiveHadoop2ConnectorName) {}
 };
 
 class HivePartitionFunctionSpec : public core::PartitionFunctionSpec {
@@ -140,7 +134,8 @@ class HivePartitionFunctionSpec : public core::PartitionFunctionSpec {
             std::move(constValues)) {}
 
   std::unique_ptr<core::PartitionFunction> create(
-      int numPartitions) const override;
+      int numPartitions,
+      bool localExchange) const override;
 
   std::string toString() const override;
 
@@ -158,5 +153,22 @@ class HivePartitionFunctionSpec : public core::PartitionFunctionSpec {
 };
 
 void registerHivePartitionFunctionSerDe();
+
+/// Hook for connecting metadata functions to a HiveConnector. Each registered
+/// factory is called after initializing a HiveConnector until one of these
+/// returns a ConnectorMetadata instance.
+class HiveConnectorMetadataFactory {
+ public:
+  virtual ~HiveConnectorMetadataFactory() = default;
+
+  /// Returns a ConnectorMetadata to complete'hiveConnector' if 'this'
+  /// recognizes a data source, e.g. local file system or remote metadata
+  /// service associated to configs in 'hiveConnector'.
+  virtual std::shared_ptr<ConnectorMetadata> create(
+      HiveConnector* connector) = 0;
+};
+
+bool registerHiveConnectorMetadataFactory(
+    std::unique_ptr<HiveConnectorMetadataFactory>);
 
 } // namespace facebook::velox::connector::hive

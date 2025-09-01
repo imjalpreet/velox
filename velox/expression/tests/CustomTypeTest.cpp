@@ -20,6 +20,7 @@
 #include "velox/functions/Macros.h"
 #include "velox/functions/Registerer.h"
 #include "velox/functions/prestosql/tests/utils/FunctionBaseTest.h"
+#include "velox/functions/prestosql/types/SfmSketchRegistration.h"
 #include "velox/type/OpaqueCustomTypes.h"
 
 namespace facebook::velox::test {
@@ -34,14 +35,12 @@ struct FancyInt {
 };
 
 class FancyIntType : public OpaqueType {
-  FancyIntType() : OpaqueType(std::type_index(typeid(FancyInt))) {}
+  FancyIntType() : OpaqueType{std::type_index(typeid(FancyInt))} {}
 
  public:
-  static const std::shared_ptr<const FancyIntType>& get() {
-    static const std::shared_ptr<const FancyIntType> instance{
-        new FancyIntType()};
-
-    return instance;
+  static std::shared_ptr<const FancyIntType> get() {
+    static const FancyIntType kInstance;
+    return {std::shared_ptr<const FancyIntType>{}, &kInstance};
   }
 
   std::string toString() const override {
@@ -53,14 +52,20 @@ class FancyIntType : public OpaqueType {
   }
 };
 
-class FancyIntTypeFactories : public CustomTypeFactories {
+class FancyIntTypeFactory : public CustomTypeFactory {
  public:
-  TypePtr getType() const override {
+  TypePtr getType(const std::vector<TypeParameter>& parameters) const override {
+    VELOX_CHECK(parameters.empty());
     return FancyIntType::get();
   }
 
   exec::CastOperatorPtr getCastOperator() const override {
     VELOX_UNSUPPORTED();
+  }
+
+  AbstractInputGeneratorPtr getInputGenerator(
+      const InputGeneratorConfig& /*config*/) const override {
+    return nullptr;
   }
 };
 
@@ -138,13 +143,19 @@ struct FancyPlusFunction {
   }
 };
 
-class AlwaysFailingTypeFactories : public CustomTypeFactories {
+class AlwaysFailingTypeFactory : public CustomTypeFactory {
  public:
-  TypePtr getType() const override {
+  TypePtr getType(const std::vector<TypeParameter>& parameters) const override {
+    VELOX_CHECK(parameters.empty());
     VELOX_UNSUPPORTED();
   }
 
   exec::CastOperatorPtr getCastOperator() const override {
+    VELOX_UNSUPPORTED();
+  }
+
+  AbstractInputGeneratorPtr getInputGenerator(
+      const InputGeneratorConfig& /*config*/) const override {
     VELOX_UNSUPPORTED();
   }
 };
@@ -155,11 +166,11 @@ class AlwaysFailingTypeFactories : public CustomTypeFactories {
 /// simple function that takes and returns this type. Verify function signatures
 /// and evaluate some expressions.
 TEST_F(CustomTypeTest, customType) {
-  ASSERT_TRUE(registerCustomType(
-      "fancy_int", std::make_unique<FancyIntTypeFactories>()));
+  ASSERT_TRUE(
+      registerCustomType("fancy_int", std::make_unique<FancyIntTypeFactory>()));
 
-  ASSERT_FALSE(registerCustomType(
-      "fancy_int", std::make_unique<AlwaysFailingTypeFactories>()));
+  ASSERT_FALSE(
+      registerCustomType("fancy_int", std::make_unique<FancyIntTypeFactory>()));
 
   registerFunction<FancyPlusFunction, TheFancyInt, TheFancyInt, TheFancyInt>(
       {"fancy_plus"});
@@ -209,51 +220,75 @@ TEST_F(CustomTypeTest, customType) {
 }
 
 TEST_F(CustomTypeTest, getCustomTypeNames) {
-  auto names = getCustomTypeNames();
-  ASSERT_EQ(
-      (std::unordered_set<std::string>{
-          "JSON",
-          "HYPERLOGLOG",
-          "TIMESTAMP WITH TIME ZONE",
-          "UUID",
-          "IPADDRESS",
-      }),
-      names);
+  // SFMSKETCH is a newly registered custom type, unlike others,
+  // registerSfmSketchType() is not called in the constructor of CustomTypeTest,
+  // so we explicitly call it here.
+  registerSfmSketchType();
 
-  ASSERT_TRUE(registerCustomType(
-      "fancy_int", std::make_unique<FancyIntTypeFactories>()));
+  auto expectedTypes = std::unordered_set<std::string>{
+      "JSON",
+      "HYPERLOGLOG",
+      "TIMESTAMP WITH TIME ZONE",
+      "UUID",
+      "IPADDRESS",
+      "IPPREFIX",
+      "BINGTILE",
+      "TDIGEST",
+      "QDIGEST",
+      "SFMSKETCH",
+      "BIGINT_ENUM",
+  };
+#ifdef VELOX_ENABLE_GEO
+  expectedTypes.insert("GEOMETRY");
+#endif
+  ASSERT_EQ(expectedTypes, getCustomTypeNames());
 
-  names = getCustomTypeNames();
-  ASSERT_EQ(
-      (std::unordered_set<std::string>{
-          "JSON",
-          "HYPERLOGLOG",
-          "TIMESTAMP WITH TIME ZONE",
-          "UUID",
-          "IPADDRESS",
-          "FANCY_INT",
-      }),
-      names);
+  ASSERT_TRUE(
+      registerCustomType("fancy_int", std::make_unique<FancyIntTypeFactory>()));
+  expectedTypes.insert("FANCY_INT");
+
+  ASSERT_EQ(expectedTypes, getCustomTypeNames());
 
   ASSERT_TRUE(unregisterCustomType("fancy_int"));
 }
 
 TEST_F(CustomTypeTest, nullConstant) {
-  ASSERT_TRUE(registerCustomType(
-      "fancy_int", std::make_unique<FancyIntTypeFactories>()));
-
-  auto names = getCustomTypeNames();
-  for (const auto& name : names) {
-    auto type = getCustomType(name);
+  ASSERT_TRUE(
+      registerCustomType("fancy_int", std::make_unique<FancyIntTypeFactory>()));
+  auto checkNullConstant = [&](const TypePtr& type,
+                               const std::string& expectedTypeString) {
     auto null = BaseVector::createNullConstant(type, 10, pool());
     EXPECT_TRUE(null->isConstantEncoding());
     EXPECT_TRUE(type->equivalent(*null->type()));
     EXPECT_EQ(type->toString(), null->type()->toString());
+    EXPECT_EQ(type->toString(), expectedTypeString);
     for (auto i = 0; i < 10; ++i) {
       EXPECT_TRUE(null->isNullAt(i));
     }
+  };
+  auto names = getCustomTypeNames();
+  for (const auto& name : names) {
+    if (name == "TDIGEST") {
+      auto type = getCustomType(name, {TypeParameter(DOUBLE())});
+      checkNullConstant(type, "TDIGEST(DOUBLE)");
+    } else if (name == "QDIGEST") {
+      for (const auto& parameter :
+           std::vector<TypePtr>{BIGINT(), DOUBLE(), REAL()}) {
+        auto type = getCustomType(name, {TypeParameter(parameter)});
+        checkNullConstant(
+            type, fmt::format("QDIGEST({})", parameter->toString()));
+      }
+    } else if (name == "BIGINT_ENUM") {
+      LongEnumParameter moodInfo(
+          "test.enum.mood", {{"CURIOUS", -2}, {"HAPPY", 0}});
+      auto type = getCustomType(name, {TypeParameter(moodInfo)});
+      checkNullConstant(
+          type, "test.enum.mood:BigintEnum({\"CURIOUS\": -2, \"HAPPY\": 0})");
+    } else {
+      auto type = getCustomType(name, {});
+      checkNullConstant(type, type->toString());
+    }
   }
-
   ASSERT_TRUE(unregisterCustomType("fancy_int"));
 }
 

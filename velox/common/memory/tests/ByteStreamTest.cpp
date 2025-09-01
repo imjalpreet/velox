@@ -21,7 +21,6 @@
 #include "velox/common/memory/MmapAllocator.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 
-#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
 using namespace facebook::velox;
@@ -30,12 +29,11 @@ using namespace facebook::velox::memory;
 class ByteStreamTest : public testing::Test {
  protected:
   void SetUp() override {
-    constexpr uint64_t kMaxMappedMemory = 64 << 20;
-    MemoryManagerOptions options;
+    constexpr uint64_t kMaxMappedMemory = 3ULL << 30;
+    MemoryManager::Options options;
     options.useMmapAllocator = true;
     options.allocatorCapacity = kMaxMappedMemory;
     options.arbitratorCapacity = kMaxMappedMemory;
-    options.arbitratorReservedCapacity = 0;
     memoryManager_ = std::make_unique<MemoryManager>(options);
     mmapAllocator_ = static_cast<MmapAllocator*>(memoryManager_->allocator());
     pool_ = memoryManager_->addLeafPool("ByteStreamTest");
@@ -48,11 +46,49 @@ class ByteStreamTest : public testing::Test {
     return std::make_unique<StreamArena>(pool_.get());
   }
 
+  std::unique_ptr<folly::IOBuf> createIOBuf(uint64_t size) {
+    auto buf = folly::IOBuf::create(size);
+    auto* writableData = buf->writableData();
+    std::memset(writableData, '6', size);
+    buf->append(size);
+    return buf;
+  }
+
   folly::Random::DefaultGenerator rng_;
   std::unique_ptr<MemoryManager> memoryManager_;
   MmapAllocator* mmapAllocator_;
   std::shared_ptr<memory::MemoryPool> pool_;
 };
+
+TEST_F(ByteStreamTest, iobufConsume) {
+  // Empty buffer test
+  auto emptyBufList = byteRangesFromIOBuf(nullptr);
+  ASSERT_TRUE(emptyBufList.empty());
+
+  // Single buffer test
+  const uint64_t bufCapacity = 1024;
+  auto iobuf = createIOBuf(bufCapacity);
+  auto oneBufList = byteRangesFromIOBuf(iobuf.get());
+  ASSERT_EQ(oneBufList.size(), 1);
+  ASSERT_EQ(oneBufList[0].size, bufCapacity);
+
+  // Multiple buffer test
+  const uint64_t numChainedBuf = 64;
+  auto head = createIOBuf(bufCapacity);
+  uint32_t count{1};
+  folly::IOBuf* cur = head.get();
+  while (count < numChainedBuf) {
+    cur->insertAfterThisOne(createIOBuf(bufCapacity));
+    cur = cur->next();
+    count++;
+  }
+
+  auto rangeList = byteRangesFromIOBuf(head.get());
+  ASSERT_EQ(rangeList.size(), numChainedBuf);
+  for (const auto& range : rangeList) {
+    ASSERT_EQ(range.size, bufCapacity);
+  }
+}
 
 TEST_F(ByteStreamTest, outputStream) {
   auto out = std::make_unique<IOBufOutputStream>(*pool_, nullptr, 10000);
@@ -99,6 +135,46 @@ TEST_F(ByteStreamTest, outputStream) {
   iobuf = nullptr;
   // We expect dropping the stream and the iobuf frees the backing memory.
   EXPECT_EQ(0, mmapAllocator_->numAllocated());
+}
+
+TEST_F(ByteStreamTest, bufferedOutputStream) {
+  auto arena = newArena();
+  auto out = std::make_unique<IOBufOutputStream>(*pool_, nullptr, 10000);
+  auto buffered =
+      std::make_unique<BufferedOutputStream>(out.get(), arena.get(), 50);
+
+  std::stringstream referenceSStream;
+  auto reference = std::make_unique<OStreamOutputStream>(&referenceSStream);
+  for (auto i = 0; i < 1000; ++i) {
+    std::string data;
+    data.resize((3 * i) % 200);
+    std::fill(data.begin(), data.end(), i);
+    buffered->write(data.data(), data.size());
+    reference->write(data.data(), data.size());
+  }
+
+  EXPECT_EQ(reference->tellp(), buffered->tellp());
+  EXPECT_EQ(out->tellp(), buffered->tellp());
+
+  for (auto i = 0; i < 100; ++i) {
+    std::string data;
+    data.resize((i * 7) % 200);
+    std::fill(data.begin(), data.end(), i + 10);
+    buffered->seekp((i * 11));
+    reference->seekp((i * 11));
+    buffered->write(data.data(), data.size());
+    reference->write(data.data(), data.size());
+  }
+
+  buffered->flush();
+
+  auto str = referenceSStream.str();
+  auto iobuf = out->getIOBuf();
+  auto outData = iobuf->coalesce();
+  EXPECT_EQ(
+      str,
+      std::string(
+          reinterpret_cast<const char*>(outData.data()), outData.size()));
 }
 
 TEST_F(ByteStreamTest, newRangeAllocation) {
@@ -150,7 +226,7 @@ TEST_F(ByteStreamTest, newRangeAllocation) {
        {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3}},
       {{1023, 64, 64, kPageSize, 5 * kPageSize},
-       {1152, 1152, 1152, kPageSize + 1152, 7 * kPageSize},
+       {1024, 1536, 1536, kPageSize + 1536, 7 * kPageSize},
        {kPageSize * 2,
         kPageSize * 2,
         kPageSize * 2,
@@ -225,36 +301,62 @@ TEST_F(ByteStreamTest, bits) {
     bits.push_back(seed * (i + 1));
   }
   auto arena = newArena();
-  ByteOutputStream bitStream(arena.get(), true);
-  bitStream.startWrite(11);
-  int32_t offset = 0;
-  // Odd number of sizes.
-  std::vector<int32_t> bitSizes = {1, 19, 52, 58, 129};
-  int32_t counter = 0;
-  auto totalBits = bits.size() * 64;
-  while (offset < totalBits) {
-    // Every second uses the fast path for aligned source and append only.
-    auto numBits = std::min<int32_t>(
-        totalBits - offset, bitSizes[counter % bitSizes.size()]);
-    if (counter % 1 == 0) {
-      bitStream.appendBits(bits.data(), offset, offset + numBits);
-    } else {
-      uint64_t aligned[10];
-      bits::copyBits(bits.data(), offset, aligned, 0, numBits);
-      bitStream.appendBitsFresh(aligned, 0, numBits);
+
+  struct {
+    bool reversed;
+    bool negated;
+
+    std::string debugString() const {
+      return fmt::format("reversed: {}, negated: {}", reversed, negated);
     }
-    offset += numBits;
-    ++counter;
+  } testSettings[] = {
+      {false, false}, {true, false}, {false, true}, {true, true}};
+
+  for (const auto& settings : testSettings) {
+    SCOPED_TRACE(settings.debugString());
+    ByteOutputStream bitStream(
+        arena.get(), true, settings.reversed, settings.negated);
+    bitStream.startWrite(11);
+    int32_t offset = 0;
+    // Odd number of sizes.
+    std::vector<int32_t> bitSizes = {1, 19, 52, 58, 129};
+    int32_t counter = 0;
+    auto totalBits = bits.size() * 64;
+    while (offset < totalBits) {
+      // Every second uses the fast path for aligned source and append only.
+      auto numBits = std::min<int32_t>(
+          totalBits - offset, bitSizes[counter % bitSizes.size()]);
+      if (counter % 1 == 0) {
+        bitStream.appendBits(bits.data(), offset, offset + numBits);
+      } else {
+        uint64_t aligned[10];
+        bits::copyBits(bits.data(), offset, aligned, 0, numBits);
+        bitStream.appendBitsFresh(aligned, 0, numBits);
+      }
+      offset += numBits;
+      ++counter;
+    }
+    std::stringstream stringStream;
+    OStreamOutputStream out(&stringStream);
+    bitStream.flush(&out);
+
+    auto expected = bits;
+    if (settings.reversed) {
+      bits::reverseBits(
+          reinterpret_cast<uint8_t*>(expected.data()),
+          expected.size() * sizeof(expected[0]));
+    }
+    if (settings.negated) {
+      bits::negate(expected.data(), expected.size() * sizeof(expected[0]) * 8);
+    }
+
+    EXPECT_EQ(
+        0,
+        memcmp(
+            stringStream.str().data(),
+            expected.data(),
+            expected.size() * sizeof(expected[0])));
   }
-  std::stringstream stringStream;
-  OStreamOutputStream out(&stringStream);
-  bitStream.flush(&out);
-  EXPECT_EQ(
-      0,
-      memcmp(
-          stringStream.str().data(),
-          bits.data(),
-          bits.size() * sizeof(bits[0])));
 }
 
 TEST_F(ByteStreamTest, appendWindow) {
@@ -318,6 +420,31 @@ TEST_F(ByteStreamTest, reuse) {
     stream.appendStringView(std::string_view(bytes, sizeof(bytes)));
     EXPECT_EQ(sizeof(bytes), stream.size());
   }
+}
+
+TEST_F(ByteStreamTest, unalignedWrite) {
+  constexpr int kSize = 1 + sizeof(int128_t);
+  auto arena = newArena();
+  ByteOutputStream stream(arena.get());
+  stream.startWrite(kSize);
+  stream.appendStringView(std::string_view("x"));
+  int128_t data{};
+  // This only crashes in opt mode.
+  stream.append<int128_t>(folly::Range(&data, 1));
+  ASSERT_EQ(stream.size(), kSize);
+}
+
+TEST_F(ByteStreamTest, hugeWrite) {
+  const int64_t kSize =
+      std::numeric_limits<int32_t>::max() + static_cast<int64_t>(1);
+  auto arena = newArena();
+  ByteOutputStream stream(arena.get());
+  stream.startWrite(kSize);
+  auto iobuf = folly::IOBuf::create(kSize);
+  memset(iobuf->writableData(), 'x', kSize);
+  iobuf->append(kSize);
+  stream.appendStringView(std::string_view((const char*)iobuf->data(), kSize));
+  ASSERT_EQ(stream.size(), kSize);
 }
 
 class InputByteStreamTest : public ByteStreamTest,

@@ -33,9 +33,7 @@ class StrideIndexProvider {
   virtual uint64_t getStrideIndex() const = 0;
 };
 
-/**
- * StreamInformation Implementation
- */
+/// StreamInformation Implementation
 class StreamInformationImpl : public StreamInformation {
  public:
   static const StreamInformationImpl& getNotFound() {
@@ -44,6 +42,13 @@ class StreamInformationImpl : public StreamInformation {
   }
 
   StreamInformationImpl() : streamId_{DwrfStreamIdentifier::getInvalid()} {}
+
+  StreamInformationImpl(uint64_t offset, const proto::orc::Stream& stream)
+      : streamId_(stream),
+        offset_(offset),
+        length_(stream.length()),
+        useVInts_(true) {}
+
   StreamInformationImpl(uint64_t offset, const proto::Stream& stream)
       : streamId_(stream),
         offset_(offset),
@@ -91,33 +96,40 @@ class StripeStreams {
  public:
   virtual ~StripeStreams() = default;
 
-  /**
-   * Get the DwrfFormat for the stream
-   * @return DwrfFormat
-   */
+  /// Get the DwrfFormat for the stream
+  ///
+  /// @return DwrfFormat
   virtual DwrfFormat format() const = 0;
 
-  /**
-   * get column selector for current stripe reading session
-   * @return column selector will hold column projection info
-   */
+  /// get column selector for current stripe reading session
+  ///
+  /// @return column selector will hold column projection info
   virtual const dwio::common::ColumnSelector& getColumnSelector() const = 0;
 
-  // Get row reader options
+  /// Session timezone used for reading Timestamp.
+  virtual const tz::TimeZone* sessionTimezone() const = 0;
+
+  /// Whether to adjust Timestamp to the timeZone obtained via
+  /// sessionTimezone(). This is used to be compatible with the
+  /// old logic of Presto.
+  virtual bool adjustTimestampToTimezone() const = 0;
+
+  /// Get row reader options
   virtual const dwio::common::RowReaderOptions& rowReaderOptions() const = 0;
 
-  /**
-   * Get the encoding for the given column for this stripe.
-   */
+  /// Get the encoding for the given column for this dwrf stripe.
   virtual const proto::ColumnEncoding& getEncoding(
       const EncodingKey&) const = 0;
 
-  /**
-   * Get the stream for the given column/kind in this stripe.
-   * @param streamId stream identifier object
-   * @param throwIfNotFound fail if a stream is required and not found
-   * @return the new stream
-   */
+  /// Get the encoding for the given column for this orc stripe.
+  virtual const proto::orc::ColumnEncoding& getEncodingOrc(
+      const EncodingKey&) const = 0;
+
+  /// Get the stream for the given column/kind in this stripe.
+  ///
+  /// @param streamId stream identifier object
+  /// @param throwIfNotFound fail if a stream is required and not found
+  /// @return the new stream
   virtual std::unique_ptr<dwio::common::SeekableInputStream> getStream(
       const DwrfStreamIdentifier& si,
       std::string_view label,
@@ -137,35 +149,27 @@ class StripeStreams {
 
   virtual std::shared_ptr<StripeDictionaryCache> getStripeDictionaryCache() = 0;
 
-  /**
-   * visit all streams of given node and execute visitor logic
-   * return number of streams visited
-   */
+  /// visit all streams of given node and execute visitor logic
+  /// return number of streams visited
   virtual uint32_t visitStreamsOfNode(
       uint32_t node,
       std::function<void(const StreamInformation&)> visitor) const = 0;
 
-  /**
-   * Get the value of useVInts for the given column in this stripe.
-   * Defaults to true.
-   * @param streamId stream identifier
-   */
+  /// Get the value of useVInts for the given column in this stripe.
+  /// Defaults to true.
+  /// @param streamId stream identifier
   virtual bool getUseVInts(const DwrfStreamIdentifier& streamId) const = 0;
 
-  /**
-   * Get the memory pool for this reader.
-   */
+  /// Get the memory pool for this reader.
   virtual memory::MemoryPool& getMemoryPool() const = 0;
 
-  /**
-   * Get stride index provider which is used by string dictionary reader to
-   * get the row index stride index where next() happens
-   */
+  /// Get stride index provider which is used by string dictionary reader to
+  /// get the row index stride index where next() happens
   virtual const StrideIndexProvider& getStrideIndexProvider() const = 0;
 
   virtual int64_t stripeRows() const = 0;
 
-  // Number of rows per row group. Last row group may have fewer rows.
+  /// Number of rows per row group. Last row group may have fewer rows.
   virtual uint32_t rowsPerRowGroup() const = 0;
 };
 
@@ -181,7 +185,7 @@ class StripeStreamsBase : public StripeStreams {
     return *pool_;
   }
 
-  // For now just return DWRF, will refine when ORC has better support
+  /// For now just return DWRF, will refine when ORC has better support
   virtual DwrfFormat format() const override {
     return DwrfFormat::kDwrf;
   }
@@ -212,9 +216,7 @@ struct StripeReadState {
         stripeMetadata{std::move(_stripeMetadata)} {}
 };
 
-/**
- * StripeStream Implementation
- */
+/// StripeStream Implementation
 class StripeStreamsImpl : public StripeStreamsBase {
  public:
   static constexpr int64_t kUnknownStripeRows = -1;
@@ -250,6 +252,14 @@ class StripeStreamsImpl : public StripeStreamsBase {
     return *selector_;
   }
 
+  const tz::TimeZone* sessionTimezone() const override {
+    return readState_->readerBase->readerOptions().sessionTimezone();
+  }
+
+  bool adjustTimestampToTimezone() const override {
+    return readState_->readerBase->readerOptions().adjustTimestampToTimezone();
+  }
+
   const dwio::common::RowReaderOptions& rowReaderOptions() const override {
     return opts_;
   }
@@ -258,7 +268,8 @@ class StripeStreamsImpl : public StripeStreamsBase {
       const EncodingKey& encodingKey) const override {
     auto index = encodings_.find(encodingKey);
     if (index != encodings_.end()) {
-      return readState_->stripeMetadata->footer->encoding(index->second);
+      return readState_->stripeMetadata->footer->columnEncodingDwrf(
+          index->second);
     }
     auto encodingKeyIt = decryptedEncodings_.find(encodingKey);
     VELOX_CHECK(
@@ -268,7 +279,22 @@ class StripeStreamsImpl : public StripeStreamsBase {
     return encodingKeyIt->second;
   }
 
-  // load data into buffer according to read plan
+  const proto::orc::ColumnEncoding& getEncodingOrc(
+      const EncodingKey& encodingKey) const override {
+    VELOX_CHECK_EQ(format(), DwrfFormat::kOrc);
+
+    auto index = encodings_.find(encodingKey);
+    if (index != encodings_.end()) {
+      return readState_->stripeMetadata->footer->columnEncodingOrc(
+          index->second);
+    }
+
+    // Do not support decryptedEncodings for ORC format.
+    static proto::orc::ColumnEncoding columnEncoding;
+    return columnEncoding;
+  }
+
+  /// load data into buffer according to read plan
   void loadReadPlan();
 
   std::unique_ptr<dwio::common::SeekableInputStream> getCompressedStream(
@@ -362,9 +388,7 @@ class StripeStreamsImpl : public StripeStreamsBase {
       decryptedEncodings_;
 };
 
-/**
- * StripeInformation Implementation
- */
+/// StripeInformation Implementation
 class StripeInformationImpl : public StripeInformation {
   uint64_t offset;
   uint64_t indexLength;
@@ -406,6 +430,69 @@ class StripeInformationImpl : public StripeInformation {
 
   uint64_t getNumberOfRows() const override {
     return numRows;
+  }
+};
+
+class StripeStreamsUtil {
+ public:
+  StripeStreamsUtil() = delete;
+  ~StripeStreamsUtil() = delete;
+
+  static bool isColumnEncodingKindDirect(
+      const StripeStreams& stripe,
+      const EncodingKey& ek) {
+    if (stripe.format() == DwrfFormat::kDwrf) {
+      switch (stripe.getEncoding(ek).kind()) {
+        case proto::ColumnEncoding_Kind_DIRECT:
+          return true;
+        case proto::ColumnEncoding_Kind_DIRECT_V2:
+          return true;
+        default:
+          return false;
+      }
+    } else {
+      switch (stripe.getEncodingOrc(ek).kind()) {
+        case proto::orc::ColumnEncoding_Kind_DIRECT:
+          return true;
+        case proto::orc::ColumnEncoding_Kind_DIRECT_V2:
+          return true;
+        default:
+          return false;
+      }
+    }
+  }
+
+  static bool isColumnEncodingKindDictionary(
+      const StripeStreams& stripe,
+      const EncodingKey& ek) {
+    if (stripe.format() == DwrfFormat::kDwrf) {
+      switch (stripe.getEncoding(ek).kind()) {
+        case proto::ColumnEncoding_Kind_DICTIONARY:
+          return true;
+        case proto::ColumnEncoding_Kind_DICTIONARY_V2:
+          return true;
+        default:
+          return false;
+      }
+    } else {
+      switch (stripe.getEncodingOrc(ek).kind()) {
+        case proto::orc::ColumnEncoding_Kind_DICTIONARY:
+          return true;
+        case proto::orc::ColumnEncoding_Kind_DICTIONARY_V2:
+          return true;
+        default:
+          return false;
+      }
+    }
+  }
+
+  static DwrfStreamIdentifier getStreamForKind(
+      const StripeStreams& stripe,
+      const EncodingKey& encodingKey,
+      proto::Stream_Kind kind,
+      proto::orc::Stream_Kind orcKind) {
+    return stripe.format() == DwrfFormat::kDwrf ? encodingKey.forKind(kind)
+                                                : encodingKey.forKind(orcKind);
   }
 };
 

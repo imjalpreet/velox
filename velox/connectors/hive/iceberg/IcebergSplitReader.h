@@ -28,13 +28,13 @@ class IcebergSplitReader : public SplitReader {
  public:
   IcebergSplitReader(
       const std::shared_ptr<const hive::HiveConnectorSplit>& hiveSplit,
-      const std::shared_ptr<const HiveTableHandle>& hiveTableHandle,
-      const std::unordered_map<std::string, std::shared_ptr<HiveColumnHandle>>*
-          partitionKeys,
+      const HiveTableHandlePtr& hiveTableHandle,
+      const std::unordered_map<std::string, HiveColumnHandlePtr>* partitionKeys,
       const ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<const HiveConfig>& hiveConfig,
       const RowTypePtr& readerOutputType,
       const std::shared_ptr<io::IoStatistics>& ioStats,
+      const std::shared_ptr<filesystems::File::IoStats>& fsStats,
       FileHandleFactory* fileHandleFactory,
       folly::Executor* executor,
       const std::shared_ptr<common::ScanSpec>& scanSpec);
@@ -43,8 +43,7 @@ class IcebergSplitReader : public SplitReader {
 
   void prepareSplit(
       std::shared_ptr<common::MetadataFilter> metadataFilter,
-      dwio::common::RuntimeStatistics& runtimeStats,
-      const std::shared_ptr<HiveColumnHandle>& rowIndexColumn) override;
+      dwio::common::RuntimeStatistics& runtimeStats) override;
 
   uint64_t next(uint64_t size, VectorPtr& output) override;
 
@@ -57,8 +56,5 @@ class IcebergSplitReader : public SplitReader {
   std::list<std::unique_ptr<PositionalDeleteFileReader>>
       positionalDeleteFileReaders_;
   BufferPtr deleteBitmap_;
-  // The offset in bits of the deleteBitmap_ starting from where the bits shall
-  // be consumed
-  uint64_t deleteBitmapBitOffset_;
 };
 } // namespace facebook::velox::connector::hive::iceberg

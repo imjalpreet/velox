@@ -188,18 +188,22 @@ TEST_F(JsonExtractScalarTest, invalidPath) {
   VELOX_ASSERT_THROW(
       jsonExtractScalar(R"({"k1":"v1"})", "$.k1."), "Invalid JSON path");
   VELOX_ASSERT_THROW(
-      jsonExtractScalar(R"({"k1":"v1"})", "$.k1]"), "Invalid JSON path");
+      jsonExtractScalar(R"({"k1":"v1"})", "$.k1["), "Invalid JSON path");
   VELOX_ASSERT_THROW(
-      jsonExtractScalar(R"({"k1":"v1)", "$.k1]"), "Invalid JSON path");
+      jsonExtractScalar(R"({"k1":"v1)", "$.k1["), "Invalid JSON path");
+}
 
-  // Paths without leading '$'.
-  VELOX_ASSERT_THROW(
-      jsonExtractScalar(R"([1,2])", ".[0]"), "Invalid JSON path");
-  VELOX_ASSERT_THROW(
-      jsonExtractScalar(R"({"k1":"v1"})", ".k1"), "Invalid JSON path");
-  VELOX_ASSERT_THROW(
-      jsonExtractScalar(R"({"k1":{"k2": 999}})", ".k1.k2"),
-      "Invalid JSON path");
+TEST_F(JsonExtractScalarTest, invalidJson) {
+  // Verify that we return null on invalid JSON regardless of whether the
+  // invalid section is after the target path.
+  EXPECT_EQ(jsonExtractScalar(R"({"a": "b", "c": "d})", "$.a"), std::nullopt);
+  EXPECT_EQ(jsonExtractScalar(R"([["a"], ["b]])", "$[0][0]"), std::nullopt);
+}
+
+TEST_F(JsonExtractScalarTest, escapedString) {
+  // Verify the the returned string is unescaped.
+  EXPECT_EQ(
+      jsonExtractScalar(R"({"x": {"a" : 1, "b" : "b\/c"} })", "$.x.b"), "b/c");
 }
 
 // simdjson, like Presto java, returns the large number as-is as a string,
@@ -233,6 +237,18 @@ TEST_F(JsonExtractScalarTest, wildcardSelect) {
   EXPECT_EQ(
       jsonExtractScalar(R"({"tags":{"a":["b"],"c":[]}})", "$.tags.c[*]"),
       std::nullopt);
+}
+
+TEST_F(JsonExtractScalarTest, nanJson) {
+  std::vector<std::string> badReplacements = {"garbage", "NaN", "}", "0/0"};
+
+  for (const auto& badReplacement : badReplacements) {
+    std::string js = fmt::format(
+        fmt::runtime(
+            "{{\"hands_v1\": {}, \"over_occlusion_rate\": 0.0358322490205352}}"),
+        badReplacement);
+    EXPECT_EQ(jsonExtractScalar(js, "$.over_occlusion_rate"), std::nullopt);
+  }
 }
 
 } // namespace

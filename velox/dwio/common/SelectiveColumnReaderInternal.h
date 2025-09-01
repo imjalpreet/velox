@@ -32,39 +32,31 @@
 namespace facebook::velox::dwio::common {
 
 template <typename T>
-void SelectiveColumnReader::ensureValuesCapacity(vector_size_t numRows) {
+void SelectiveColumnReader::ensureValuesCapacity(
+    vector_size_t numRows,
+    bool preserveData) {
   if (values_ && (isFlatMapValue_ || values_->unique()) &&
       values_->capacity() >=
           BaseVector::byteSize<T>(numRows) + simd::kPadding) {
     return;
   }
-  values_ = AlignedBuffer::allocate<T>(
-      numRows + (simd::kPadding / sizeof(T)), memoryPool_);
+  auto newValues = AlignedBuffer::allocate<T>(
+      numRows + simd::kPadding / sizeof(T), memoryPool_);
+  if (preserveData) {
+    std::memcpy(
+        newValues->template asMutable<char>(), rawValues_, values_->capacity());
+  }
+  values_ = std::move(newValues);
   rawValues_ = values_->asMutable<char>();
 }
 
 template <typename T>
 void SelectiveColumnReader::prepareRead(
-    vector_size_t offset,
+    int64_t offset,
     const RowSet& rows,
     const uint64_t* incomingNulls) {
-  const bool readsNullsOnly = this->readsNullsOnly();
-  seekTo(offset, readsNullsOnly);
-
   const vector_size_t numRows = rows.back() + 1;
-  if (isFlatMapValue_) {
-    if (!nullsInReadRange_) {
-      nullsInReadRange_ = std::move(flatMapValueNullsInReadRange_);
-    }
-  } else if (nullsInReadRange_ && !nullsInReadRange_->unique()) {
-    nullsInReadRange_.reset();
-  }
-
-  formatData_->readNulls(
-      numRows, incomingNulls, nullsInReadRange_, readsNullsOnly);
-  if (isFlatMapValue_ && nullsInReadRange_) {
-    flatMapValueNullsInReadRange_ = nullsInReadRange_;
-  }
+  readNulls(offset, numRows, incomingNulls);
 
   // We check for all nulls and no nulls. We expect both calls to
   // bits::isAllSet to fail early in the common case. We could do a

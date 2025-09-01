@@ -21,8 +21,7 @@
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/TypeAliases.h"
 
-namespace facebook {
-namespace velox {
+namespace facebook::velox {
 
 /*
  * NOTE - biased vector is stored solely as a standard numeric flat array in
@@ -34,7 +33,7 @@ template <typename T>
 BiasVector<T>::BiasVector(
     velox::memory::MemoryPool* pool,
     BufferPtr nulls,
-    size_t length,
+    vector_size_t length,
     TypeKind valueType,
     BufferPtr values,
     T bias,
@@ -48,7 +47,7 @@ BiasVector<T>::BiasVector(
           pool,
           CppToType<T>::create(),
           VectorEncoding::Simple::BIASED,
-          nulls,
+          std::move(nulls),
           length,
           stats,
           distinctCount,
@@ -145,5 +144,4 @@ xsimd::batch<T> BiasVector<T>::loadSIMDValueBufferAt(size_t index) const {
   }
 }
 
-} // namespace velox
-} // namespace facebook
+} // namespace facebook::velox

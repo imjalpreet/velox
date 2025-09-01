@@ -23,10 +23,7 @@ DEFINE_int32(
     1024,
     "Number of items per thread block in Wave reader");
 
-DEFINE_int32(
-    wave_max_reader_batch_rows,
-    80 * 1024,
-    "Max batch for Wave table scan");
+DECLARE_int32(wave_max_reader_batch_rows);
 
 namespace facebook::velox::wave {
 
@@ -89,8 +86,8 @@ void ReadStream::prefetchStatus(Stream* stream) {
     return;
   }
   char* data = control_->deviceData->as<char>();
-  auto size = control_->deviceData->size() - (statusBytes_ + gridStatusBytes_);
-  stream->prefetch(getDevice(), data + statusBytes_ + gridStatusBytes_, size);
+  auto size = control_->deviceData->size() - statusBytes_;
+  stream->prefetch(getDevice(), data + statusBytes_, size);
 }
 
 namespace {
@@ -108,11 +105,16 @@ void ReadStream::makeGrid(Stream* stream) {
   auto blockSize = FLAGS_wave_reader_rows_per_tb;
   auto numBlocks = bits::roundUp(total, blockSize) / blockSize;
   auto& children = reader_->children();
+  int32_t nthFilter = 0;
+  int32_t nthNonFilter = 0;
   for (auto i = 0; i < children.size(); ++i) {
     auto* child = reader_->children()[i];
     // TODO:  Must  propagate the incoming nulls from outer to inner structs.
     // griddize must decode nulls if present.
+    auto* op = child->scanSpec().filter() ? &filters_[nthFilter++]
+                                          : &ops_[nthNonFilter++];
     child->formatData()->griddize(
+        *op,
         blockSize,
         numBlocks,
         deviceStaging_,
@@ -217,6 +219,7 @@ void ReadStream::makeCompact(bool isSerial) {
 
 void ReadStream::makeOps() {
   auto& children = reader_->children();
+  bool isMultiChunkFilter = false;
   for (auto i = 0; i < children.size(); ++i) {
     auto* child = reader_->children()[i];
     if (child->scanSpec().filter()) {
@@ -227,7 +230,13 @@ void ReadStream::makeOps() {
           this,
           filterOnly ? ColumnAction::kFilter : ColumnAction::kValues,
           filters_.back());
+      decodeLevel_ =
+          std::max(decodeLevel_, child->formatData()->maxDecodeLevel());
+      isMultiChunkFilter |= filters_.back().hasMultiChunks;
     }
+  }
+  for (auto& filter : filters_) {
+    filter.hasMultiChunks = isMultiChunkFilter;
   }
   for (auto i = 0; i < children.size(); ++i) {
     auto* child = reader_->children()[i];
@@ -246,6 +255,7 @@ bool ReadStream::decodenonFiltersInFiltersKernel() {
 
 void ReadStream::prepareRead() {
   filtersDone_ = false;
+  filtersCompacted_ = false;
   for (auto& op : filters_) {
     op.reader->formatData()->newBatch(row_);
     op.isFinal = false;
@@ -263,10 +273,18 @@ bool ReadStream::makePrograms(bool& needSync) {
   needSync = false;
   programs_.clear();
   ColumnOp* previousFilter = nullptr;
+
+  auto filterOpsFinal = [&]() {
+    return std::all_of(filters_.begin(), filters_.end(), [](auto& filter) {
+      return filter.isFinal;
+    });
+  };
+
   if (!filtersDone_ && !filters_.empty()) {
     // Filters are done consecutively, each TB does all the filters for its
     // range.
     for (auto& filter : filters_) {
+      filter.decodeLevel = decodeLevel_;
       filter.reader->formatData()->startOp(
           filter,
           previousFilter,
@@ -277,12 +295,21 @@ bool ReadStream::makePrograms(bool& needSync) {
           *this);
       previousFilter = &filter;
     }
-    if (!decodenonFiltersInFiltersKernel()) {
-      filtersDone_ = true;
-      return false;
-    }
+    decodeLevel_--;
+    filtersDone_ = filterOpsFinal();
+
+    // the decode is already done here if the filters are dispatched and there
+    // is only one filter kernel (hence makeCompact is not needed) and there are
+    // no non-filter columns to decode.
+    return filtersDone_ && filters_.size() == 1 && ops_.empty();
+    // TODO(bowenwu): revisit this optimization of
+    // decodenonFiltersInFiltersKernel().
   }
-  makeCompact(!filtersDone_);
+  if (!filtersCompacted_) {
+    // makeCompact is not idempotent can only be called once per batch.
+    makeCompact(!filtersDone_);
+    filtersCompacted_ = true;
+  }
   previousFilter = filters_.empty() ? nullptr : &filters_.back();
   for (auto i = 0; i < ops_.size(); ++i) {
     auto& op = ops_[i];
@@ -340,6 +367,24 @@ void ReadStream::syncStaging(Stream& stream) {
   });
 }
 
+void ReadStream::initializeResultNulls(Stream& stream) {
+  for (auto i = 0; i < filters_.size(); ++i) {
+    if (filters_[i].reader->formatData()->hasNulls()) {
+      auto waveVector = filters_[i].waveVector;
+      if (waveVector && waveVector->nulls()) {
+        stream.memset(waveVector->nulls(), 1, waveVector->size());
+      }
+    }
+  }
+  for (auto i = 0; i < ops_.size(); ++i) {
+    if (ops_[i].reader->formatData()->hasNulls()) {
+      auto waveVector = ops_[i].waveVector;
+      VELOX_CHECK(waveVector != nullptr && waveVector->nulls() != nullptr);
+      stream.memset(waveVector->nulls(), 1, waveVector->size());
+    }
+  }
+}
+
 void ReadStream::launch(
     std::unique_ptr<ReadStream> readStream,
     int32_t row,
@@ -352,7 +397,6 @@ void ReadStream::launch(
   // kBlockSize top level rows of output and to have Operand structs for the
   // produced column.
   readStream->makeControl();
-  auto numRows = readStream->rows_.size();
   auto waveStream = readStream->waveStream;
   WaveStats& stats = waveStream->stats();
   bool firstLaunch = true;
@@ -363,9 +407,10 @@ void ReadStream::launch(
         bool needSync = false;
         bool griddizedHere = false;
         if (!readStream->inited_) {
-          readStream->makeGrid(stream);
-          griddizedHere = true;
           readStream->makeOps();
+          readStream->makeGrid(stream);
+          readStream->initializeResultNulls(*stream);
+          griddizedHere = true;
           readStream->inited_ = true;
         }
         readStream->prepareRead();
@@ -451,9 +496,9 @@ void ReadStream::makeControl() {
   // The operand section must be cleared before written on host. The statuses
   // are cleared on device.
   memset(
-      control->deviceData->as<char>() + statusBytes_ + instructionBytes,
+      control->deviceData->as<char>() + statusBytes_,
       0,
-      info.totalBytes);
+      instructionBytes + info.totalBytes);
   control->params.status = control->deviceData->as<BlockStatus>();
   for (auto& reader : reader_->children()) {
     if (!reader->formatData()->hasNulls() || reader->hasNonNullFilter()) {

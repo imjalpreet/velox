@@ -16,45 +16,51 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
-#include <fstream>
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Fs.h"
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/process/ThreadDebugInfo.h"
 #include "velox/common/testutil/TestValue.h"
-#include "velox/core/Expressions.h"
 #include "velox/expression/CastExpr.h"
 #include "velox/expression/ConstantExpr.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/ExprCompiler.h"
 #include "velox/expression/FieldReference.h"
+#include "velox/expression/LambdaExpr.h"
 #include "velox/expression/PeeledEncoding.h"
 #include "velox/expression/ScopedVarSetter.h"
 #include "velox/expression/VectorFunction.h"
+#include "velox/vector/LazyVector.h"
 #include "velox/vector/SelectivityVector.h"
 #include "velox/vector/VectorSaver.h"
 
-DEFINE_bool(
-    force_eval_simplified,
-    false,
-    "Whether to overwrite queryCtx and force the "
-    "use of simplified expression evaluation path.");
-
-DEFINE_bool(
-    velox_experimental_save_input_on_fatal_signal,
-    false,
-    "This is an experimental flag only to be used for debugging "
-    "purposes. If set to true, serializes the input vector data and "
-    "all the SQL expressions in the ExprSet that is currently "
-    "executing, whenever a fatal signal is encountered. Enabling "
-    "this flag makes the signal handler async signal unsafe, so it "
-    "should only be used for debugging purposes. The vector and SQLs "
-    "are serialized to files in directories specified by either "
-    "'velox_save_input_on_expression_any_failure_path' or "
-    "'velox_save_input_on_expression_system_failure_path'");
+DECLARE_string(velox_save_input_on_expression_any_failure_path);
+DECLARE_string(velox_save_input_on_expression_system_failure_path);
+DECLARE_bool(force_eval_simplified);
+DECLARE_bool(velox_experimental_save_input_on_fatal_signal);
 
 namespace facebook::velox::exec {
+
+namespace {
+const auto& specialFormNames() {
+  static const folly::F14FastMap<SpecialFormKind, std::string_view> kNames = {
+      {SpecialFormKind::kFieldAccess, "FIELD"},
+      {SpecialFormKind::kConstant, "CONSTANT"},
+      {SpecialFormKind::kCast, "CAST"},
+      {SpecialFormKind::kCoalesce, "COALESCE"},
+      {SpecialFormKind::kSwitch, "SWITCH"},
+      {SpecialFormKind::kLambda, "LAMBDA"},
+      {SpecialFormKind::kTry, "TRY"},
+      {SpecialFormKind::kAnd, "AND"},
+      {SpecialFormKind::kOr, "OR"},
+      {SpecialFormKind::kCustom, "CUSTOM"},
+  };
+  return kNames;
+}
+} // namespace
+
+VELOX_DEFINE_ENUM_NAME(SpecialFormKind, specialFormNames);
 
 folly::Synchronized<std::vector<std::shared_ptr<ExprSetListener>>>&
 exprSetListeners() {
@@ -136,7 +142,7 @@ Expr::Expr(
       name_(std::move(name)),
       vectorFunction_(std::move(vectorFunction)),
       vectorFunctionMetadata_{std::move(metadata)},
-      specialForm_{false},
+      specialFormKind_{std::nullopt},
       supportsFlatNoNullsFastPath_{
           vectorFunction_->supportsFlatNoNullsFastPath() &&
           type_->isPrimitiveType() && type_->isFixedWidth() &&
@@ -225,6 +231,15 @@ void Expr::computeDistinctFields() {
   }
 }
 
+bool Expr::isCurrentFunctionDeterministic() const {
+  if (vectorFunction_) {
+    return vectorFunctionMetadata_.deterministic;
+  } else {
+    VELOX_CHECK(isSpecialForm());
+    return true;
+  }
+}
+
 void Expr::computeMetadata() {
   if (metaDataComputed_) {
     return;
@@ -236,17 +251,15 @@ void Expr::computeMetadata() {
   }
 
   // (1) Compute deterministic_.
-  // An expression is deterministic if it is a deterministic function call or a
-  // special form, and all its inputs are also deterministic.
-  if (vectorFunction_) {
-    deterministic_ = vectorFunctionMetadata_.deterministic;
-  } else {
-    VELOX_CHECK(isSpecialForm());
-    deterministic_ = true;
-  }
-
+  // An expression is deterministic if it is a deterministic function call or
+  // a special form, and all its inputs are also deterministic.
+  deterministic_ = isCurrentFunctionDeterministic();
   for (auto& input : inputs_) {
-    deterministic_ &= input->deterministic_;
+    if (auto* lambda = input->as<LambdaExpr>()) {
+      deterministic_ &= lambda->body()->isDeterministic();
+    } else {
+      deterministic_ &= input->deterministic_;
+    }
   }
 
   // (2) Compute distinctFields_ and multiplyReferencedFields_.
@@ -266,9 +279,9 @@ void Expr::computeMetadata() {
       // cast, constant and fieldReference expressions act as vector functions
       // with default null behavior.
 
-      // If the function has default null behavior, the Expr propagates nulls if
-      // the set of fields null-propagating arguments depend on is a superset of
-      // the fields non null-propagating arguments depend on.
+      // If the function has default null behavior, the Expr propagates nulls
+      // if the set of fields null-propagating arguments depend on is a
+      // superset of the fields non null-propagating arguments depend on.
       std::unordered_set<FieldReference*> nullPropagating, nonNullPropagating;
       for (auto& input : inputs_) {
         if (input->propagatesNulls_) {
@@ -390,8 +403,8 @@ bool Expr::evalArgsDefaultNulls(
         auto newErrors = context.errors();
         assert(newErrors); // lint
         if (flatNulls) {
-          // There are both nulls and errors. Only a null with no error removes
-          // a row.
+          // There are both nulls and errors. Only a null with no error
+          // removes a row.
           auto errorNulls = newErrors->errorFlags();
           auto rowBits = rows.mutableRows().asMutableRange().bits();
           auto nwords = bits::nwords(rows.rows().end());
@@ -412,6 +425,9 @@ bool Expr::evalArgsDefaultNulls(
       }
     }
   }
+
+  // Default-null behavior has taken place if rows has changed.
+  stats_.defaultNullRowsSkipped |= rows.hasChanged();
 
   mergeOrThrowArgumentErrors(
       rows.rows(), originalErrors, argumentErrors, context);
@@ -504,6 +520,8 @@ void Expr::evalSimplifiedImpl(
         inputValue->encoding() == VectorEncoding::Simple::ROW ||
         inputValue->encoding() == VectorEncoding::Simple::FUNCTION);
   };
+  auto releaseInputsGuard =
+      folly::makeGuard([&]() { releaseInputValues(context); });
 
   if (defaultNulls) {
     if (!evalArgsDefaultNulls(remainingRows, evalArg, context, result)) {
@@ -527,7 +545,6 @@ void Expr::evalSimplifiedImpl(
 
   // Make sure the returned vector has its null bitmap properly set.
   addNulls(rows, remainingRows.rows().asRange().bits(), context, result);
-  releaseInputValues(context);
 }
 
 namespace {
@@ -546,8 +563,8 @@ class ExprExceptionContext {
   /// Persist data and sql on disk. Data will be persisted in $basePath/vector
   /// and sql will be persisted in $basePath/sql
   void persistDataAndSql(const char* basePath) {
-    // Exception already persisted or failed to persist. We don't persist again
-    // in this situation.
+    // Exception already persisted or failed to persist. We don't persist
+    // again in this situation.
     if (!dataPath_.empty()) {
       return;
     }
@@ -641,22 +658,21 @@ class ExprExceptionContext {
   /// Path of the file storing the serialized 'vector'. Used to avoid
   /// serializing vector repeatedly in cases when multiple rows generate
   /// exceptions. This happens when exceptions are suppressed by TRY/AND/OR.
-  std::string dataPath_{""};
+  std::string dataPath_;
 
   /// Path of the file storing the expression SQL. Used to avoid writing SQL
   /// repeatedly in cases when multiple rows generate exceptions.
-  std::string sqlPath_{""};
+  std::string sqlPath_;
 
   /// Path of the file storing the SQL for all expressions in the ExprSet that
-  /// was executing this expression. Useful if the bug that caused the error was
-  /// encountered due to some mutation from running the other expressions.
+  /// was executing this expression. Useful if the bug that caused the error
+  /// was encountered due to some mutation from running the other expressions.
   std::string allExprSqlPath_{"N/A"};
 };
 
 /// Used to generate context for an error occurred while evaluating
 /// top-level expression or top-level context for an error occurred while
-/// evaluating top-level expression. If
-/// FLAGS_velox_save_input_on_expression_failure_path
+/// evaluating top-level expression. If saveInputOnExpressionAnyFailurePath
 /// is not empty, saves the input vector and expression SQL to files in
 /// that directory.
 ///
@@ -733,7 +749,8 @@ void Expr::evalFlatNoNullsImpl(
       {.messageFunc = parentExprSet ? onTopLevelException : onException,
        .arg = parentExprSet ? (void*)&exprExceptionContext : this,
        .isEssential = parentExprSet != nullptr});
-
+  auto releaseInputsGuard =
+      folly::makeGuard([&]() { releaseInputValues(context); });
   if (!rows.hasSelections()) {
     checkOrSetEmptyResult(type(), context.pool(), result);
     return;
@@ -747,8 +764,8 @@ void Expr::evalFlatNoNullsImpl(
   inputValues_.resize(inputs_.size());
   for (int32_t i = 0; i < inputs_.size(); ++i) {
     if (constantInputs_[i]) {
-      // No need to re-evaluate constant expression. Simply move constant values
-      // from constantInputs_.
+      // No need to re-evaluate constant expression. Simply move constant
+      // values from constantInputs_.
       inputValues_[i] = std::move(constantInputs_[i]);
       inputValues_[i]->resize(rows.end());
     } else {
@@ -765,7 +782,6 @@ void Expr::evalFlatNoNullsImpl(
       VELOX_CHECK_NULL(inputValues_[i]);
     }
   }
-  releaseInputValues(context);
 }
 
 void Expr::eval(
@@ -780,8 +796,8 @@ void Expr::eval(
     return;
   }
 
-  // Make sure to include current expression in the error message in case of an
-  // exception.
+  // Make sure to include current expression in the error message in case of
+  // an exception.
   ExprExceptionContext exprExceptionContext{this, context.row(), parentExprSet};
   ExceptionContextSetter exceptionContext(
       {.messageFunc = parentExprSet ? onTopLevelException : onException,
@@ -805,20 +821,24 @@ void Expr::eval(
   // peeling and wrapping in the sub-nodes.
   //
   // Also load fields referenced by shared sub expressions to ensure that if
-  // there is an encoding on the loaded vector, then it is always peeled before
-  // evaluating sub-expression. Otherwise, the first call to
-  // evaluateSharedSubexpr might pass rows before peeling and the next one pass
-  // rows after peeling.
+  // there is an encoding on the loaded vector, then it is always peeled
+  // before evaluating sub-expression. Otherwise, the first call to
+  // evaluateSharedSubexpr might pass rows before peeling and the next one
+  // pass rows after peeling.
   //
   // Finally, for non-null propagating expressions, load multiply referenced
-  // inputs unconditionally as it is hard to keep track of the superset of rows
-  // that would end up being evaluated among all its children (and hence need to
-  // be loaded). This is because any of the children might have null propagating
-  // expressions that end up operating on a reduced set of rows. So, one sub
-  // tree might need only a subset, whereas other might need a different subset.
+  // inputs unconditionally as it is hard to keep track of the superset of
+  // rows that would end up being evaluated among all its children (and hence
+  // need to be loaded). This is because any of the children might have null
+  // propagating expressions that end up operating on a reduced set of rows.
+  // So, one sub tree might need only a subset, whereas other might need a
+  // different subset.
   //
   // TODO: Re-work the logic of deciding when to load which field.
-  if (!hasConditionals_ || distinctFields_.size() == 1 ||
+  if (context.lazyDereference()) {
+    // Do not load any lazy.
+  } else if (
+      !hasConditionals_ || distinctFields_.size() == 1 ||
       shouldEvaluateSharedSubexp(context) ||
       !context.deferredLazyLoadingEnabled()) {
     // Load lazy vectors if any.
@@ -827,10 +847,10 @@ void Expr::eval(
     }
   } else if (
       !propagatesNulls_ && !evaluatesArgumentsOnNonIncreasingSelection()) {
-    // Load multiply-referenced fields at common parent expr with "rows".  Delay
-    // loading fields that are not in multiplyReferencedFields_.  In case
-    // evaluatesArgumentsOnNonIncreasingSelection() is true, this is delayed
-    // until we process the inputs of ConjunctExpr.
+    // Load multiply-referenced fields at common parent expr with "rows".
+    // Delay loading fields that are not in multiplyReferencedFields_.  In
+    // case evaluatesArgumentsOnNonIncreasingSelection() is true, this is
+    // delayed until we process the inputs of ConjunctExpr.
     for (const auto& field : multiplyReferencedFields_) {
       context.ensureFieldLoaded(field->index(context), rows);
     }
@@ -887,7 +907,6 @@ void Expr::evaluateSharedSubexpr(
     } else {
       // Otherwise, simply evaluate it and return without caching the results.
       eval(rows, context, result);
-
       return;
     }
   }
@@ -929,15 +948,15 @@ void Expr::evaluateSharedSubexpr(
   // Identify a subset of rows that need to be computed: rows -
   // sharedSubexprRows_.
   LocalSelectivityVector missingRowsHolder(context, rows);
-  auto missingRows = missingRowsHolder.get();
+  auto* missingRows = missingRowsHolder.get();
   missingRows->deselect(*sharedSubexprRows);
   VELOX_DCHECK(missingRows->hasSelections());
 
   // Fix finalSelection to avoid losing values outside missingRows.
-  // Final selection of rows need to include sharedSubexprRows_, missingRows and
-  // current final selection of rows if set.
+  // Final selection of rows need to include sharedSubexprRows_, missingRows
+  // and current final selection of rows if set.
   LocalSelectivityVector newFinalSelectionHolder(context, *sharedSubexprRows);
-  auto newFinalSelection = newFinalSelectionHolder.get();
+  auto* newFinalSelection = newFinalSelectionHolder.get();
   newFinalSelection->select(*missingRows);
   if (!context.isFinalSelection()) {
     newFinalSelection->select(*context.finalSelection());
@@ -986,12 +1005,12 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
 
   // Prepare the rows and vectors to peel.
 
-  // Use finalSelection to generate peel to ensure those rows can be translated
-  // and ensure consistent peeling across multiple calls to this expression if
-  // its a shared subexpression.
+  // Use finalSelection to generate peel to ensure those rows can be
+  // translated and ensure consistent peeling across multiple calls to this
+  // expression if its a shared subexpression.
   const auto& rowsToPeel =
       context.isFinalSelection() ? rows : *context.finalSelection();
-  auto numFields = context.row()->childrenSize();
+  [[maybe_unused]] auto numFields = context.row()->childrenSize();
   std::vector<VectorPtr> vectorsToPeel;
   vectorsToPeel.reserve(distinctFields_.size());
   for (auto* field : distinctFields_) {
@@ -1131,7 +1150,12 @@ bool Expr::removeSureNulls(
   }
   if (result) {
     result->updateBounds();
-    return result->countSelected() != rows.countSelected();
+    // Default-null behavior has taken place if some sure nulls has been
+    // removed from rows.
+    if (result->countSelected() < rows.countSelected()) {
+      stats_.defaultNullRowsSkipped = true;
+      return true;
+    }
   }
   return false;
 }
@@ -1184,11 +1208,11 @@ void Expr::evalWithNulls(
 }
 
 // Optimization that attempts to cache results for inputs that are dictionary
-// encoded and use the same base vector between subsequent input batches. Since
-// this hold onto a reference to the base vector and the cached results, it can
-// be memory intensive. Therefore in order to reduce this consumption and ensure
-// it is only employed for cases where it can be useful, it only starts caching
-// result after it encounters the same base at least twice.
+// encoded and use the same base vector between subsequent input batches.
+// Since this hold onto a reference to the base vector and the cached results,
+// it can be memory intensive. Therefore in order to reduce this consumption
+// and ensure it is only employed for cases where it can be useful, it only
+// starts caching result after it encounters the same base at least twice.
 void Expr::evalWithMemo(
     const SelectivityVector& rows,
     EvalCtx& context,
@@ -1196,20 +1220,36 @@ void Expr::evalWithMemo(
   VectorPtr base;
   distinctFields_[0]->evalSpecialForm(rows, context, base);
 
+  // evalWithNulls may throw an exception. If this happens during constant
+  // folding, the exception is suppressed and the Expr object may be reused.
+  // Hence, it is important to update state in way that ensure "valid" state in
+  // case of exceptions.
+  //
+  // Also, note that the same expression running on same data may pass or may
+  // fail depending on whether it runs under TRY or not.
+  //
+  // An example expression that triggers these edge cases:
+  //
+  //    try(coalesce(array_min_by(array[1, 2, 3], x -> x / 0), 0::INTEGER))
+
   if (base.get() != baseOfDictionaryRawPtr_ ||
       baseOfDictionaryWeakPtr_.expired()) {
     baseOfDictionaryRepeats_ = 0;
-    baseOfDictionaryWeakPtr_ = base;
-    baseOfDictionaryRawPtr_ = base.get();
+    baseOfDictionaryWeakPtr_.reset();
+    baseOfDictionaryRawPtr_ = nullptr;
     context.releaseVector(baseOfDictionary_);
     context.releaseVector(dictionaryCache_);
+
     evalWithNulls(rows, context, result);
+    baseOfDictionaryWeakPtr_ = base;
+    baseOfDictionaryRawPtr_ = base.get();
     return;
   }
-  ++baseOfDictionaryRepeats_;
 
-  if (baseOfDictionaryRepeats_ == 1) {
+  if (baseOfDictionaryRepeats_ == 0) {
     evalWithNulls(rows, context, result);
+
+    ++baseOfDictionaryRepeats_;
     baseOfDictionary_ = base;
     dictionaryCache_ = result;
     if (!cachedDictionaryIndices_) {
@@ -1220,6 +1260,8 @@ void Expr::evalWithMemo(
     context.deselectErrors(*cachedDictionaryIndices_);
     return;
   }
+
+  ++baseOfDictionaryRepeats_;
 
   if (cachedDictionaryIndices_) {
     LocalSelectivityVector cachedHolder(context, rows);
@@ -1246,31 +1288,34 @@ void Expr::evalWithMemo(
 
     evalWithNulls(*uncached, context, result);
     context.deselectErrors(*uncached);
-    context.exprSet()->addToMemo(this);
-    auto newCacheSize = uncached->end();
 
-    // dictionaryCache_ is valid only for cachedDictionaryIndices_. Hence, a
-    // safe call to BaseVector::ensureWritable must include all the rows not
-    // covered by cachedDictionaryIndices_. If BaseVector::ensureWritable is
-    // called only for a subset of rows not covered by
-    // cachedDictionaryIndices_, it will attempt to copy rows that are not
-    // valid leading to a crash.
-    LocalSelectivityVector allUncached(context, dictionaryCache_->size());
-    allUncached.get()->setAll();
-    allUncached.get()->deselect(*cachedDictionaryIndices_);
-    context.ensureWritable(*allUncached.get(), type(), dictionaryCache_);
+    if (uncached->hasSelections()) {
+      context.exprSet()->addToMemo(this);
+      auto newCacheSize = uncached->end();
 
-    if (cachedDictionaryIndices_->size() < newCacheSize) {
-      cachedDictionaryIndices_->resize(newCacheSize, false);
+      // dictionaryCache_ is valid only for cachedDictionaryIndices_. Hence, a
+      // safe call to BaseVector::ensureWritable must include all the rows not
+      // covered by cachedDictionaryIndices_. If BaseVector::ensureWritable is
+      // called only for a subset of rows not covered by
+      // cachedDictionaryIndices_, it will attempt to copy rows that are not
+      // valid leading to a crash.
+      LocalSelectivityVector allUncached(context, dictionaryCache_->size());
+      allUncached.get()->setAll();
+      allUncached.get()->deselect(*cachedDictionaryIndices_);
+      context.ensureWritable(*allUncached.get(), type(), dictionaryCache_);
+
+      if (cachedDictionaryIndices_->size() < newCacheSize) {
+        cachedDictionaryIndices_->resize(newCacheSize, false);
+      }
+
+      cachedDictionaryIndices_->select(*uncached);
+
+      // Resize the dictionaryCache_ to accommodate all the necessary rows.
+      if (dictionaryCache_->size() < uncached->end()) {
+        dictionaryCache_->resize(uncached->end());
+      }
+      dictionaryCache_->copy(result.get(), *uncached, nullptr);
     }
-
-    cachedDictionaryIndices_->select(*uncached);
-
-    // Resize the dictionaryCache_ to accommodate all the necessary rows.
-    if (dictionaryCache_->size() < uncached->end()) {
-      dictionaryCache_->resize(uncached->end());
-    }
-    dictionaryCache_->copy(result.get(), *uncached, nullptr);
   }
   context.releaseVector(base);
 }
@@ -1406,16 +1451,17 @@ void Expr::evalAllImpl(
     EvalCtx& context,
     VectorPtr& result) {
   VELOX_DCHECK(rows.hasSelections());
-
+  auto releaseInputsGuard =
+      folly::makeGuard([&]() { releaseInputValues(context); });
   if (isSpecialForm()) {
     evalSpecialFormWithStats(rows, context, result);
     return;
   }
-  bool tryPeelArgs = deterministic_ ? true : false;
+  bool tryPeelArgs = isCurrentFunctionDeterministic();
   bool defaultNulls = vectorFunctionMetadata_.defaultNullBehavior;
 
-  // Tracks what subset of rows shall un-evaluated inputs and current expression
-  // evaluates. Initially points to rows.
+  // Tracks what subset of rows shall un-evaluated inputs and current
+  // expression evaluates. Initially points to rows.
   MutableRemainingRows remainingRows(rows, context);
   if (defaultNulls) {
     if (!evalArgsDefaultNulls(
@@ -1453,7 +1499,6 @@ void Expr::evalAllImpl(
   if (remainingRows.hasChanged()) {
     addNulls(rows, remainingRows.rows().asRange().bits(), context, result);
   }
-  releaseInputValues(context);
 }
 
 bool Expr::applyFunctionWithPeeling(
@@ -1463,10 +1508,14 @@ bool Expr::applyFunctionWithPeeling(
   LocalDecodedVector localDecoded(context);
   LocalSelectivityVector newRowsHolder(context);
   if (!context.peelingEnabled()) {
-    if (inputValues_.size() == 1) {
+    if (distinctFields_.size() < 2) {
       // If we have a single input, velox needs to ensure that the
-      // vectorFunction would receive a flat input.
-      BaseVector::flattenVector(inputValues_[0]);
+      // vectorFunction would receive a flat or constant input.
+      for (int i = 0; i < inputValues_.size(); ++i) {
+        if (inputValues_[i]->encoding() == VectorEncoding::Simple::DICTIONARY) {
+          BaseVector::flattenVector(inputValues_[i]);
+        }
+      }
       applyFunction(applyRows, context, result);
       return true;
     }
@@ -1487,9 +1536,9 @@ bool Expr::applyFunctionWithPeeling(
   peeledVectors.clear();
 
   // Translate the relevant rows.
-  // Note: We do not need to translate final selection since at this stage those
-  // rows are not used but isFinalSelection() is only used to check whether
-  // pre-existing rows need to be preserved.
+  // Note: We do not need to translate final selection since at this stage
+  // those rows are not used but isFinalSelection() is only used to check
+  // whether pre-existing rows need to be preserved.
   auto newRows = peeledEncoding->translateToInnerRows(applyRows, newRowsHolder);
 
   withContextSaver([&](ContextSaver& saver) {
@@ -1504,9 +1553,9 @@ bool Expr::applyFunctionWithPeeling(
         this->type(), context.pool(), peeledResult, applyRows);
     context.moveOrCopyResult(wrappedResult, applyRows, result);
 
-    // Recycle peeledResult if it's not owned by the result vector. Examples of
-    // when this can happen is when the result is a primitive constant vector,
-    // or when moveOrCopyResult copies wrappedResult content.
+    // Recycle peeledResult if it's not owned by the result vector. Examples
+    // of when this can happen is when the result is a primitive constant
+    // vector, or when moveOrCopyResult copies wrappedResult content.
     context.releaseVector(peeledResult);
   });
 
@@ -1656,16 +1705,8 @@ void Expr::appendInputsSql(
   }
 }
 
-bool Expr::isConstant() const {
-  if (!isDeterministic()) {
-    return false;
-  }
-  for (auto& input : inputs_) {
-    if (!input->is<ConstantExpr>()) {
-      return false;
-    }
-  }
-  return true;
+bool Expr::isConstantExpr() const {
+  return isDeterministic() && distinctFields_.empty();
 }
 
 namespace {
@@ -1677,8 +1718,8 @@ common::Subfield extractSubfield(
   for (;;) {
     if (auto* ref = expr->as<FieldReference>()) {
       const auto& name = ref->name();
-      // When the field name is empty string, it typically means that the field
-      // name was not set in the parent type.
+      // When the field name is empty string, it typically means that the
+      // field name was not set in the parent type.
       if (name == "") {
         expr = expr->inputs()[0].get();
         continue;
@@ -1756,12 +1797,57 @@ std::vector<common::Subfield> Expr::extractSubfields() const {
   return subfields;
 }
 
+namespace {
+
+// Make sure there are only FieldReferences, and there is no overlap between the
+// output of expressions.
+void validateLazyDereference(const std::vector<std::shared_ptr<Expr>>& exprs) {
+#ifndef NDEBUG
+  std::vector<std::vector<std::string>> paths;
+  for (auto& expr : exprs) {
+    std::vector<std::string> path;
+    auto* fieldRef = dynamic_cast<const FieldReference*>(expr.get());
+    VELOX_CHECK_NOT_NULL(fieldRef);
+    path.push_back(fieldRef->field());
+    while (!fieldRef->inputs().empty()) {
+      VELOX_CHECK_EQ(fieldRef->inputs().size(), 1);
+      fieldRef =
+          dynamic_cast<const FieldReference*>(fieldRef->inputs()[0].get());
+      VELOX_CHECK_NOT_NULL(fieldRef);
+      path.push_back(fieldRef->field());
+    }
+    std::reverse(path.begin(), path.end());
+    paths.push_back(std::move(path));
+  }
+  std::sort(paths.begin(), paths.end());
+  for (int i = 1; i < paths.size(); ++i) {
+    if (paths[i - 1].size() > paths[i].size()) {
+      continue;
+    }
+    bool isPrefix = true;
+    for (int j = 0; j < paths[i - 1].size(); ++j) {
+      if (paths[i - 1][j] != paths[i][j]) {
+        isPrefix = false;
+        break;
+      }
+    }
+    VELOX_CHECK(!isPrefix);
+  }
+#endif
+}
+
+} // namespace
+
 ExprSet::ExprSet(
     const std::vector<core::TypedExprPtr>& sources,
     core::ExecCtx* execCtx,
-    bool enableConstantFolding)
-    : execCtx_(execCtx) {
+    bool enableConstantFolding,
+    bool lazyDereference)
+    : execCtx_(execCtx), lazyDereference_(lazyDereference) {
   exprs_ = compileExpressions(sources, execCtx, this, enableConstantFolding);
+  if (lazyDereference_) {
+    validateLazyDereference(exprs_);
+  }
   std::vector<FieldReference*> allDistinctFields;
   for (auto& expr : exprs_) {
     Expr::mergeFields(
@@ -1773,7 +1859,8 @@ namespace {
 void addStats(
     const exec::Expr& expr,
     std::unordered_map<std::string, exec::ExprStats>& stats,
-    std::unordered_set<const exec::Expr*>& uniqueExprs) {
+    std::unordered_set<const exec::Expr*>& uniqueExprs,
+    bool excludeSpecialForm) {
   auto it = uniqueExprs.find(&expr);
   if (it != uniqueExprs.end()) {
     // Common sub-expression. Skip to avoid double counting.
@@ -1782,13 +1869,16 @@ void addStats(
 
   uniqueExprs.insert(&expr);
 
+  bool excludeSplFormExpr = excludeSpecialForm && expr.isSpecialForm();
   // Do not aggregate empty stats.
-  if (expr.stats().numProcessedRows) {
+  bool emptyStats =
+      !expr.stats().numProcessedRows && !expr.stats().defaultNullRowsSkipped;
+  if (!emptyStats && !excludeSplFormExpr) {
     stats[expr.name()].add(expr.stats());
   }
 
   for (const auto& input : expr.inputs()) {
-    addStats(*input, stats, uniqueExprs);
+    addStats(*input, stats, uniqueExprs, excludeSpecialForm);
   }
 }
 
@@ -1797,11 +1887,12 @@ std::string makeUuid() {
 }
 } // namespace
 
-std::unordered_map<std::string, exec::ExprStats> ExprSet::stats() const {
+std::unordered_map<std::string, exec::ExprStats> ExprSet::stats(
+    bool excludeSpecialForm) const {
   std::unordered_map<std::string, exec::ExprStats> stats;
   std::unordered_set<const exec::Expr*> uniqueExprs;
   for (const auto& expr : exprs()) {
-    addStats(*expr, stats, uniqueExprs);
+    addStats(*expr, stats, uniqueExprs, excludeSpecialForm);
   }
 
   return stats;
@@ -1902,20 +1993,23 @@ void ExprSet::eval(
     const SelectivityVector& rows,
     EvalCtx& context,
     std::vector<VectorPtr>& result) {
+  VELOX_CHECK_EQ(lazyDereference_, context.lazyDereference());
   result.resize(exprs_.size());
   if (initialize) {
     clearSharedSubexprs();
   }
 
-  // Make sure LazyVectors, referenced by multiple expressions, are loaded
-  // for all the "rows".
-  //
-  // Consider projection with 2 expressions: f(a) AND g(b), h(b)
-  // If b is a LazyVector and f(a) AND g(b) expression is evaluated first, it
-  // will load b only for rows where f(a) is true. However, h(b) projection
-  // needs all rows for "b".
-  for (const auto& field : multiplyReferencedFields_) {
-    context.ensureFieldLoaded(field->index(context), rows);
+  if (!lazyDereference_) {
+    // Make sure LazyVectors, referenced by multiple expressions, are loaded for
+    // all the "rows".
+    //
+    // Consider projection with 2 expressions: f(a) AND g(b), h(b) If b is a
+    // LazyVector and f(a) AND g(b) expression is evaluated first, it will load
+    // b only for rows where f(a) is true. However, h(b) projection needs all
+    // rows for "b".
+    for (const auto& field : multiplyReferencedFields_) {
+      context.ensureFieldLoaded(field->index(context), rows);
+    }
   }
 
   if (FLAGS_velox_experimental_save_input_on_fatal_signal) {
@@ -1952,8 +2046,13 @@ void ExprSet::clear() {
   for (auto* memo : memoizingExprs_) {
     memo->clearMemo();
   }
-  distinctFields_.clear();
-  multiplyReferencedFields_.clear();
+  memoizingExprs_.clear();
+}
+
+void ExprSet::clearCache() {
+  for (auto& expr : exprs_) {
+    expr->clearCache();
+  }
 }
 
 void ExprSetSimplified::eval(
@@ -1974,12 +2073,14 @@ void ExprSetSimplified::eval(
 
 std::unique_ptr<ExprSet> makeExprSetFromFlag(
     std::vector<core::TypedExprPtr>&& source,
-    core::ExecCtx* execCtx) {
+    core::ExecCtx* execCtx,
+    bool lazyDereference) {
   if (execCtx->queryCtx()->queryConfig().exprEvalSimplified() ||
       FLAGS_force_eval_simplified) {
     return std::make_unique<ExprSetSimplified>(std::move(source), execCtx);
   }
-  return std::make_unique<ExprSet>(std::move(source), execCtx);
+  return std::make_unique<ExprSet>(
+      std::move(source), execCtx, true, lazyDereference);
 }
 
 std::string printExprWithStats(const exec::ExprSet& exprSet) {
@@ -2006,11 +2107,49 @@ void SimpleExpressionEvaluator::evaluate(
   result = results[0];
 }
 
+void SimpleExpressionEvaluator::evaluate(
+    exec::ExprSet* exprSet,
+    const SelectivityVector& rows,
+    const RowVector& input,
+    std::vector<VectorPtr>& results) {
+  EvalCtx context(ensureExecCtx(), exprSet, &input);
+  exprSet->eval(0, exprSet->size(), true, rows, context, results);
+}
+
 core::ExecCtx* SimpleExpressionEvaluator::ensureExecCtx() {
   if (!execCtx_) {
     execCtx_ = std::make_unique<core::ExecCtx>(pool_, queryCtx_);
   }
   return execCtx_.get();
+}
+
+VectorPtr tryEvaluateConstantExpression(
+    const core::TypedExprPtr& expr,
+    memory::MemoryPool* pool,
+    const std::shared_ptr<core::QueryCtx>& queryCtx,
+    bool suppressEvaluationFailures) {
+  velox::core::ExecCtx execCtx{pool, queryCtx.get()};
+  velox::exec::ExprSet exprSet({expr}, &execCtx);
+
+  // The construction of ExprSet involves compiling and constant folding the
+  // expression. If constant folding succeeded, then we get a ConstantExpr.
+  // Constant folding may fail because expression is not constant-foldable or if
+  // an error happened during evaluation (5 / 0 fails with "division by zero").
+  // If constant folding didn't succeed, but suppressEvaluationFailures is
+  // false, we need to re-evaluate the expression to propagate the failure.
+  const bool doEvaluate = exprSet.expr(0)->is<ConstantExpr>() ||
+      (!suppressEvaluationFailures && exprSet.expr(0)->isConstantExpr());
+
+  if (doEvaluate) {
+    auto data = BaseVector::create<RowVector>(ROW({}), 1, pool);
+    velox::exec::EvalCtx evalCtx(&execCtx, &exprSet, data.get());
+    velox::SelectivityVector singleRow(1);
+    std::vector<velox::VectorPtr> results(1);
+    exprSet.eval(singleRow, evalCtx, results);
+    return results.at(0);
+  }
+
+  return nullptr;
 }
 
 } // namespace facebook::velox::exec

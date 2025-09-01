@@ -12,20 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(velox_expression_test_utility ArgumentTypeFuzzer.cpp
-                                          FuzzerToolkit.cpp)
+add_library(velox_expression_test_utility ArgumentTypeFuzzer.cpp FuzzerToolkit.cpp)
 
 target_link_libraries(
-  velox_expression_test_utility velox_type velox_expression_functions
-  GTest::gtest)
+  velox_expression_test_utility
+  velox_type
+  velox_expression_functions
+  velox_fuzzer_util
+  velox_presto_types
+  GTest::gtest
+)
 
 add_library(
   velox_expression_fuzzer
+  ArgValuesGenerators.cpp
   ArgumentTypeFuzzer.cpp
-  DecimalArgGeneratorBase.cpp
+  DecimalArgTypesGeneratorBase.cpp
   ExpressionFuzzer.cpp
+  ExpressionFuzzerVerifier.cpp
   FuzzerRunner.cpp
-  ExpressionFuzzerVerifier.cpp)
+  SpecialFormSignatureGenerator.cpp
+)
 
 target_link_libraries(
   velox_expression_fuzzer
@@ -33,8 +40,14 @@ target_link_libraries(
   velox_type
   velox_vector_fuzzer
   velox_vector_test_lib
+  velox_constrained_input_generators
   velox_function_registry
-  velox_expression_test_utility)
+  velox_expression_test_utility
+  velox_file
+  velox_hive_connector
+  velox_fuzzer_util
+  velox_common_fuzzer_util
+)
 
 add_executable(velox_expression_fuzzer_test ExpressionFuzzerTest.cpp)
 
@@ -42,17 +55,28 @@ target_link_libraries(
   velox_expression_fuzzer_test
   velox_expression_fuzzer
   velox_functions_prestosql
+  velox_fuzzer_util
+  velox_hive_connector
   GTest::gtest
-  GTest::gtest_main)
+  GTest::gtest_main
+)
 
-add_executable(spark_expression_fuzzer_test SparkExpressionFuzzerTest.cpp)
+add_executable(
+  spark_expression_fuzzer_test
+  SparkExpressionFuzzerTest.cpp
+  SparkSpecialFormSignatureGenerator.cpp
+)
 
 target_link_libraries(
   spark_expression_fuzzer_test
   velox_expression_fuzzer
+  velox_constrained_input_generators
+  velox_fuzzer_util
+  velox_hive_connector
   velox_functions_spark
   GTest::gtest
-  GTest::gtest_main)
+  GTest::gtest_main
+)
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)

@@ -35,7 +35,9 @@ class WaveOperator {
 
   virtual ~WaveOperator() = default;
 
-  virtual exec::BlockingReason isBlocked(ContinueFuture* future) {
+  virtual exec::BlockingReason isBlocked(
+      WaveStream& stream,
+      ContinueFuture* future) {
     return exec::BlockingReason::kNotBlocked;
   }
 
@@ -63,23 +65,13 @@ class WaveOperator {
     VELOX_FAIL("Override for blocking operator");
   }
 
-  virtual void flush(bool /*noMoreInput*/) {
-    VELOX_FAIL("Override for blocking operator");
-  }
-
-  // If 'this' is a cardinality change (filter, join, unnest...),
-  // returns the instruction where the projected through columns get
-  // wrapped. Columns that need to be accessed through the change are
-  // added here.
-  virtual AbstractWrap* findWrap() const {
-    return nullptr;
-  }
+  virtual void pipelineFinished(WaveStream& /*stream*/) {}
 
   /// Returns how many rows of output are available from 'this'. Source
   /// operators and cardinality increasing operators must return a correct
   /// answer if they are ready to produce data. Others should return 0.
-  virtual AdvanceResult canAdvance(WaveStream& stream) {
-    return {.numRows = 0};
+  virtual std::vector<AdvanceResult> canAdvance(WaveStream& stream) {
+    return {};
   }
 
   /// Adds processing for 'this' to 'stream'. If 'maxRows' is given,
@@ -99,6 +91,25 @@ class WaveOperator {
 
   virtual bool isSink() const {
     return false;
+  }
+
+  virtual void callUpdateStatus(
+      WaveStream& stream,
+      const std::vector<WaveStream*>& otherStreams,
+      AdvanceResult& advance) {
+    VELOX_FAIL("Only Project supports callUpdateStatus()");
+  }
+
+  /// InstructionStatus that describes the extra statuses returned
+  /// from device for the pipeline that begins with 'this'. Must be
+  /// set for the head of each pipeline.
+  const InstructionStatus& instructionStatus() const {
+    VELOX_CHECK_NE(instructionStatus_.gridStateSize, 0);
+    return instructionStatus_;
+  }
+
+  void setInstructionStatus(InstructionStatus status) {
+    instructionStatus_ = status;
   }
 
   virtual std::string toString() const;
@@ -121,6 +132,14 @@ class WaveOperator {
   /// Marks 'operand' as defined here.
   void defined(Value value, AbstractOperand* op) {
     defines_[value] = op;
+  }
+
+  void addSubfieldAndType(
+      const common::Subfield* subfield,
+      const TypePtr& type) {
+    VELOX_UNSUPPORTED();
+    // subfields_.push_back(subfield);
+    // types_.push_back(type);
   }
 
   void setDriver(WaveDriver* driver) {
@@ -156,8 +175,7 @@ class WaveOperator {
 
   virtual void addDynamicFilter(
       const core::PlanNodeId& /*producer*/,
-      column_index_t /*outputChannel*/,
-      const std::shared_ptr<common::Filter>& /*filter*/) {
+      const exec::PushdownFilters& /*filters*/) {
     VELOX_UNSUPPORTED();
   }
 
@@ -174,10 +192,10 @@ class WaveOperator {
   // different times on different waves. In this list, ordered in
   // depth first preorder of outputType_. Top struct not listed,
   // struct columns have the parent before the children.
-  std::vector<const common::Subfield*> subfields_;
+  // std::vector<const common::Subfield*> subfields_;
 
   // Pairwise type for each subfield.
-  std::vector<TypePtr> types_;
+  // std::vector<TypePtr> types_;
 
   // Id in original plan. Use for getting splits.
   std::string planNodeId_;
@@ -209,6 +227,10 @@ class WaveOperator {
   // operands etc. referenced from these.  This does not include buffers for
   // intermediate results.
   std::vector<WaveBufferPtr> executableMemory_;
+
+  // The total size of grid and block level statuses for the pipeline. This must
+  // be set for the first operator of any pipeline.
+  InstructionStatus instructionStatus_;
 };
 
 class WaveSourceOperator : public WaveOperator {

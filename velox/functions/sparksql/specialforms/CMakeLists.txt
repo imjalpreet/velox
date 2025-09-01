@@ -14,10 +14,20 @@
 
 velox_add_library(
   velox_functions_spark_specialforms
+  AtLeastNNonNulls.cpp
   DecimalRound.cpp
+  FromJson.cpp
+  GetArrayStructFields.cpp
+  GetStructField.cpp
   MakeDecimal.cpp
   SparkCastExpr.cpp
-  SparkCastHooks.cpp)
+  SparkCastHooks.cpp
+)
 
-velox_link_libraries(velox_functions_spark_specialforms fmt::fmt
-                     velox_expression)
+velox_link_libraries(
+  velox_functions_spark_specialforms
+  fmt::fmt
+  velox_functions_lib
+  velox_functions_json
+  velox_expression
+)

@@ -44,7 +44,8 @@ class DwrfUnit : public LoadUnit {
       uint32_t stripeIndex,
       std::shared_ptr<dwio::common::ColumnSelector> columnSelector,
       const std::shared_ptr<BitSet>& projectedNodes,
-      RowReaderOptions options)
+      RowReaderOptions options,
+      const dwio::common::ColumnReaderOptions& columnReaderOptions)
       : stripeReaderBase_{stripeReaderBase},
         strideIndexProvider_{strideIndexProvider},
         columnReaderStatistics_{&columnReaderStatistics},
@@ -52,6 +53,7 @@ class DwrfUnit : public LoadUnit {
         columnSelector_{std::move(columnSelector)},
         projectedNodes_{projectedNodes},
         options_{std::move(options)},
+        columnReaderOptions_{columnReaderOptions},
         stripeInfo_{
             stripeReaderBase.getReader().footer().stripes(stripeIndex_)} {}
 
@@ -90,6 +92,7 @@ class DwrfUnit : public LoadUnit {
   const std::shared_ptr<dwio::common::ColumnSelector> columnSelector_;
   const std::shared_ptr<BitSet> projectedNodes_;
   const RowReaderOptions options_;
+  const dwio::common::ColumnReaderOptions& columnReaderOptions_;
   const StripeInformationWrapper stripeInfo_;
 
   // Mutables
@@ -160,6 +163,7 @@ void DwrfUnit::ensureDecoders() {
 
   if (scanSpec) {
     selectiveColumnReader_ = SelectiveDwrfReader::build(
+        columnReaderOptions_,
         options_.requestedType() ? options_.requestedType() : fileType->type(),
         fileType,
         *stripeStreams_,
@@ -169,8 +173,6 @@ void DwrfUnit::ensureDecoders() {
         flatMapContext,
         /*isRoot=*/true);
     selectiveColumnReader_->setIsTopLevel();
-    selectiveColumnReader_->setFillMutatedOutputRows(
-        options_.rowNumberColumnInfo().has_value());
   } else {
     auto requestedType = columnSelector_->getSchemaWithId();
     auto factory = &ColumnReaderFactory::defaultFactory();
@@ -303,6 +305,12 @@ DwrfRowReader::DwrfRowReader(
   }
 
   unitLoader_ = getUnitLoader();
+  if (!emptyFile()) {
+    getReader().loadCache();
+  }
+
+  columnReaderOptions_ = dwio::common::makeColumnReaderOptions(
+      readerBaseShared()->readerOptions());
 }
 
 std::unique_ptr<ColumnReader>& DwrfRowReader::getColumnReader() {
@@ -327,7 +335,8 @@ std::unique_ptr<dwio::common::UnitLoader> DwrfRowReader::getUnitLoader() {
         stripe,
         columnSelector_,
         projectedNodes_,
-        options_));
+        options_,
+        columnReaderOptions_));
   }
   std::shared_ptr<UnitLoaderFactory> unitLoaderFactory =
       options_.unitLoaderFactory();
@@ -341,7 +350,7 @@ std::unique_ptr<dwio::common::UnitLoader> DwrfRowReader::getUnitLoader() {
 
 uint64_t DwrfRowReader::seekToRow(uint64_t rowNumber) {
   // Empty file
-  if (isEmptyFile()) {
+  if (emptyFile()) {
     return 0;
   }
   nextRowNumber_.reset();
@@ -424,7 +433,7 @@ uint64_t DwrfRowReader::seekToRow(uint64_t rowNumber) {
 }
 
 uint64_t DwrfRowReader::skipRows(uint64_t numberOfRowsToSkip) {
-  if (isEmptyFile()) {
+  if (emptyFile()) {
     VLOG(1) << "Empty file, nothing to skip";
     return 0;
   }
@@ -526,19 +535,14 @@ void DwrfRowReader::readNext(
     }
     return;
   }
-
+  auto& columnReader = getSelectiveColumnReader();
+  columnReader->setCurrentRowNumber(previousRow_);
   if (!options_.rowNumberColumnInfo().has_value()) {
-    getSelectiveColumnReader()->next(rowsToRead, result, mutation);
+    columnReader->next(rowsToRead, result, mutation);
     return;
   }
-
   readWithRowNumber(
-      getSelectiveColumnReader(),
-      options_,
-      previousRow_,
-      rowsToRead,
-      mutation,
-      result);
+      columnReader, options_, previousRow_, rowsToRead, mutation, result);
 }
 
 uint64_t DwrfRowReader::skip(uint64_t numValues) {
@@ -588,6 +592,17 @@ int64_t DwrfRowReader::nextRowNumber() {
   return kAtEnd;
 }
 
+uint64_t DwrfRowReader::rowNumber() {
+  const auto nextRow = nextRowNumber();
+  if (nextRow != kAtEnd) {
+    return nextRow;
+  }
+  if (emptyFile()) {
+    return 0;
+  }
+  return getReader().footer().numberOfRows();
+}
+
 int64_t DwrfRowReader::nextReadSize(uint64_t size) {
   VELOX_DCHECK_GT(size, 0);
   if (nextRowNumber() == kAtEnd) {
@@ -611,7 +626,7 @@ uint64_t DwrfRowReader::next(
     const dwio::common::Mutation* mutation) {
   const auto nextRow = nextRowNumber();
   if (nextRow == kAtEnd) {
-    if (!isEmptyFile()) {
+    if (!emptyFile()) {
       previousRow_ = firstRowOfStripe_[stripeCeiling_ - 1] +
           getReader().footer().stripes(stripeCeiling_ - 1).numberOfRows();
     } else {
@@ -653,6 +668,7 @@ void DwrfRowReader::loadCurrentStripe() {
   const auto loadUnitIdx = currentStripe_ - firstStripe_;
   currentUnit_ = castDwrfUnit(&unitLoader_->getLoadedUnit(loadUnitIdx));
   rowsInCurrentStripe_ = currentUnit_->getNumRows();
+  ++processedStrides_;
 }
 
 size_t DwrfRowReader::estimatedReaderMemory() const {
@@ -736,8 +752,10 @@ std::optional<size_t> DwrfRowReader::estimatedRowSizeHelper(
     case TypeKind::ARRAY:
     case TypeKind::MAP:
     case TypeKind::ROW: {
-      // start the estimate with the offsets and hasNulls vectors sizes
-      size_t totalEstimate = valueCount * (sizeof(uint8_t) + sizeof(uint64_t));
+      // Start the estimate with the offsets and sizes buffers.
+      size_t totalEstimate = nodeType.kind() == TypeKind::ROW
+          ? 0
+          : 2 * valueCount * sizeof(vector_size_t);
       for (int32_t i = 0; i < nodeType.subtypesSize(); ++i) {
         if (!shouldReadNode(nodeType.subtypes(i))) {
           continue;
@@ -758,15 +776,23 @@ std::optional<size_t> DwrfRowReader::estimatedRowSizeHelper(
 }
 
 std::optional<size_t> DwrfRowReader::estimatedRowSize() const {
+  if (hasRowEstimate_) {
+    return estimatedRowSize_;
+  }
+
   const auto& reader = getReader();
   const auto& fileFooter = reader.footer();
 
+  hasRowEstimate_ = true;
+
   if (!fileFooter.hasNumberOfRows()) {
-    return std::nullopt;
+    estimatedRowSize_ = std::nullopt;
+    return estimatedRowSize_;
   }
 
   if (fileFooter.numberOfRows() < 1) {
-    return 0;
+    estimatedRowSize_ = 0;
+    return estimatedRowSize_;
   }
 
   // Estimate with projections.
@@ -775,134 +801,35 @@ std::optional<size_t> DwrfRowReader::estimatedRowSize() const {
   const auto projectedSize =
       estimatedRowSizeHelper(fileFooter, *stats, ROOT_NODE_ID);
   if (projectedSize.has_value()) {
-    return projectedSize.value() / fileFooter.numberOfRows();
+    estimatedRowSize_ = projectedSize.value() / fileFooter.numberOfRows();
+    return estimatedRowSize_;
   }
-  return std::nullopt;
+
+  estimatedRowSize_ = std::nullopt;
+  return estimatedRowSize_;
 }
 
 DwrfReader::DwrfReader(
     const ReaderOptions& options,
     std::unique_ptr<dwio::common::BufferedInput> input)
-    : readerBase_(std::make_unique<ReaderBase>(
-          options.memoryPool(),
-          std::move(input),
-          options.decrypterFactory(),
-          options.footerEstimatedSize(),
-          options.filePreloadThreshold(),
-          options.fileFormat() == FileFormat::ORC ? FileFormat::ORC
-                                                  : FileFormat::DWRF,
-          options.fileColumnNamesReadAsLowerCase(),
-          options.randomSkip(),
-          options.scanSpec())),
-      options_(options) {
+    : readerBase_(std::make_unique<ReaderBase>(options, std::move(input))) {
   // If we are not using column names to map table columns to file columns,
   // then we use indices. In that case we need to ensure the names completely
   // match, because we are still mapping columns by names further down the
   // code. So we rename column names in the file schema to match table schema.
   // We test the options to have 'fileSchema' (actually table schema) as most
   // of the unit tests fail to provide it.
-  if ((!options_.useColumnNamesForColumnMapping()) &&
-      (options_.fileSchema() != nullptr)) {
+  if ((!readerBase_->readerOptions().useColumnNamesForColumnMapping()) &&
+      (readerBase_->readerOptions().fileSchema() != nullptr)) {
     updateColumnNamesFromTableSchema();
   }
 }
 
-namespace {
-void logTypeInequality(
-    const Type& fileType,
-    const Type& tableType,
-    const std::string& fileFieldName,
-    const std::string& tableFieldName) {
-  VLOG(1) << "Type of the File field '" << fileFieldName
-          << "' does not match the type of the Table field '" << tableFieldName
-          << "': [" << fileType.toString() << "] vs [" << tableType.toString()
-          << "]";
-}
-
-// Forward declaration for general type tree recursion function.
-TypePtr updateColumnNames(
-    const TypePtr& fileType,
-    const TypePtr& tableType,
-    const std::string& fileFieldName,
-    const std::string& tableFieldName);
-
-// Non-primitive type tree recursion function.
-template <typename T>
-TypePtr updateColumnNames(const TypePtr& fileType, const TypePtr& tableType) {
-  const auto fileRowType = std::dynamic_pointer_cast<const T>(fileType);
-  const auto tableRowType = std::dynamic_pointer_cast<const T>(tableType);
-
-  std::vector<std::string> newFileFieldNames;
-  newFileFieldNames.reserve(fileRowType->size());
-  std::vector<TypePtr> newFileFieldTypes;
-  newFileFieldTypes.reserve(fileRowType->size());
-
-  for (auto childIdx = 0; childIdx < tableRowType->size(); ++childIdx) {
-    if (childIdx >= fileRowType->size()) {
-      break;
-    }
-
-    newFileFieldTypes.push_back(updateColumnNames(
-        fileRowType->childAt(childIdx),
-        tableRowType->childAt(childIdx),
-        fileRowType->nameOf(childIdx),
-        tableRowType->nameOf(childIdx)));
-
-    newFileFieldNames.push_back(tableRowType->nameOf(childIdx));
-  }
-
-  for (auto childIdx = tableRowType->size(); childIdx < fileRowType->size();
-       ++childIdx) {
-    newFileFieldTypes.push_back(fileRowType->childAt(childIdx));
-    newFileFieldNames.push_back(fileRowType->nameOf(childIdx));
-  }
-
-  return std::make_shared<const T>(
-      std::move(newFileFieldNames), std::move(newFileFieldTypes));
-}
-
-// General type tree recursion function.
-TypePtr updateColumnNames(
-    const TypePtr& fileType,
-    const TypePtr& tableType,
-    const std::string& fileFieldName,
-    const std::string& tableFieldName) {
-  // Check type kind equality. If not equal, no point to continue down the
-  // tree.
-  if (fileType->kind() != tableType->kind()) {
-    logTypeInequality(*fileType, *tableType, fileFieldName, tableFieldName);
-    return fileType;
-  }
-
-  // For leaf types we return type as is.
-  if (fileType->isPrimitiveType()) {
-    return fileType;
-  }
-
-  if (fileType->isRow()) {
-    return updateColumnNames<RowType>(fileType, tableType);
-  }
-
-  if (fileType->isMap()) {
-    return updateColumnNames<MapType>(fileType, tableType);
-  }
-
-  if (fileType->isArray()) {
-    return updateColumnNames<ArrayType>(fileType, tableType);
-  }
-
-  // We should not be here.
-  VLOG(1) << "Unexpected table type during column names update for File field '"
-          << fileFieldName << "': [" << fileType->toString() << "]";
-  return fileType;
-}
-} // namespace
-
 void DwrfReader::updateColumnNamesFromTableSchema() {
-  const auto& tableSchema = options_.fileSchema();
+  const auto& tableSchema = readerBase_->readerOptions().fileSchema();
   const auto& fileSchema = readerBase_->schema();
   readerBase_->setSchema(std::dynamic_pointer_cast<const RowType>(
-      updateColumnNames(fileSchema, tableSchema, "", "")));
+      updateColumnNames(fileSchema, tableSchema)));
 }
 
 std::unique_ptr<StripeInformation> DwrfReader::getStripe(
@@ -1068,7 +995,7 @@ uint64_t DwrfReader::getMemoryUse(
   uint64_t memoryBytes = hasStringColumn
       ? 2 * maxDataLength
       : std::min(
-            uint64_t(maxDataLength),
+            static_cast<uint64_t>(maxDataLength),
             numSelectedStreams *
                 readerBase.bufferedInput().getReadFile()->getNaturalReadSize());
 
@@ -1122,6 +1049,9 @@ std::unique_ptr<DwrfRowReader> DwrfReader::createDwrfRowReader(
 std::unique_ptr<DwrfReader> DwrfReader::create(
     std::unique_ptr<dwio::common::BufferedInput> input,
     const ReaderOptions& options) {
+  if (options.allowEmptyFile() && input->getReadFile()->size() == 0) {
+    return nullptr;
+  }
   return std::make_unique<DwrfReader>(options, std::move(input));
 }
 

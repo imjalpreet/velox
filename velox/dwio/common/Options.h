@@ -50,6 +50,7 @@ enum class FileFormat {
   PARQUET = 7,
   NIMBLE = 8,
   ORC = 9,
+  SST = 10, // rocksdb sst format
 };
 
 FileFormat toFileFormat(std::string_view s);
@@ -71,7 +72,34 @@ enum class SerDeSeparator {
 
 class SerDeOptions {
  public:
+  /// The following members control how data is separated in TEXT format files:
+  ///
+  /// - 'separators': An array of separator characters used to delimit columns
+  ///   and nested data.
+  ///     - 'separators[0]' defines the delimiter that separates top-level
+  ///     columns.
+  ///     - 'separators[1 to depth_-1]' defines the delimiters that separate
+  ///     nested data within a ComplexType column.
+  /// - 'newLine': The character used to separate rows in the file.
+  ///
+  /// Suppose we have a schema: ROW(MAP(VARCHAR(), ARRAY(BIGINT())), BOOLEAN())
+  /// With the following configuration:
+  ///   - separators = [',', '@', ':', '#]
+  ///   - newLine = '\n'
+  ///   - nullString = "NULL"
+  ///
+  /// With the following data to be written:
+  ///   - row1: {key1:[10, 20, 30], key2:[40, 50, 60]}, true
+  ///   - row2: {key3:[100, 2, 30], key4:[80, 40, 45]}, true
+  ///
+  /// A sample text file with the 2 rows of data above would look like this:
+  /// key1:10#20#30@key2:40#50#60,true\n
+  /// key3:100#2#30@key4:80#40#45,true\n
+
   std::array<uint8_t, 8> separators;
+  uint8_t newLine;
+
+  /// Null values are represented by 'nullString'
   std::string nullString;
   bool lastColumnTakesRest;
   uint8_t escapeChar;
@@ -87,8 +115,10 @@ class SerDeOptions {
       uint8_t collectionDelim = '\2',
       uint8_t mapKeyDelim = '\3',
       uint8_t escape = '\\',
-      bool isEscapedFlag = false)
+      bool isEscapedFlag = false,
+      uint8_t newLine = '\n')
       : separators{{fieldDelim, collectionDelim, mapKeyDelim, 4, 5, 6, 7, 8}},
+        newLine(newLine),
         nullString("\\N"),
         lastColumnTakesRest(false),
         escapeChar(escape),
@@ -109,6 +139,9 @@ struct TableParameter {
       "serialization.null.format";
 };
 
+/// Implicit row number column to be added.  This column will be removed in the
+/// output of split reader.  Should use the ScanSpec::ColumnType::kRowIndex if
+/// the column is suppose to be explicit and kept in the output.
 struct RowNumberColumnInfo {
   column_index_t insertPosition;
   std::string name;
@@ -275,6 +308,10 @@ class RowReaderOptions {
     return flatmapNodeIdAsStruct_;
   }
 
+  void setPreserveFlatMapsInMemory(bool preserveFlatMapsInMemory) {
+    preserveFlatMapsInMemory_ = preserveFlatMapsInMemory;
+  }
+
   void setDecodingExecutor(std::shared_ptr<folly::Executor> executor) {
     decodingExecutor_ = executor;
   }
@@ -344,6 +381,10 @@ class RowReaderOptions {
     return skipRows_;
   }
 
+  bool preserveFlatMapsInMemory() const {
+    return preserveFlatMapsInMemory_;
+  }
+
   void setUnitLoaderFactory(
       std::shared_ptr<UnitLoaderFactory> unitLoaderFactory) {
     unitLoaderFactory_ = std::move(unitLoaderFactory);
@@ -378,6 +419,23 @@ class RowReaderOptions {
     formatSpecificOptions_ = std::move(options);
   }
 
+  const std::unordered_map<std::string, std::string>& serdeParameters() const {
+    return serdeParameters_;
+  }
+
+  void setSerdeParameters(
+      std::unordered_map<std::string, std::string> serdeParameters) {
+    serdeParameters_ = std::move(serdeParameters);
+  }
+
+  bool trackRowSize() const {
+    return trackRowSize_;
+  }
+
+  void setTrackRowSize(bool value) {
+    trackRowSize_ = value;
+  }
+
  private:
   uint64_t dataStart_;
   uint64_t dataLength_;
@@ -389,8 +447,14 @@ class RowReaderOptions {
   RowTypePtr requestedType_;
   std::shared_ptr<velox::common::ScanSpec> scanSpec_{nullptr};
   std::shared_ptr<velox::common::MetadataFilter> metadataFilter_;
+
   // Node id for map column to a list of keys to be projected as a struct.
   std::unordered_map<uint32_t, std::vector<std::string>> flatmapNodeIdAsStruct_;
+
+  // Whether to generate FlatMapVectors when reading flat maps from the file. By
+  // default, converts flat maps in the file to MapVectors.
+  bool preserveFlatMapsInMemory_ = false;
+
   // Optional executors to enable internal reader parallelism.
   // 'decodingExecutor' allow parallelising the vector decoding process.
   // 'ioExecutor' enables parallelism when performing file system read
@@ -398,6 +462,12 @@ class RowReaderOptions {
   std::shared_ptr<folly::Executor> decodingExecutor_;
   size_t decodingParallelismFactor_{0};
   std::optional<RowNumberColumnInfo> rowNumberColumnInfo_{std::nullopt};
+
+  // Parameters that are provided as the physical storage properties.
+  std::unordered_map<std::string, std::string> storageParameters_{};
+  // Parameters that are provided as the serialization/deserialization
+  // properties.
+  std::unordered_map<std::string, std::string> serdeParameters_{};
 
   // Function to populate metrics related to feature projection stats
   // in Koski. This gets fired in FlatMapColumnReader.
@@ -423,6 +493,7 @@ class RowReaderOptions {
   TimestampPrecision timestampPrecision_ = TimestampPrecision::kMilliseconds;
 
   std::shared_ptr<FormatSpecificOptions> formatSpecificOptions_;
+  bool trackRowSize_{false};
 };
 
 /// Options for creating a Reader.
@@ -445,9 +516,10 @@ class ReaderOptions : public io::ReaderOptions {
     return *this;
   }
 
-  /// Sets the schema of the file (a Type tree).  For "dwrf" format, a default
-  /// schema is derived from the file. For "rc" format, there is no default
-  /// schema.
+  /// Sets the current table schema of the file (a Type tree).  This could be
+  /// different from the actual schema in file if schema evolution happened.
+  /// For "dwrf" format, a default schema is derived from the file. For "rc"
+  /// format, there is no default schema.
   ReaderOptions& setFileSchema(const RowTypePtr& schema) {
     fileSchema_ = schema;
     return *this;
@@ -502,6 +574,11 @@ class ReaderOptions : public io::ReaderOptions {
     return *this;
   }
 
+  ReaderOptions& setAdjustTimestampToTimezone(bool adjustTimestampToTimezone) {
+    adjustTimestampToTimezone_ = adjustTimestampToTimezone;
+    return *this;
+  }
+
   /// Gets the desired tail location.
   uint64_t tailLocation() const {
     return tailLocation_;
@@ -541,8 +618,12 @@ class ReaderOptions : public io::ReaderOptions {
     return ioExecutor_;
   }
 
-  const tz::TimeZone* getSessionTimezone() const {
+  const tz::TimeZone* sessionTimezone() const {
     return sessionTimezone_;
+  }
+
+  bool adjustTimestampToTimezone() const {
+    return adjustTimestampToTimezone_;
   }
 
   bool fileColumnNamesReadAsLowerCase() const {
@@ -585,6 +666,14 @@ class ReaderOptions : public io::ReaderOptions {
     selectiveNimbleReaderEnabled_ = value;
   }
 
+  bool allowEmptyFile() const {
+    return allowEmptyFile_;
+  }
+
+  void setAllowEmptyFile(bool value) {
+    allowEmptyFile_ = value;
+  }
+
  private:
   uint64_t tailLocation_;
   FileFormat fileFormat_;
@@ -599,7 +688,9 @@ class ReaderOptions : public io::ReaderOptions {
   std::shared_ptr<random::RandomSkipTracker> randomSkip_;
   std::shared_ptr<velox::common::ScanSpec> scanSpec_;
   const tz::TimeZone* sessionTimezone_{nullptr};
+  bool adjustTimestampToTimezone_{false};
   bool selectiveNimbleReaderEnabled_{false};
+  bool allowEmptyFile_{false};
 };
 
 struct WriterOptions {
@@ -617,21 +708,30 @@ struct WriterOptions {
       memoryReclaimerFactory{[]() { return nullptr; }};
 
   std::optional<velox::common::CompressionKind> compressionKind;
-  std::optional<uint64_t> orcMinCompressionSize{std::nullopt};
-  std::optional<uint64_t> maxStripeSize{std::nullopt};
-  std::optional<bool> orcLinearStripeSizeHeuristics{std::nullopt};
-  std::optional<uint64_t> maxDictionaryMemory{std::nullopt};
-  std::optional<bool> orcWriterIntegerDictionaryEncodingEnabled{std::nullopt};
-  std::optional<bool> orcWriterStringDictionaryEncodingEnabled{std::nullopt};
   std::map<std::string, std::string> serdeParameters;
-  std::optional<uint8_t> zlibCompressionLevel;
-  std::optional<uint8_t> zstdCompressionLevel;
-
   std::function<std::unique_ptr<dwio::common::FlushPolicy>()>
       flushPolicyFactory;
 
+  std::string sessionTimezoneName;
+  bool adjustTimestampToTimezone{false};
+
+  // WriterOption implementations can implement this function to specify how to
+  // process format-specific session and connector configs.
+  virtual void processConfigs(
+      const config::ConfigBase& connectorConfig,
+      const config::ConfigBase& session) {}
+
   virtual ~WriterOptions() = default;
 };
+
+// Options for creating a column reader.
+struct ColumnReaderOptions {
+  // Whether to map table field names to file field names using names, not
+  // indices.
+  bool useColumnNamesForColumnMapping_{false};
+};
+
+ColumnReaderOptions makeColumnReaderOptions(const ReaderOptions& options);
 
 } // namespace facebook::velox::dwio::common
 
@@ -639,9 +739,8 @@ template <>
 struct fmt::formatter<facebook::velox::dwio::common::FileFormat>
     : fmt::formatter<std::string_view> {
   template <typename FormatContext>
-  auto format(
-      facebook::velox::dwio::common::FileFormat fmt,
-      FormatContext& ctx) {
+  auto format(facebook::velox::dwio::common::FileFormat fmt, FormatContext& ctx)
+      const {
     return formatter<std::string_view>::format(
         facebook::velox::dwio::common::toString(fmt), ctx);
   }

@@ -20,13 +20,27 @@
 #include "velox/experimental/wave/exec/Wave.h"
 #include "velox/experimental/wave/exec/WaveDriver.h"
 
+#include <iostream>
+
 namespace facebook::velox::wave {
 
-AbstractWrap* Project::findWrap() const {
-  return filterWrap_;
+exec::BlockingReason Project::isBlocked(
+    WaveStream& stream,
+    ContinueFuture* future) {
+  for (int32_t i = levels_.size() - 1; i >= 0; --i) {
+    auto& level = levels_[i];
+    for (auto j = 0; j < level.size(); ++j) {
+      auto* program = level[j].get();
+      auto result = program->isBlocked(stream, future);
+      if (result != exec::BlockingReason::kNotBlocked) {
+        return result;
+      }
+    }
+  }
+  return exec::BlockingReason::kNotBlocked;
 }
 
-AdvanceResult Project::canAdvance(WaveStream& stream) {
+std::vector<AdvanceResult> Project::canAdvance(WaveStream& stream) {
   auto& controls = stream.launchControls(id_);
   if (controls.empty()) {
     /// No previous execution on the stream. If the first program starts with a
@@ -38,31 +52,41 @@ AdvanceResult Project::canAdvance(WaveStream& stream) {
     auto advance = program->canAdvance(stream, nullptr, 0);
     if (!advance.empty()) {
       advance.programIdx = 0;
+      return {advance};
     }
-    return advance;
+    return {};
   }
+  std::vector<AdvanceResult> result;
   for (int32_t i = levels_.size() - 1; i >= 0; --i) {
     auto& level = levels_[i];
-    AdvanceResult first;
     VELOX_CHECK_EQ(controls[i]->programInfo.size(), level.size());
     for (auto j = 0; j < level.size(); ++j) {
-      auto* program = level[i].get();
+      auto* program = level[j].get();
       auto advance = program->canAdvance(stream, controls[i].get(), j);
       if (!advance.empty()) {
-        if (first.empty()) {
-          first = advance;
-        }
+        advance.nthLaunch = i;
+        result.push_back(advance);
         controls[i]->programInfo[j].advance = advance;
       } else {
         controls[i]->programInfo[j].advance = {};
       }
-      if (!first.empty()) {
-        return first;
-      }
+    }
+    if (!result.empty()) {
+      return result;
     }
   }
 
   return {};
+}
+
+void Project::callUpdateStatus(
+    WaveStream& stream,
+    const std::vector<WaveStream*>& otherStreams,
+    AdvanceResult& advance) {
+  if (advance.updateStatus) {
+    levels_[advance.nthLaunch][advance.programIdx]->callUpdateStatus(
+        stream, otherStreams, advance);
+  }
 }
 
 namespace {
@@ -107,7 +131,7 @@ void Project::schedule(WaveStream& stream, int32_t maxRows) {
     stream.installExecutables(
         range, [&](Stream* out, folly::Range<Executable**> exes) {
           LaunchControl* inputControl = nullptr;
-          if (!isContinue && !isSource()) {
+          if (!isSource()) {
             inputControl = driver_->inputControl(stream, id_);
           }
           auto control = stream.prepareProgramLaunch(
@@ -123,23 +147,41 @@ void Project::schedule(WaveStream& stream, int32_t maxRows) {
               control->deviceData->as<char>(),
               control->deviceData->size());
           stream.setState(WaveStream::State::kParallel);
+          stream.checkExecutables();
           {
             PrintTime c("expr");
-            reinterpret_cast<WaveKernelStream*>(out)->call(
-                out,
-                exes.size() * blocksPerExe,
-                control->sharedMemorySize,
-                control->params);
+            auto* kernel = exes[0]->programShared->kernel();
+            VELOX_CHECK_NOT_NULL(kernel);
+            auto numBranches = exes[0]->programShared->numBranches();
+            void* params = &control->params;
+            // The count of TBs is the BlockStatus count ceil
+            // numRowsPerThread, i.e. 11 blocks with 4 rows per thread
+            // is 3. The TBs in the launch is this times the number of
+            // program branches.
+            auto numTBs = numBranches *
+                bits::roundUp(control->params.numBlocks,
+                              control->params.numRowsPerThread) /
+                control->params.numRowsPerThread;
+            kernel->launch(
+                0, numTBs, kBlockSize, control->sharedMemorySize, out, &params);
           }
+          stream.checkExecutables();
         });
     isContinue = false;
+  }
+}
+
+void Project::pipelineFinished(WaveStream& stream) {
+  for (auto& level : levels_) {
+    for (auto& program : level) {
+      program->pipelineFinished(stream);
+    }
   }
 }
 
 void Project::finalize(CompileState& state) {
   for (auto& level : levels_) {
     for (auto& program : level) {
-      program->prepareForDevice(state.arena());
       for (auto& pair : program->output()) {
         if (true /*isProjected(id)*/) {
           computedSet_.add(pair.first->id);

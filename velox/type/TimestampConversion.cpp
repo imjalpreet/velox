@@ -157,17 +157,17 @@ bool isValidWeekOfMonthDate(
     return false;
   }
 
-  int64_t daysSinceEpochOfFirstDayOfMonth;
-  const Status status =
-      daysSinceEpochFromDate(year, month, 1, daysSinceEpochOfFirstDayOfMonth);
-  if (!status.ok()) {
+  Expected<int64_t> daysSinceEpochOfFirstDayOfMonth =
+      daysSinceEpochFromDate(year, month, 1);
+  if (daysSinceEpochOfFirstDayOfMonth.hasError()) {
     return false;
   }
+  daysSinceEpochOfFirstDayOfMonth = daysSinceEpochOfFirstDayOfMonth.value();
 
   // Calculates the actual number of week of month and validates if it is in the
   // valid range.
   const int32_t firstDayOfWeek =
-      extractISODayOfTheWeek(daysSinceEpochOfFirstDayOfMonth);
+      extractISODayOfTheWeek(daysSinceEpochOfFirstDayOfMonth.value());
   const int32_t firstWeekLength = 7 - firstDayOfWeek + 1;
   const int32_t monthLength =
       isLeapYear(year) ? kLeapDays[month] : kNormalDays[month];
@@ -219,6 +219,8 @@ bool tryParseDateString(
   int32_t month = -1;
   int32_t year = 0;
   bool yearneg = false;
+  // Whether a sign is included in the date string.
+  bool sign = false;
   int sep;
   if (mode != ParseMode::kIso8601) {
     skipSpaces(buf, len, pos);
@@ -228,12 +230,14 @@ bool tryParseDateString(
     return false;
   }
   if (buf[pos] == '-') {
+    sign = true;
     yearneg = true;
     pos++;
     if (pos >= len) {
       return false;
     }
   } else if (buf[pos] == '+') {
+    sign = true;
     pos++;
     if (pos >= len) {
       return false;
@@ -250,6 +254,16 @@ bool tryParseDateString(
       break;
     }
   }
+  /// Spark digits of year must >= 4. The following formats are allowed:
+  /// `[+-]yyyy*`
+  /// `[+-]yyyy*-[m]m`
+  /// `[+-]yyyy*-[m]m-[d]d`
+  /// `[+-]yyyy*-[m]m-[d]d `
+  /// `[+-]yyyy*-[m]m-[d]d *`
+  /// `[+-]yyyy*-[m]m-[d]dT*`
+  if (mode == ParseMode::kSparkCast && pos - sign < 4) {
+    return false;
+  }
   if (yearneg) {
     year = checkedNegate(year);
     if (year < kMinYear) {
@@ -259,10 +273,12 @@ bool tryParseDateString(
 
   // No month or day.
   if ((mode == ParseMode::kSparkCast || mode == ParseMode::kIso8601) &&
-      pos == len) {
-    if (!daysSinceEpochFromDate(year, 1, 1, daysSinceEpoch).ok()) {
+      (pos == len || buf[pos] == 'T')) {
+    Expected<int64_t> expected = daysSinceEpochFromDate(year, 1, 1);
+    if (expected.hasError()) {
       return false;
     }
+    daysSinceEpoch = expected.value();
     return validDate(daysSinceEpoch);
   }
 
@@ -292,10 +308,12 @@ bool tryParseDateString(
 
   // No day.
   if ((mode == ParseMode::kSparkCast || mode == ParseMode::kIso8601) &&
-      pos == len) {
-    if (!daysSinceEpochFromDate(year, month, 1, daysSinceEpoch).ok()) {
+      (pos == len || buf[pos] == 'T')) {
+    Expected<int64_t> expected = daysSinceEpochFromDate(year, month, 1);
+    if (expected.hasError()) {
       return false;
     }
+    daysSinceEpoch = expected.value();
     return validDate(daysSinceEpoch);
   }
 
@@ -317,9 +335,11 @@ bool tryParseDateString(
   }
 
   if (mode == ParseMode::kPrestoCast || mode == ParseMode::kIso8601) {
-    if (!daysSinceEpochFromDate(year, month, day, daysSinceEpoch).ok()) {
+    Expected<int64_t> expected = daysSinceEpochFromDate(year, month, day);
+    if (expected.hasError()) {
       return false;
     }
+    daysSinceEpoch = expected.value();
 
     if (mode == ParseMode::kPrestoCast) {
       skipSpaces(buf, len, pos);
@@ -334,9 +354,11 @@ bool tryParseDateString(
   // In non-standard cast mode, an optional trailing 'T' or space followed
   // by any optional characters are valid patterns.
   if (mode == ParseMode::kSparkCast) {
-    if (!daysSinceEpochFromDate(year, month, day, daysSinceEpoch).ok()) {
+    Expected<int64_t> expected = daysSinceEpochFromDate(year, month, day);
+    if (expected.hasError()) {
       return false;
     }
+    daysSinceEpoch = expected.value();
 
     if (!validDate(daysSinceEpoch)) {
       return false;
@@ -380,8 +402,12 @@ bool tryParseDateString(
       return false;
     }
   }
-
-  return daysSinceEpochFromDate(year, month, day, daysSinceEpoch).ok();
+  Expected<int64_t> expected = daysSinceEpochFromDate(year, month, day);
+  if (expected.hasError()) {
+    return false;
+  }
+  daysSinceEpoch = expected.value();
+  return true;
 }
 
 void parseTimeSeparator(
@@ -417,6 +443,7 @@ bool tryParseTimeString(
     size_t& pos,
     int64_t& result,
     TimestampParseMode parseMode) {
+  static constexpr int sep = ':';
   int32_t hour = 0, min = 0, sec = 0, micros = 0;
   pos = 0;
 
@@ -444,7 +471,7 @@ bool tryParseTimeString(
     return false;
   }
 
-  if (pos >= len) {
+  if (pos >= len || buf[pos] != sep) {
     if (parseMode == TimestampParseMode::kIso8601) {
       result = fromTime(hour, 0, 0, 0);
       return true;
@@ -453,8 +480,7 @@ bool tryParseTimeString(
   }
 
   // Fetch the separator.
-  int sep = buf[pos++];
-  if (sep != ':') {
+  if (buf[pos++] != sep) {
     // Invalid separator.
     return false;
   }
@@ -503,8 +529,118 @@ bool tryParseTimeString(
   return true;
 }
 
-// String format is "YYYY-MM-DD hh:mm:ss.microseconds" (seconds and microseconds
-// are optional). ISO 8601
+// String format is [+/-]hh:mm:ss.MMM
+// * minutes, seconds, and milliseconds are optional.
+// * all separators are optional.
+// * . may be replaced with ,
+bool tryParsePrestoTimeOffsetString(
+    const char* buf,
+    size_t len,
+    size_t& pos,
+    int64_t& result) {
+  static constexpr int sep = ':';
+  int32_t hour = 0, min = 0, sec = 0, millis = 0;
+  pos = 0;
+  result = 0;
+
+  if (len == 0) {
+    return false;
+  }
+
+  if (buf[pos] != '+' && buf[pos] != '-') {
+    return false;
+  }
+
+  bool positive = buf[pos++] == '+';
+
+  if (pos >= len) {
+    return false;
+  }
+
+  // Read the hours.
+  if (!parseDoubleDigit(buf, len, pos, hour)) {
+    return false;
+  }
+  if (hour < 0 || hour >= 24) {
+    return false;
+  }
+
+  result += hour * kMillisPerHour;
+
+  if (pos >= len || (buf[pos] != sep && !characterIsDigit(buf[pos]))) {
+    result *= positive ? 1 : -1;
+    return pos == len;
+  }
+
+  // Skip the separator.
+  if (buf[pos] == sep) {
+    pos++;
+  }
+
+  // Read the minutes.
+  if (!parseDoubleDigit(buf, len, pos, min)) {
+    return false;
+  }
+  if (min < 0 || min >= 60) {
+    return false;
+  }
+
+  result += min * kMillisPerMinute;
+
+  if (pos >= len || (buf[pos] != sep && !characterIsDigit(buf[pos]))) {
+    result *= positive ? 1 : -1;
+    return pos == len;
+  }
+
+  // Skip the separator.
+  if (buf[pos] == sep) {
+    pos++;
+  }
+
+  // Try to read seconds.
+  if (!parseDoubleDigit(buf, len, pos, sec)) {
+    return false;
+  }
+  if (sec < 0 || sec >= 60) {
+    return false;
+  }
+
+  result += sec * kMillisPerSecond;
+
+  if (pos >= len ||
+      (buf[pos] != '.' && buf[pos] != ',' && !characterIsDigit(buf[pos]))) {
+    result *= positive ? 1 : -1;
+    return pos == len;
+  }
+
+  // Skip the decimal.
+  if (buf[pos] == '.' || buf[pos] == ',') {
+    pos++;
+  }
+
+  // Try to read microseconds.
+  if (pos >= len) {
+    return false;
+  }
+
+  // We expect milliseconds.
+  int32_t mult = 100;
+  for (; pos < len && mult > 0 && characterIsDigit(buf[pos]);
+       pos++, mult /= 10) {
+    millis += (buf[pos] - '0') * mult;
+  }
+
+  result += millis;
+  result *= positive ? 1 : -1;
+  return pos == len;
+}
+
+// Parses a variety of timestamp strings, depending on the value of
+// `parseMode`. Consumes as much of the string as it can and sets `result` to
+// the timestamp from whatever it successfully parses. `pos` is set to the
+// position of first character that was not consumed. Returns true if it
+// successfully parsed at least a date, `result` is only set if true is
+// returned.
 bool tryParseTimestampString(
     const char* buf,
     size_t len,
@@ -525,13 +661,18 @@ bool tryParseTimestampString(
 
   if (parseMode == TimestampParseMode::kIso8601 && pos < len &&
       buf[pos] == 'T') {
+    if (pos == len - 1) {
+      // If the string is just 'T'.
+      return false;
+    }
     // No date. Assume 1970-01-01.
   } else if (!tryParseDateString(
                  buf,
                  len,
                  pos,
                  daysSinceEpoch,
-                 parseMode == TimestampParseMode::kIso8601
+                 parseMode == TimestampParseMode::kIso8601 ||
+                         parseMode == TimestampParseMode::kSparkCast
                      ? ParseMode::kSparkCast
                      : ParseMode::kNonStrict)) {
     return false;
@@ -549,7 +690,11 @@ bool tryParseTimestampString(
   size_t timePos = 0;
   if (!tryParseTimeString(
           buf + pos, len - pos, timePos, microsSinceMidnight, parseMode)) {
-    return false;
+    // The rest of the string is not a valid time, but it could be relevant to
+    // the caller (e.g. it could be a time zone), return the date we parsed
+    // and let them decide what to do with the rest.
+    result = fromDatetime(daysSinceEpoch, 0);
+    return true;
   }
 
   pos += timePos;
@@ -586,27 +731,27 @@ bool isValidDayOfYear(int32_t year, int32_t dayOfYear) {
   return true;
 }
 
-Status lastDayOfMonthSinceEpochFromDate(const std::tm& dateTime, int64_t& out) {
+Expected<int64_t> lastDayOfMonthSinceEpochFromDate(const std::tm& dateTime) {
   auto year = dateTime.tm_year + 1900;
   auto month = dateTime.tm_mon + 1;
   auto day = util::getMaxDayOfMonth(year, month);
-  return util::daysSinceEpochFromDate(year, month, day, out);
+  return util::daysSinceEpochFromDate(year, month, day);
 }
 
 int32_t getMaxDayOfMonth(int32_t year, int32_t month) {
   return isLeapYear(year) ? kLeapDays[month] : kNormalDays[month];
 }
 
-Status
-daysSinceEpochFromDate(int32_t year, int32_t month, int32_t day, int64_t& out) {
+Expected<int64_t>
+daysSinceEpochFromDate(int32_t year, int32_t month, int32_t day) {
   int64_t daysSinceEpoch = 0;
 
   if (!isValidDate(year, month, day)) {
     if (threadSkipErrorDetails()) {
-      return Status::UserError();
-    } else {
-      return Status::UserError("Date out of range: {}-{}-{}", year, month, day);
+      return folly::makeUnexpected(Status::UserError());
     }
+    return folly::makeUnexpected(
+        Status::UserError("Date out of range: {}-{}-{}", year, month, day));
   }
   while (year < 1970) {
     year += kYearInterval;
@@ -620,29 +765,29 @@ daysSinceEpochFromDate(int32_t year, int32_t month, int32_t day, int64_t& out) {
   daysSinceEpoch += isLeapYear(year) ? kCumulativeLeapDays[month - 1]
                                      : kCumulativeDays[month - 1];
   daysSinceEpoch += day - 1;
-  out = daysSinceEpoch;
-  return Status::OK();
+  return daysSinceEpoch;
 }
 
-Status daysSinceEpochFromWeekDate(
+Expected<int64_t> daysSinceEpochFromWeekDate(
     int32_t weekYear,
     int32_t weekOfYear,
-    int32_t dayOfWeek,
-    int64_t& out) {
+    int32_t dayOfWeek) {
   if (!isValidWeekDate(weekYear, weekOfYear, dayOfWeek)) {
-    return Status::UserError(
-        "Date out of range: {}-{}-{}", weekYear, weekOfYear, dayOfWeek);
+    if (threadSkipErrorDetails()) {
+      return folly::makeUnexpected(Status::UserError());
+    }
+    return folly::makeUnexpected(Status::UserError(
+        "Date out of range: {}-{}-{}", weekYear, weekOfYear, dayOfWeek));
   }
 
-  int64_t daysSinceEpochOfJanFourth;
-  VELOX_RETURN_NOT_OK(
-      daysSinceEpochFromDate(weekYear, 1, 4, daysSinceEpochOfJanFourth));
-  int32_t firstDayOfWeekYear =
-      extractISODayOfTheWeek(daysSinceEpochOfJanFourth);
+  return daysSinceEpochFromDate(weekYear, 1, 4)
+      .then([&weekOfYear, &dayOfWeek](int64_t daysSinceEpochOfJanFourth) {
+        int32_t firstDayOfWeekYear =
+            extractISODayOfTheWeek(daysSinceEpochOfJanFourth);
 
-  out = daysSinceEpochOfJanFourth - (firstDayOfWeekYear - 1) +
-      7 * (weekOfYear - 1) + dayOfWeek - 1;
-  return Status::OK();
+        return daysSinceEpochOfJanFourth - (firstDayOfWeekYear - 1) +
+            7 * (weekOfYear - 1) + dayOfWeek - 1;
+      });
 }
 
 Expected<int64_t> daysSinceEpochFromWeekOfMonthDate(
@@ -655,14 +800,9 @@ Expected<int64_t> daysSinceEpochFromWeekOfMonthDate(
       !isValidWeekOfMonthDate(year, month, weekOfMonth, dayOfWeek)) {
     if (threadSkipErrorDetails()) {
       return folly::makeUnexpected(Status::UserError());
-    } else {
-      return folly::makeUnexpected(Status::UserError(
-          "Date out of range: {}-{}-{}-{}",
-          year,
-          month,
-          weekOfMonth,
-          dayOfWeek));
     }
+    return folly::makeUnexpected(Status::UserError(
+        "Date out of range: {}-{}-{}-{}", year, month, weekOfMonth, dayOfWeek));
   }
 
   // Adjusts the year and month to ensure month is within the range 1-12,
@@ -677,35 +817,36 @@ Expected<int64_t> daysSinceEpochFromWeekOfMonthDate(
   }
   year += additionYears;
 
-  int64_t daysSinceEpochOfFirstDayOfMonth;
-  const Status status =
-      daysSinceEpochFromDate(year, month, 1, daysSinceEpochOfFirstDayOfMonth);
-  if (!status.ok()) {
-    return folly::makeUnexpected(status);
-  }
-  const int32_t firstDayOfWeek =
-      extractISODayOfTheWeek(daysSinceEpochOfFirstDayOfMonth);
-  int32_t days;
-  if (dayOfWeek < 1) {
-    days = 7 - abs(dayOfWeek - 1) % 7;
-  } else if (dayOfWeek > 7) {
-    days = (dayOfWeek - 1) % 7;
-  } else {
-    days = dayOfWeek % 7;
-  }
-  return daysSinceEpochOfFirstDayOfMonth - (firstDayOfWeek - 1) +
-      7 * (weekOfMonth - 1) + days - 1;
+  return daysSinceEpochFromDate(year, month, 1)
+      .then(
+          [&dayOfWeek, &weekOfMonth](int64_t daysSinceEpochOfFirstDayOfMonth) {
+            const int32_t firstDayOfWeek =
+                extractISODayOfTheWeek(daysSinceEpochOfFirstDayOfMonth);
+            int32_t days;
+            if (dayOfWeek < 1) {
+              days = 7 - abs(dayOfWeek - 1) % 7;
+            } else if (dayOfWeek > 7) {
+              days = (dayOfWeek - 1) % 7;
+            } else {
+              days = dayOfWeek % 7;
+            }
+            return daysSinceEpochOfFirstDayOfMonth - (firstDayOfWeek - 1) +
+                7 * (weekOfMonth - 1) + days - 1;
+          });
 }
 
-Status
-daysSinceEpochFromDayOfYear(int32_t year, int32_t dayOfYear, int64_t& out) {
+Expected<int64_t> daysSinceEpochFromDayOfYear(int32_t year, int32_t dayOfYear) {
   if (!isValidDayOfYear(year, dayOfYear)) {
-    return Status::UserError("Day of year out of range: {}", dayOfYear);
+    if (threadSkipErrorDetails()) {
+      return folly::makeUnexpected(Status::UserError());
+    }
+    return folly::makeUnexpected(
+        Status::UserError("Day of year out of range: {}", dayOfYear));
   }
-  int64_t startOfYear;
-  VELOX_RETURN_NOT_OK(daysSinceEpochFromDate(year, 1, 1, startOfYear));
-  out = startOfYear + (dayOfYear - 1);
-  return Status::OK();
+  return daysSinceEpochFromDate(year, 1, 1)
+      .then([&dayOfYear](int64_t startOfYear) {
+        return startOfYear + (dayOfYear - 1);
+      });
 }
 
 Expected<int32_t> fromDateString(const char* str, size_t len, ParseMode mode) {
@@ -824,8 +965,7 @@ fromTimestampString(const char* str, size_t len, TimestampParseMode parseMode) {
   return resultTimestamp;
 }
 
-Expected<std::pair<Timestamp, const tz::TimeZone*>>
-fromTimestampWithTimezoneString(
+Expected<ParsedTimestampWithTimeZone> fromTimestampWithTimezoneString(
     const char* str,
     size_t len,
     TimestampParseMode parseMode) {
@@ -837,8 +977,10 @@ fromTimestampWithTimezoneString(
   }
 
   const tz::TimeZone* timeZone = nullptr;
+  std::optional<int64_t> offset = std::nullopt;
 
-  if (pos < len && characterIsSpace(str[pos])) {
+  if (pos < len && parseMode != TimestampParseMode::kIso8601 &&
+      characterIsSpace(str[pos])) {
     pos++;
   }
 
@@ -860,8 +1002,16 @@ fromTimestampWithTimezoneString(
     std::string_view timeZoneName(str + pos, timezonePos - pos);
 
     if ((timeZone = tz::locateZone(timeZoneName, false)) == nullptr) {
-      return folly::makeUnexpected(
-          Status::UserError("Unknown timezone value: \"{}\"", timeZoneName));
+      int64_t offsetMillis = 0;
+      size_t offsetPos = 0;
+      if (parseMode == TimestampParseMode::kPrestoCast &&
+          tryParsePrestoTimeOffsetString(
+              str + pos, timezonePos - pos, offsetPos, offsetMillis)) {
+        offset = offsetMillis;
+      } else {
+        return folly::makeUnexpected(
+            Status::UserError("Unknown timezone value: \"{}\"", timeZoneName));
+      }
     }
 
     // Skip any spaces at the end.
@@ -874,7 +1024,35 @@ fromTimestampWithTimezoneString(
       return folly::makeUnexpected(parserError(str, len));
     }
   }
-  return std::make_pair(resultTimestamp, timeZone);
+  return {{resultTimestamp, timeZone, offset}};
+}
+
+Timestamp fromParsedTimestampWithTimeZone(
+    ParsedTimestampWithTimeZone parsed,
+    const tz::TimeZone* sessionTimeZone) {
+  if (parsed.timeZone) {
+    parsed.timestamp.toGMT(*parsed.timeZone);
+  } else if (parsed.offsetMillis.has_value()) {
+    auto seconds = parsed.timestamp.getSeconds();
+    // use int128_t to avoid overflow.
+    __int128_t nanos = parsed.timestamp.getNanos();
+    seconds -= parsed.offsetMillis.value() / util::kMillisPerSecond;
+    nanos -= (parsed.offsetMillis.value() % util::kMillisPerSecond) *
+        util::kNanosPerMicro * util::kMicrosPerMsec;
+    if (nanos < 0) {
+      seconds -= 1;
+      nanos += Timestamp::kNanosInSecond;
+    } else if (nanos > Timestamp::kMaxNanos) {
+      seconds += 1;
+      nanos -= Timestamp::kNanosInSecond;
+    }
+    parsed.timestamp = Timestamp(seconds, nanos);
+  } else {
+    if (sessionTimeZone) {
+      parsed.timestamp.toGMT(*sessionTimeZone);
+    }
+  }
+  return parsed.timestamp;
 }
 
 int32_t toDate(const Timestamp& timestamp, const tz::TimeZone* timeZone_) {

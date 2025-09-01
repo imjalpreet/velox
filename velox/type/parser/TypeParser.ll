@@ -4,6 +4,7 @@
 
 #include "velox/type/parser/TypeParser.yy.h"  // @manual
 #include "velox/type/parser/Scanner.h"
+
 #define YY_DECL int facebook::velox::type::Scanner::lex(facebook::velox::type::Parser::semantic_type *yylval)
 %}
 
@@ -34,7 +35,7 @@ Y   [Y|y]
 Z   [Z|z]
 
 WORD              ([[:alpha:][:alnum:]_]*)
-QUOTED_ID         (['"'][[:alnum:][:space:]_]*['"'])
+QUOTED_ID         (['"']([^"\n]|"")*['"'])
 NUMBER            ([[:digit:]]+)
 VARIABLE          (VARCHAR|VARBINARY)
 

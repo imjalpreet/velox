@@ -52,15 +52,21 @@ static const TypePtr& TIMESTAMP_WITH_TIME_ZONE() {
   return instance;
 }
 
-class TypeFactories : public CustomTypeFactories {
+class TypeFactory : public CustomTypeFactory {
  public:
-  TypeFactories(const TypePtr& type) : type_(type) {}
+  TypeFactory(const TypePtr& type) : type_(type) {}
 
-  TypePtr getType() const override {
+  TypePtr getType(const std::vector<TypeParameter>& parameters) const override {
+    VELOX_CHECK(parameters.empty());
     return type_;
   }
 
   exec::CastOperatorPtr getCastOperator() const override {
+    return nullptr;
+  }
+
+  AbstractInputGeneratorPtr getInputGenerator(
+      const InputGeneratorConfig& /*config*/) const override {
     return nullptr;
   }
 
@@ -72,10 +78,10 @@ class ParseTypeSignatureTest : public ::testing::Test {
  private:
   void SetUp() override {
     // Register custom types with and without spaces.
-    registerCustomType("json", std::make_unique<const TypeFactories>(JSON()));
+    registerCustomType("json", std::make_unique<const TypeFactory>(JSON()));
     registerCustomType(
         "timestamp with time zone",
-        std::make_unique<const TypeFactories>(TIMESTAMP_WITH_TIME_ZONE()));
+        std::make_unique<const TypeFactory>(TIMESTAMP_WITH_TIME_ZONE()));
   }
 };
 
@@ -224,6 +230,44 @@ TEST_F(ParseTypeSignatureTest, row) {
     ASSERT_EQ(rowfield.rowFieldName(), "bla");
     ASSERT_EQ(rowfield.parameters().size(), 0);
   }
+
+  {
+    auto signature = parseTypeSignature("row(\"a (b)\" INTEGER)");
+    ASSERT_EQ(signature.baseName(), "row");
+    ASSERT_EQ(signature.parameters().size(), 1);
+    auto field0 = signature.parameters()[0];
+    ASSERT_EQ(field0.baseName(), "INTEGER");
+    ASSERT_EQ(field0.rowFieldName(), "a (b)");
+  }
+
+  // Test double double quote escape
+  {
+    auto signature = parseTypeSignature(
+        "row(\"a\"\"b\" INTEGER, \"\"\"ab\" INTEGER, \"ab\"\"\"\"\" INTEGER)");
+    ASSERT_EQ(signature.baseName(), "row");
+    ASSERT_EQ(signature.parameters().size(), 3);
+    auto field0 = signature.parameters()[0];
+    ASSERT_EQ(field0.baseName(), "INTEGER");
+    ASSERT_EQ(field0.rowFieldName(), "a\"b");
+    auto field1 = signature.parameters()[1];
+    ASSERT_EQ(field1.baseName(), "INTEGER");
+    ASSERT_EQ(field1.rowFieldName(), "\"ab");
+    auto field2 = signature.parameters()[2];
+    ASSERT_EQ(field2.baseName(), "INTEGER");
+    ASSERT_EQ(field2.rowFieldName(), "ab\"\"");
+  }
+
+  // Single double quote is an error.
+  EXPECT_THROW(parseTypeSignature("row(\"a\"b\" INTEGER)"), VeloxRuntimeError);
+}
+
+TEST_F(ParseTypeSignatureTest, tdigest) {
+  auto signature = parseTypeSignature("tdigest(double)");
+  ASSERT_EQ(signature.baseName(), "tdigest");
+  ASSERT_EQ(signature.parameters().size(), 1);
+  auto& parameter = signature.parameters()[0];
+  ASSERT_EQ(parameter.baseName(), "double");
+  ASSERT_TRUE(parameter.parameters().empty());
 }
 
 TEST_F(ParseTypeSignatureTest, roundTrip) {

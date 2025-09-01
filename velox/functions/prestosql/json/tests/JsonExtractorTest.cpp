@@ -29,33 +29,33 @@ using namespace std::string_literals;
 #define EXPECT_SCALAR_VALUE_EQ(json, path, ret) \
   {                                             \
     auto val = jsonExtractScalar(json, path);   \
-    EXPECT_TRUE(val.hasValue());                \
+    EXPECT_TRUE(val.has_value());               \
     EXPECT_EQ(val.value(), ret);                \
   }
 
 #define EXPECT_SCALAR_VALUE_NULL(json, path) \
-  EXPECT_FALSE(jsonExtractScalar(json, path).hasValue())
+  EXPECT_FALSE(jsonExtractScalar(json, path).has_value())
 
 #define EXPECT_JSON_VALUE_EQ(json, path, ret)        \
   {                                                  \
     auto val = json_format(jsonExtract(json, path)); \
-    EXPECT_TRUE(val.hasValue());                     \
+    EXPECT_TRUE(val.has_value());                    \
     EXPECT_EQ(val.value(), ret);                     \
   }
 
 #define EXPECT_JSON_VALUE_NULL(json, path) \
-  EXPECT_FALSE(json_format(jsonExtract(json, path)).hasValue())
+  EXPECT_FALSE(json_format(jsonExtract(json, path)).has_value())
 
 #define EXPECT_THROW_INVALID_ARGUMENT(json, path) \
   EXPECT_THROW(jsonExtract(json, path), VeloxUserError)
 
 namespace {
-folly::Optional<std::string> json_format(
-    const folly::Optional<folly::dynamic>& json) {
+std::optional<std::string> json_format(
+    const std::optional<folly::dynamic>& json) {
   if (json.has_value()) {
     return folly::toJson(json.value());
   }
-  return folly::none;
+  return std::nullopt;
 }
 } // namespace
 
@@ -243,6 +243,9 @@ TEST(JsonExtractorTest, arrayJsonValueTest) {
   EXPECT_JSON_VALUE_EQ("[1, 2, 3]"s, "$[0]"s, "1"s);
   EXPECT_JSON_VALUE_EQ("[1, 2]"s, "$[1]"s, "2"s);
   EXPECT_JSON_VALUE_EQ("[1, null]"s, "$[1]"s, "null"s);
+  // Negative Index
+  EXPECT_JSON_VALUE_EQ("[1, 2, 3]"s, "$[-1]"s, "3"s);
+  EXPECT_JSON_VALUE_NULL("[1, 2, 3]"s, "$[-4]"s);
   // Out of bounds
   EXPECT_JSON_VALUE_NULL("[1]"s, "$[1]"s);
   // Check skipping complex structures
@@ -412,6 +415,21 @@ TEST(JsonExtractorTest, fullJsonValueTest) {
       "{\"15day\" : 0, \"30day\" : 1, \"90day\" : 2 }"s, "$[\"30day\"]"s, "1"s);
   EXPECT_JSON_VALUE_EQ("{\"a\\\\b\": 4}"s, "$[\"a\\\\b\"]"s, "4"s);
   EXPECT_JSON_VALUE_NULL("{\"fuu\" : null}"s, "$.a.b"s);
+
+  // Negative array index
+  EXPECT_JSON_VALUE_EQ(
+      "[{\"id\": 1, \"text\": \"First\"}, {\"id\": 2, \"text\": \"Second\"},"
+      "{\"id\": 3, \"text\": \"Last\"}]"s,
+      "[-1][\"text\"]"s,
+      "\"Last\""s);
+  EXPECT_JSON_VALUE_EQ(
+      "{\"id\": 1, \"entries\": [\"First\", \"Second\", \"Last\"]}"s,
+      "$.entries[-2]"s,
+      "\"Second\""s);
+  EXPECT_JSON_VALUE_EQ(
+      "{\"id\": 1, \"entries\": [\"First\", \"Second\", \"Last\"]}"s,
+      "$.entries.-3"s,
+      "\"First\""s);
 }
 
 TEST(JsonExtractorTest, invalidJsonPathTest) {
@@ -460,7 +478,7 @@ TEST(JsonExtractorTest, reextractJsonTest) {
   auto originalJsonObj = jsonExtract(json, "$");
   // extract the same json json by giving the root path
   auto reExtractedJsonObj = jsonExtract(originalJsonObj.value(), "$");
-  ASSERT_TRUE(reExtractedJsonObj.hasValue());
+  ASSERT_TRUE(reExtractedJsonObj.has_value());
   // expect the re-extracted json object to be the same as the original jsonObj
   EXPECT_EQ(originalJsonObj.value(), reExtractedJsonObj.value());
 }
@@ -496,8 +514,8 @@ TEST(JsonExtractorTest, jsonMultipleExtractsTest) {
         "e mail":"amy@only_for_json_udf_test.net",
         "owner":"amy"})DELIM";
   auto extract1 = jsonExtract(json, "$.store");
-  ASSERT_TRUE(extract1.hasValue());
+  ASSERT_TRUE(extract1.has_value());
   auto extract2 = jsonExtract(extract1.value(), "$.fruit");
-  ASSERT_TRUE(extract2.hasValue());
+  ASSERT_TRUE(extract2.has_value());
   EXPECT_EQ(jsonExtract(json, "$.store.fruit").value(), extract2.value());
 }

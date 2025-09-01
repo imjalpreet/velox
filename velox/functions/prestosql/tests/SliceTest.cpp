@@ -61,11 +61,11 @@ TEST_F(SliceTest, constantInputArray) {
     testSlice("slice(C0, -2, 2)", {arrayVector}, expectedArrayVector);
   }
 
-  // Allow length extends beyond boundary.
+  // Allow length to extend beyond boundary and be a BIGINT.
   {
     auto expectedArrayVector = makeArrayVector<int64_t>(
         {{1, 2, 3, 4, 5, 6, 7}, {1, 2, 7}, {1, 2, 3, 5, 6, 7}});
-    testSlice("slice(C0, 1, 7)", {arrayVector}, expectedArrayVector);
+    testSlice("slice(C0, 1, 2147483648)", {arrayVector}, expectedArrayVector);
   }
 
   // Throw invalid argument when start index = 0.
@@ -278,6 +278,15 @@ TEST_F(SliceTest, negativeSliceLength) {
       testSlice(
           "slice(C0, C1, C2)",
           {arrayVector, startsVector, lengthsVector},
+          expectedArrayVector),
+      "The value of length argument of slice() function should not be negative");
+
+  auto mixedStartsVector = makeFlatVector<int64_t>(
+      kVectorSize, [](vector_size_t /*row*/) { return -2000; });
+  VELOX_ASSERT_THROW(
+      testSlice(
+          "slice(C0, C1, C2)",
+          {arrayVector, mixedStartsVector, lengthsVector},
           expectedArrayVector),
       "The value of length argument of slice() function should not be negative");
 }

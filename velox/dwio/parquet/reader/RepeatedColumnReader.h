@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/SelectiveRepeatedColumnReader.h"
 #include "velox/dwio/parquet/reader/ParquetData.h"
 
@@ -56,6 +57,7 @@ class RepeatedLengths {
 class MapColumnReader : public dwio::common::SelectiveMapColumnReader {
  public:
   MapColumnReader(
+      const dwio::common::ColumnReaderOptions& columnReaderOptions,
       const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       ParquetParams& params,
@@ -68,12 +70,12 @@ class MapColumnReader : public dwio::common::SelectiveMapColumnReader {
     // The prepare is done by the topmost list/map/struct.
   }
 
-  void seekToRowGroup(uint32_t index) override;
+  void seekToRowGroup(int64_t index) override;
 
   void enqueueRowGroup(uint32_t index, dwio::common::BufferedInput& input);
 
   void read(
-      vector_size_t offset,
+      int64_t offset,
       const RowSet& rows,
       const uint64_t* /*incomingNulls*/) override;
 
@@ -106,12 +108,13 @@ class MapColumnReader : public dwio::common::SelectiveMapColumnReader {
   RepeatedLengths lengths_;
   RepeatedLengths keyLengths_;
   RepeatedLengths elementLengths_;
-  arrow::LevelInfo levelInfo_;
+  LevelInfo levelInfo_;
 };
 
 class ListColumnReader : public dwio::common::SelectiveListColumnReader {
  public:
   ListColumnReader(
+      const dwio::common::ColumnReaderOptions& columnReaderOptions,
       const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       ParquetParams& params,
@@ -124,12 +127,12 @@ class ListColumnReader : public dwio::common::SelectiveListColumnReader {
     // The prepare is done by the topmost list/struct.
   }
 
-  void seekToRowGroup(uint32_t index) override;
+  void seekToRowGroup(int64_t index) override;
 
   void enqueueRowGroup(uint32_t index, dwio::common::BufferedInput& input);
 
   void read(
-      vector_size_t offset,
+      int64_t offset,
       const RowSet& rows,
       const uint64_t* /*incomingNulls*/) override;
 
@@ -160,7 +163,7 @@ class ListColumnReader : public dwio::common::SelectiveListColumnReader {
 
  private:
   RepeatedLengths lengths_;
-  arrow::LevelInfo levelInfo_;
+  LevelInfo levelInfo_;
 };
 
 /// Sets nulls and lengths for 'reader' and its children for the

@@ -71,13 +71,16 @@ class WindowFuzzerRunner {
         filteredWindowSignatures.empty()) {
       LOG(ERROR)
           << "No function left after filtering using 'only' and 'skip' lists.";
-      exit(1);
+      return 1;
     }
 
     facebook::velox::parse::registerTypeResolver();
     facebook::velox::serializer::presto::PrestoVectorSerde::
         registerVectorSerde();
     facebook::velox::filesystems::registerLocalFileSystem();
+
+    auto& aggregationFunctionDataSpecs =
+        referenceQueryRunner->aggregationFunctionDataSpecs();
 
     facebook::velox::exec::test::windowFuzzer(
         filteredAggregationSignatures,
@@ -86,6 +89,7 @@ class WindowFuzzerRunner {
         options.customVerificationFunctions,
         options.customInputGenerators,
         options.orderDependentFunctions,
+        aggregationFunctionDataSpecs,
         options.timestampPrecision,
         options.queryConfigs,
         options.hiveConfigs,

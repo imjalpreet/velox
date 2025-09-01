@@ -24,6 +24,7 @@ namespace facebook::velox::dwrf {
 using namespace dwio::common;
 
 SelectiveStructColumnReader::SelectiveStructColumnReader(
+    const dwio::common::ColumnReaderOptions& columnReaderOptions,
     const TypePtr& requestedType,
     const std::shared_ptr<const TypeWithId>& fileType,
     DwrfParams& params,
@@ -37,11 +38,27 @@ SelectiveStructColumnReader::SelectiveStructColumnReader(
           isRoot) {
   EncodingKey encodingKey{fileType_->id(), params.flatMapContext().sequence};
   auto& stripe = params.stripeStreams();
-  const auto encodingKind =
-      static_cast<int64_t>(stripe.getEncoding(encodingKey).kind());
-  VELOX_CHECK(
-      encodingKind == proto::ColumnEncoding_Kind_DIRECT,
-      "Unknown encoding for StructColumnReader");
+
+  // A reader tree may be constructed while the ScanSpec is being used
+  // for another read. This happens when the next stripe is being
+  // prepared while the previous one is reading.
+  if (stripe.format() == DwrfFormat::kDwrf) {
+    auto encoding =
+        static_cast<int64_t>(stripe.getEncoding(encodingKey).kind());
+
+    DWIO_ENSURE_EQ(
+        encoding,
+        proto::ColumnEncoding_Kind_DIRECT,
+        "Unknown encoding for StructColumnReader");
+  } else {
+    auto encoding =
+        static_cast<int64_t>(stripe.getEncodingOrc(encodingKey).kind());
+
+    DWIO_ENSURE_EQ(
+        encoding,
+        proto::orc::ColumnEncoding_Kind_DIRECT,
+        "Unknown encoding for StructColumnReader");
+  }
 
   // A reader tree may be constructed while the ScanSpec is being used
   // for another read. This happens when the next stripe is being
@@ -50,8 +67,11 @@ SelectiveStructColumnReader::SelectiveStructColumnReader(
   const auto& rowType = requestedType_->asRow();
   for (auto i = 0; i < childSpecs.size(); ++i) {
     auto* childSpec = childSpecs[i];
-    if (isChildConstant(*childSpec)) {
+    if (childSpec->isConstant() || isChildMissing(*childSpec)) {
       childSpec->setSubscript(kConstantChildSpecSubscript);
+      continue;
+    }
+    if (!childSpec->readFromFile()) {
       continue;
     }
 
@@ -67,13 +87,17 @@ SelectiveStructColumnReader::SelectiveStructColumnReader(
             .inMapDecoder = nullptr,
             .keySelectionCallback = nullptr});
     addChild(SelectiveDwrfReader::build(
-        childRequestedType, childFileType, childParams, *childSpec));
+        columnReaderOptions,
+        childRequestedType,
+        childFileType,
+        childParams,
+        *childSpec));
     childSpec->setSubscript(children_.size() - 1);
   }
 }
 
 void SelectiveStructColumnReaderBase::seekTo(
-    vector_size_t offset,
+    int64_t offset,
     bool readsNullsOnly) {
   if (offset == readOffset_) {
     return;

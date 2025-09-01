@@ -35,7 +35,11 @@ class BooleanColumnReader : public dwio::common::SelectiveByteRleColumnReader {
             params,
             scanSpec) {}
 
-  void seekToRowGroup(uint32_t index) override {
+  bool hasBulkPath() const override {
+    return false;
+  }
+
+  void seekToRowGroup(int64_t index) override {
     SelectiveByteRleColumnReader::seekToRowGroup(index);
     scanState().clear();
     readOffset_ = 0;
@@ -47,10 +51,8 @@ class BooleanColumnReader : public dwio::common::SelectiveByteRleColumnReader {
     return numValues;
   }
 
-  void read(
-      vector_size_t offset,
-      const RowSet& rows,
-      const uint64_t* incomingNulls) override {
+  void read(int64_t offset, const RowSet& rows, const uint64_t* incomingNulls)
+      override {
     readCommon<BooleanColumnReader, true>(offset, rows, incomingNulls);
     readOffset_ += rows.back() + 1;
   }

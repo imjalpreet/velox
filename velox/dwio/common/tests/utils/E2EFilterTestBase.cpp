@@ -93,6 +93,7 @@ void E2EFilterTestBase::readWithoutFilter(
     std::shared_ptr<ScanSpec> spec,
     const std::vector<RowVectorPtr>& batches,
     uint64_t& time) {
+  SCOPED_TRACE("Read without filter");
   dwio::common::ReaderOptions readerOpts{leafPool_.get()};
   dwio::common::RowReaderOptions rowReaderOpts;
   auto input = std::make_unique<BufferedInput>(
@@ -111,7 +112,7 @@ void E2EFilterTestBase::readWithoutFilter(
     bool hasData;
     {
       MicrosecondTimer timer(&time);
-      auto rowsScanned = rowReader->next(1000, resultBatch);
+      auto rowsScanned = rowReader->next(readSize_, resultBatch);
       VLOG(1) << "rowsScanned=" << rowsScanned;
       hasData = rowsScanned > 0;
     }
@@ -146,6 +147,7 @@ void E2EFilterTestBase::readWithFilter(
     uint64_t& time,
     bool useValueHook,
     bool skipCheck) {
+  SCOPED_TRACE("Read with filter");
   dwio::common::ReaderOptions readerOpts{leafPool_.get()};
   dwio::common::RowReaderOptions rowReaderOpts;
   auto input = std::make_unique<BufferedInput>(
@@ -239,6 +241,7 @@ void E2EFilterTestBase::readWithFilter(
         auto column = spec->children()[childIndex]->channel();
         auto result = resultBatch->asUnchecked<RowVector>()->childAt(column);
         auto expectedColumn = expectedBatch->childAt(column).get();
+
         ASSERT_TRUE(result->equalValueAt(expectedColumn, i, expectedRow))
             << "Content mismatch at " << rowIndex - 1 << " column " << column
             << ": expected: " << expectedColumn->toString(expectedRow)
@@ -285,14 +288,6 @@ void E2EFilterTestBase::testReadWithFilterLazy(
   SCOPED_TRACE("Lazy");
   // Test with LazyVectors for non-filtered columns.
   uint64_t timeWithFilter = 0;
-  for (auto& childSpec : spec->children()) {
-    childSpec->setExtractValues(false);
-    for (auto& grandchild : childSpec->children()) {
-      grandchild->setExtractValues(false);
-    }
-  }
-  readWithFilter(spec, mutations, batches, hitRows, timeWithFilter, false);
-  timeWithFilter = 0;
   readWithFilter(spec, mutations, batches, hitRows, timeWithFilter, true);
 }
 
@@ -347,8 +342,7 @@ void E2EFilterTestBase::testRowGroupSkip(
   // Makes a row group skipping filter for the first bigint column.
   for (auto& field : filterable) {
     VectorPtr child = getChildBySubfield(batches[0].get(), Subfield(field));
-    if (child->typeKind() == TypeKind::BIGINT ||
-        child->typeKind() == TypeKind::VARCHAR) {
+    if (child->type() == BIGINT() || child->typeKind() == TypeKind::VARCHAR) {
       specs.emplace_back();
       specs.back().field = field;
       specs.back().isForRowGroupSkip = true;
@@ -427,6 +421,69 @@ void E2EFilterTestBase::testScenario(
   }
 }
 
+namespace {
+std::vector<RowVectorPtr> wrapWithRunLengthDictionary(
+    const std::vector<RowVectorPtr>& batches,
+    size_t maxRunLength,
+    int64_t seed) {
+  LOG(INFO) << "Generating random run length indices with seed: " << seed;
+  std::mt19937 gen(seed);
+  std::vector<RowVectorPtr> dictionaryWrappedVectors{};
+  for (auto& batch : batches) {
+    auto runIdx = 0;
+    auto runLength = 0;
+    auto indices = velox::allocateIndices(batch->size(), batch->pool());
+    auto rawIndices = indices->asMutable<vector_size_t>();
+    for (vector_size_t i = 0; i < batch->size(); ++i) {
+      if (folly::Random::rand32(0, 5, gen) > 1 && runLength < maxRunLength) {
+        ++runLength;
+      } else {
+        ++runIdx;
+        runLength = 0;
+      }
+      rawIndices[i] = runIdx;
+    }
+
+    auto dictVector = BaseVector::wrapInDictionary(
+        nullptr, std::move(indices), batch->size(), batch);
+    // TODO: try using SimpleVector for downstream access and avoid explicit
+    // flattening of the encodings.
+    dictionaryWrappedVectors.push_back(
+        std::static_pointer_cast<velox::RowVector>(
+            BaseVector::copy(*dictVector)));
+  }
+  return dictionaryWrappedVectors;
+}
+} // namespace
+
+void E2EFilterTestBase::testRunLengthDictionaryScenario(
+    const std::string& columns,
+    std::function<void()> customize,
+    bool wrapInStruct,
+    const std::vector<std::string>& filterable,
+    int32_t numCombinations,
+    int32_t maxRunLength,
+    bool withRecursiveNulls,
+    int64_t seed) {
+  SCOPED_TRACE("Run length dictionary");
+  rowType_ = DataSetBuilder::makeRowType(columns, wrapInStruct);
+  filterGenerator_ = std::make_unique<FilterGenerator>(rowType_, seed_);
+
+  auto batches = wrapWithRunLengthDictionary(
+      makeDataset(customize, false, withRecursiveNulls), maxRunLength, seed);
+
+  writeToMemory(rowType_, batches, false);
+  testNoRowGroupSkip(batches, filterable, numCombinations);
+  testPruningWithFilter(batches, filterable);
+
+  if (testRowGroupSkip_) {
+    batches = wrapWithRunLengthDictionary(
+        makeDataset(customize, true, withRecursiveNulls), maxRunLength, seed);
+    writeToMemory(rowType_, batches, true);
+    testRowGroupSkip(batches, filterable);
+  }
+}
+
 void E2EFilterTestBase::testMetadataFilterImpl(
     const std::vector<RowVectorPtr>& batches,
     common::Subfield filterField,
@@ -484,7 +541,7 @@ void E2EFilterTestBase::testMetadataFilterImpl(
       }
     }
   };
-  while (rowReader->next(1000, result)) {
+  while (rowReader->next(readSize_, result)) {
     for (int i = 0; i < result->size(); ++i) {
       auto totalIndex = nextExpectedIndex();
       ASSERT_GE(totalIndex, 0);
@@ -624,8 +681,18 @@ void E2EFilterTestBase::testSubfieldsPruning() {
         [](auto) { return 1; },
         [](auto) { return 0; },
         [](auto) { return "foofoofoofoofoo"_sv; });
-    batches.push_back(
-        vectorMaker.rowVector({"a", "b", "c", "d"}, {a, b, c, d}));
+    auto e = vectorMaker.mapVector<int64_t, int64_t>(
+        batchSize_,
+        [&](auto) { return kMapSize; },
+        [](auto j) { return j; },
+        [&](auto j) { return j % kMapSize; });
+    auto f = vectorMaker.arrayVector<int64_t>(
+        batchSize_,
+        [&](auto j) { return kMapSize; },
+        [&](auto j) { return j % kMapSize; },
+        [&](auto j) { return j >= i + 1 && j % 23 == (i + 1) % 23; });
+    batches.push_back(vectorMaker.rowVector(
+        {"a", "b", "c", "d", "e", "f"}, {a, b, c, d, e, f}));
   }
   writeToMemory(batches[0]->type(), batches, false);
   auto spec = std::make_shared<common::ScanSpec>("<root>");
@@ -650,6 +717,12 @@ void E2EFilterTestBase::testSubfieldsPruning() {
   auto specD = spec->addFieldRecursively("d", *MAP(BIGINT(), VARCHAR()), 3);
   specD->childByName(common::ScanSpec::kMapKeysFieldName)
       ->setFilter(common::createBigintValues({1}, false));
+  auto specE = spec->addFieldRecursively("e", *MAP(BIGINT(), BIGINT()), 4);
+  specE->childByName(common::ScanSpec::kMapValuesFieldName)
+      ->setFilter(common::createBigintValues({0, 2, 4}, false));
+  auto specF = spec->addFieldRecursively("f", *ARRAY(BIGINT()), 5);
+  specF->childByName(common::ScanSpec::kArrayElementsFieldName)
+      ->setFilter(common::createBigintValues({0, 2, 4}, false));
   ReaderOptions readerOpts{leafPool_.get()};
   RowReaderOptions rowReaderOpts;
   auto input = std::make_unique<BufferedInput>(
@@ -699,6 +772,31 @@ void E2EFilterTestBase::testSubfieldsPruning() {
       auto* dd = actual->childAt(3)->loadedVector()->asUnchecked<MapVector>();
       ASSERT_FALSE(dd->isNullAt(ii));
       ASSERT_EQ(dd->sizeAt(ii), 0);
+      auto* e = expected->childAt(4)->asUnchecked<MapVector>();
+      auto* ee = actual->childAt(4)->loadedVector()->asUnchecked<MapVector>();
+      ASSERT_FALSE(ee->isNullAt(ii));
+      ASSERT_EQ(ee->sizeAt(ii), (kMapSize + 1) / 2);
+      for (int k = 0; k < kMapSize; k += 2) {
+        int k1 = ee->offsetAt(ii) + k / 2;
+        int k2 = e->offsetAt(j) + k;
+        ASSERT_TRUE(ee->mapKeys()->equalValueAt(e->mapKeys().get(), k1, k2));
+        ASSERT_TRUE(
+            ee->mapValues()->equalValueAt(e->mapValues().get(), k1, k2));
+      }
+      auto* f = expected->childAt(5)->asUnchecked<ArrayVector>();
+      auto* ff = actual->childAt(5)->loadedVector()->asUnchecked<ArrayVector>();
+      if (f->isNullAt(j)) {
+        ASSERT_TRUE(ff->isNullAt(ii));
+      } else {
+        ASSERT_FALSE(ff->isNullAt(ii));
+        for (int k = 0; k < kMapSize; k += 2) {
+          int k1 = ff->offsetAt(ii) + k / 2;
+          int k2 = f->offsetAt(j) + k;
+
+          ASSERT_TRUE(
+              ff->elements()->equalValueAt(f->elements().get(), k1, k2));
+        }
+      }
       ++ii;
     }
   }

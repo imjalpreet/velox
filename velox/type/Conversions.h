@@ -46,6 +46,12 @@ struct SparkCastPolicy {
   static constexpr bool throwOnUnicode = false;
 };
 
+struct SparkTryCastPolicy {
+  static constexpr bool truncate = false;
+  static constexpr bool legacyCast = false;
+  static constexpr bool throwOnUnicode = false;
+};
+
 struct LegacyCastPolicy {
   static constexpr bool truncate = false;
   static constexpr bool legacyCast = true;
@@ -82,7 +88,9 @@ Expected<bool> castToBoolean(const char* data, size_t len) {
     if (character == 'F' || character == '0') {
       return false;
     }
-    if constexpr (std::is_same_v<TPolicy, SparkCastPolicy>) {
+    if constexpr (
+        std::is_same_v<TPolicy, SparkCastPolicy> ||
+        std::is_same_v<TPolicy, SparkTryCastPolicy>) {
       if (character == 'Y') {
         return true;
       }
@@ -104,7 +112,9 @@ Expected<bool> castToBoolean(const char* data, size_t len) {
     return false;
   }
 
-  if constexpr (std::is_same_v<TPolicy, SparkCastPolicy>) {
+  if constexpr (
+      std::is_same_v<TPolicy, SparkCastPolicy> ||
+      std::is_same_v<TPolicy, SparkTryCastPolicy>) {
     // Case-insensitive 'yes'.
     if ((len == 3) && (TU(data[0]) == 'Y') && (TU(data[1]) == 'E') &&
         (TU(data[2]) == 'S')) {
@@ -230,6 +240,11 @@ struct Converter<TypeKind::BOOLEAN, void, TPolicy> {
   }
 };
 
+/// Presto compatible trim of whitespace. This also trims
+/// control characters from both front and back and returns
+/// a StringView of the trimmed string.
+std::string_view trimWhiteSpace(const char* data, size_t length);
+
 /// To TINYINT, SMALLINT, INTEGER, BIGINT, and HUGEINT converter.
 template <TypeKind KIND, typename TPolicy>
 struct Converter<
@@ -317,7 +332,8 @@ struct Converter<
     if constexpr (TPolicy::truncate) {
       return convertStringToInt(v);
     } else {
-      return detail::callFollyTo<T>(v);
+      auto trimmed = trimWhiteSpace(v.data(), v.size());
+      return detail::callFollyTo<T>(trimmed);
     }
   }
 
@@ -325,7 +341,8 @@ struct Converter<
     if constexpr (TPolicy::truncate) {
       return convertStringToInt(folly::StringPiece(v));
     } else {
-      return detail::callFollyTo<T>(folly::StringPiece(v));
+      auto trimmed = trimWhiteSpace(v.data(), v.size());
+      return detail::callFollyTo<T>(trimmed);
     }
   }
 
@@ -333,7 +350,8 @@ struct Converter<
     if constexpr (TPolicy::truncate) {
       return convertStringToInt(v);
     } else {
-      return detail::callFollyTo<T>(v);
+      auto trimmed = trimWhiteSpace(v.data(), v.length());
+      return detail::callFollyTo<T>(trimmed);
     }
   }
 
@@ -402,6 +420,9 @@ struct Converter<
         return folly::makeUnexpected(
             Status::UserError("Cannot cast NaN to an integral value."));
       }
+      if constexpr (std::is_same_v<TPolicy, SparkTryCastPolicy>) {
+        return detail::callFollyTo<T>(std::trunc(v));
+      }
       return detail::callFollyTo<T>(std::round(v));
     }
   }
@@ -425,6 +446,9 @@ struct Converter<
       if (std::isnan(v)) {
         return folly::makeUnexpected(
             Status::UserError("Cannot cast NaN to an integral value."));
+      }
+      if constexpr (std::is_same_v<TPolicy, SparkTryCastPolicy>) {
+        return detail::callFollyTo<T>(std::trunc(v));
       }
       return detail::callFollyTo<T>(std::round(v));
     }
@@ -629,7 +653,7 @@ struct Converter<TypeKind::VARCHAR, void, TPolicy> {
     }
     str[pos++] = 'E';
 
-    int startExp = idxE + 1;
+    size_t startExp = idxE + 1;
     if (str[startExp] == '-') {
       str[pos++] = '-';
       startExp++;

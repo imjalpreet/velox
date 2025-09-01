@@ -30,7 +30,7 @@ are supported if the conversion of their element types are supported. In additio
 supported conversions to/from JSON are listed in :doc:`json`.
 
 .. list-table::
-   :widths: 25 25 25 25 25 25 25 25 25 25 25 25 25 25 25 25
+   :widths: 25 25 25 25 25 25 25 25 25 25 25 25 25 25 25 25 25 25 25
    :header-rows: 1
 
    * -
@@ -49,6 +49,9 @@ supported conversions to/from JSON are listed in :doc:`json`.
      - interval day to second
      - decimal
      - ipaddress
+     - ipprefix
+     - tdigest
+     - qdigest
    * - tinyint
      - Y
      - Y
@@ -58,13 +61,16 @@ supported conversions to/from JSON are listed in :doc:`json`.
      - Y
      - Y
      - Y
-     - 
+     -
      -
      -
      -
      -
      - Y
-     - 
+     -
+     -
+     -
+     -
    * - smallint
      - Y
      - Y
@@ -74,13 +80,16 @@ supported conversions to/from JSON are listed in :doc:`json`.
      - Y
      - Y
      - Y
-     - 
+     -
      -
      -
      -
      -
      - Y
-     - 
+     -
+     -
+     -
+     -
    * - integer
      - Y
      - Y
@@ -90,13 +99,16 @@ supported conversions to/from JSON are listed in :doc:`json`.
      - Y
      - Y
      - Y
-     - 
+     -
      -
      -
      -
      -
      - Y
-     - 
+     -
+     -
+     -
+     -
    * - bigint
      - Y
      - Y
@@ -106,13 +118,16 @@ supported conversions to/from JSON are listed in :doc:`json`.
      - Y
      - Y
      - Y
-     - 
+     -
      -
      -
      -
      -
      - Y
-     - 
+     -
+     -
+     -
+     -
    * - boolean
      - Y
      - Y
@@ -122,13 +137,16 @@ supported conversions to/from JSON are listed in :doc:`json`.
      - Y
      - Y
      - Y
-     - 
+     -
      -
      -
      -
      -
      - Y
-     - 
+     -
+     -
+     -
+     -
    * - real
      - Y
      - Y
@@ -138,13 +156,16 @@ supported conversions to/from JSON are listed in :doc:`json`.
      - Y
      - Y
      - Y
-     - 
+     -
      -
      -
      -
      -
      - Y
-     - 
+     -
+     -
+     -
+     -
    * - double
      - Y
      - Y
@@ -154,13 +175,16 @@ supported conversions to/from JSON are listed in :doc:`json`.
      - Y
      - Y
      - Y
-     - 
+     -
      -
      -
      -
      -
      - Y
-     - 
+     -
+     -
+     -
+     -
    * - varchar
      - Y
      - Y
@@ -170,28 +194,34 @@ supported conversions to/from JSON are listed in :doc:`json`.
      - Y
      - Y
      - Y
-     - 
+     -
      - Y
      - Y
      - Y
      -
      - Y
      - Y
+     - Y
+     -
+     -
    * - varbinary
-     - 
-     - 
-     - 
-     - 
-     - 
-     - 
-     - 
-     - 
-     - 
-     - 
-     - 
-     - 
      -
-     - 
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     - Y
+     - Y
+     - Y
      - Y
    * - timestamp
      -
@@ -202,13 +232,16 @@ supported conversions to/from JSON are listed in :doc:`json`.
      -
      -
      - Y
-     - 
+     -
      - Y
      - Y
      - Y
      -
      -
-     - 
+     -
+     -
+     -
+     -
    * - timestamp with time zone
      -
      -
@@ -218,10 +251,13 @@ supported conversions to/from JSON are listed in :doc:`json`.
      -
      -
      - Y
-     - 
+     -
      - Y
      -
      - Y
+     -
+     -
+     -
      -
      -
      -
@@ -234,9 +270,12 @@ supported conversions to/from JSON are listed in :doc:`json`.
      -
      -
      - Y
-     - 
+     -
      - Y
      - Y
+     -
+     -
+     -
      -
      -
      -
@@ -250,7 +289,10 @@ supported conversions to/from JSON are listed in :doc:`json`.
      -
      -
      - Y
-     - 
+     -
+     -
+     -
+     -
      -
      -
      -
@@ -266,29 +308,92 @@ supported conversions to/from JSON are listed in :doc:`json`.
      - Y
      - Y
      - Y
-     - 
+     -
      -
      -
      -
      -
      - Y
+     -
+     -
+     -
      -
    * - ipaddress
-     - 
-     - 
-     - 
-     - 
-     - 
-     - 
-     - 
+     -
+     -
+     -
+     -
+     -
+     -
+     -
      - Y
      - Y
      -
      -
      -
      -
-     - 
-     - 
+     -
+     -
+     - Y
+     -
+     -
+   * - ipprefix
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     - Y
+     -
+     -
+     -
+     -
+     -
+     -
+     - Y
+     - Y
+     -
+     -
+   * - tdigest
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     - Y
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+   * - qdigest
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     - Y
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
+     -
 
 Cast to Integral Types
 ----------------------
@@ -538,7 +643,7 @@ Invalid example
   SELECT cast(decimal '300.001' as tinyint); -- Out of range
 
 Cast to VARCHAR
---------------
+---------------
 
 Casting from scalar types to string is allowed.
 
@@ -689,6 +794,33 @@ IPV4 mapped IPV6:
 
   SELECT cast(ipaddress '::ffff:ffff:ffff' as varchar); -- '255.255.255.255'
 
+From IPPREFIX
+^^^^^^^^^^^^^
+
+Casting from IPPREFIX to VARCHAR returns a string formatted as *x.x.x.x/<prefix-length>* for IPv4 formatted IPv6 addresses.
+
+For all other IPv6 addresses it will be formatted in compressed alternate form IPv6 defined in `RFC 4291#section-2.2 <https://datatracker.ietf.org/doc/html/rfc4291.html#section-2.2>`_
+followed by */<prefix-length>*. [`RFC 4291#section-2.3 <https://datatracker.ietf.org/doc/html/rfc4291.html#section-2.3>`_]
+
+IPv4:
+
+::
+
+  SELECT cast(ipprefix '1.2.0.0/16' as varchar); -- '1.2.0.0/16'
+
+IPv6:
+
+::
+
+  SELECT cast(ipprefix '2001:db8::ff00:42:8329/128' as varchar); -- '2001:db8::ff00:42:8329/128'
+  SELECT cast(ipprefix '0:0:0:0:0:0:13.1.68.3/32' as varchar); -- '::/32'
+
+IPv4 mapped IPv6:
+
+::
+
+  SELECT cast(ipaddress '::ffff:ffff:0000/16' as varchar); -- '255.255.0.0/16'
+
 Cast to VARBINARY
 -----------------
 
@@ -717,6 +849,26 @@ IPV4 mapped IPV6:
 ::
 
   SELECT cast('::ffff:ffff:ffff' as ipaddress); -- 0x00000000000000000000ffffffffffff
+
+From TDIGEST(DOUBLE)
+^^^^^^^^^^^^^^^^^^^^
+
+Returns the T-digest as a varbinary string containing the serialized representation of the T-digest data structure.
+This allows T-digests to be stored and retrieved for later use.
+
+::
+
+  SELECT cast(tdigest_agg(cast(1.0 as double)) as varbinary); -- AQAAAAAAAADwPwAAAAAAAPA/AAAAAAAA8D8AAAAAAABZQAAAAAAAAPA/AQAAAAAAAAAAAPA/AAAAAAAA8D8=
+
+From QDIGEST(BIGINT), QDIGEST(REAL), QDIGEST(DOUBLE)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Returns the quantile digest as a varbinary string containing the serialized representation of the quantile digest data structure.
+This allows quantile digests to be stored and retrieved for later use.
+
+::
+
+  SELECT cast(qdigest_agg(cast(1.0 as double)) as varbinary); -- AHsUrkfheoQ/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAPA/AAAAAAAA8D8BAAAAAAAAAAAAAPA/AAAAAAAA8L8=
 
 Cast to TIMESTAMP
 -----------------
@@ -1036,6 +1188,8 @@ Invalid example
 Cast to IPADDRESS
 -----------------
 
+.. _ipaddress-from-varchar:
+
 From VARCHAR
 ^^^^^^^^^^^^
 
@@ -1056,12 +1210,14 @@ Full form:
 
 Compressed form:
 ::
-  2001:DB8::8:800:200C:417A
+
+   2001:DB8::8:800:200C:417A
 
 Alternate form:
 ::
-  0:0:0:0:0:0:13.1.68.3
-  ::13.1.68.3
+
+   0:0:0:0:0:0:13.1.68.3
+   ::13.1.68.3
 
 Internally, the type is a pure IPv6 address. Support for IPv4 is handled using the IPv4-mapped IPv6 address range `(RFC 4291#section-2.5.5.2) <https://datatracker.ietf.org/doc/html/rfc4291.html#section-2.5.5.2>`_.
 When creating an IPADDRESS, IPv4 addresses will be mapped into that range.
@@ -1127,6 +1283,106 @@ Invalid examples:
 ::
 
   SELECT cast(from_hex('f000001100') as ipaddress); -- Invalid IP address binary length: 5
+
+From IPPREFIX
+^^^^^^^^^^^^^
+
+Returns the canonical(lowest) IPADDRESS in the subnet range.
+
+Examples:
+
+::
+
+  SELECT cast(ipprefix '1.2.3.4/24' as ipaddress) -- ipaddress '1.2.3.0'
+  SELECT cast(ipprefix '2001:db8::ff00:42:8329/64' as ipaddress) -- ipaddress '2001:db8::'
+
+Cast to TDIGEST(DOUBLE)
+-----------------------
+
+From VARBINARY
+^^^^^^^^^^^^^^
+
+Returns a T-digest reconstructed from the varbinary string containing the serialized representation.
+This allows previously stored T-digests to be restored for use.
+
+::
+
+  SELECT cast(stored_tdigest_binary as tdigest(double));
+
+Cast to QDIGEST(BIGINT), QDIGEST(REAL), QDIGEST(DOUBLE)
+-------------------------------------------------------
+
+From VARBINARY
+^^^^^^^^^^^^^^
+
+Returns a quantile digest reconstructed from the varbinary string containing the serialized representation.
+This allows previously stored quantile digests to be restored for use.
+
+::
+
+  SELECT cast(stored_qdigest_binary as qdigest(bigint));
+  SELECT cast(stored_qdigest_binary as qdigest(real));
+  SELECT cast(stored_qdigest_binary as qdigest(double));
+
+Cast to IPPREFIX
+----------------
+
+From VARCHAR
+^^^^^^^^^^^^
+
+The IPPREFIX string must be in the form of *<ip_address>/<ip_prefix>* as defined in `RFC 4291#section-2.3 <https://datatracker.ietf.org/doc/html/rfc4291.html#section-2.3>`_.
+The IPADDRESS portion of the IPPREFIX follows the same rules as casting
+`IPADDRESS from VARCHAR <#ipaddress-from-varchar>`_.
+
+The prefix portion must be <= 32 if the IP is an IPv4 address or <= 128 for an IPv6 address.
+As with IPADDRESS, any IPv6 address in the form of an IPv4 mapped IPv6 address will be
+interpreted as an IPv4 address. Only the canonical(smallest) IP address will be stored
+in the IPPREFIX.
+
+Examples:
+
+Valid examples:
+
+::
+
+  SELECT cast('2001:0db8:0000:0000:0000:ff00:0042:8329/32' as ipprefix); -- ipprefix '2001:0db8::/32'
+  SELECT cast('1.2.3.4/24' as ipprefix); -- ipprefix '1.2.3.0/24'
+  SELECT cast('::ffff:ffff:ffff/16' as ipprefix); -- ipprefix '255.255.0.0/16'
+
+Invalid examples:
+
+::
+
+  SELECT cast('2001:db8::1::1/1' as ipprefix); -- Cannot cast value to IPPREFIX: 2001:db8::1::1/1
+  SELECT cast('2001:0db8:0000:0000:0000:ff00:0042:8329/129' as ipprefix); -- Cannot cast value to IPPREFIX: 2001:0db8:0000:0000:0000:ff00:0042:8329/129
+  SELECT cast('2001:0db8:0000:0000:0000:ff00:0042:8329/-1' as ipprefix); -- Cannot cast value to IPPREFIX: 2001:0db8:0000:0000:0000:ff00:0042:8329/-1
+  SELECT cast('255.2.3.4/33' as ipprefix); -- Cannot cast value to IPPREFIX: 255.2.3.4/33
+  SELECT cast('::ffff:ffff:ffff/33' as ipprefix); -- Cannot cast value to IPPREFIX: ::ffff:ffff:ffff/33
+
+From IPADDRESS
+^^^^^^^^^^^^^^
+
+Returns an IPPREFIX where the prefix length is the length of the entire IP address.
+Prefix length for IPv4 is 32 and for IPv6 it is 128.
+
+Examples:
+
+::
+
+  SELECT cast(ipaddress '1.2.3.4' as ipprefix) -- ipprefix '1.2.3.4/32'
+  SELECT cast(ipaddress '2001:db8::ff00:42:8329' as ipprefix) -- ipprefix '2001:db8::ff00:42:8329/128'
+
+Data Size Functions
+-------------------
+
+.. function:: parse_presto_data_size(string) -> decimal(38)
+
+    Parses ``string`` of format ``value unit`` into a number, where ``value`` is the fractional number of unit values::
+
+      SELECT parse_presto_data_size('1B'); -- 1
+      SELECT parse_presto_data_size('1kB'); -- 1024
+      SELECT parse_presto_data_size('1MB'); -- 1048576
+      SELECT parse_presto_data_size('2.3MB'); -- 2411724
 
 Miscellaneous
 -------------

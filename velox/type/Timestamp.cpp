@@ -17,7 +17,7 @@
 #include <charconv>
 #include <chrono>
 #include "velox/common/base/CountBits.h"
-#include "velox/external/date/tz.h"
+#include "velox/external/tzdb/exception.h"
 #include "velox/type/tz/TimeZoneMap.h"
 
 namespace facebook::velox {
@@ -35,6 +35,12 @@ Timestamp Timestamp::fromDaysAndNanos(int32_t days, int64_t nanos) {
 }
 
 // static
+Timestamp Timestamp::fromDate(int32_t date) {
+  int64_t seconds = (int64_t)date * kSecondsInDay;
+  return Timestamp(seconds, 0);
+}
+
+// static
 Timestamp Timestamp::now() {
   auto now = std::chrono::system_clock::now();
   auto epochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -48,19 +54,19 @@ void Timestamp::toGMT(const tz::TimeZone& zone) {
 
   try {
     sysSeconds = zone.to_sys(std::chrono::seconds(seconds_));
-  } catch (const date::ambiguous_local_time&) {
+  } catch (const tzdb::ambiguous_local_time&) {
     // If the time is ambiguous, pick the earlier possibility to be consistent
     // with Presto.
     sysSeconds = zone.to_sys(
         std::chrono::seconds(seconds_), tz::TimeZone::TChoose::kEarliest);
-  } catch (const date::nonexistent_local_time& error) {
+  } catch (const tzdb::nonexistent_local_time& error) {
     // If the time does not exist, fail the conversion.
     VELOX_USER_FAIL(error.what());
   } catch (const std::invalid_argument& e) {
     // Invalid argument means we hit a conversion not supported by
     // external/date. Need to throw a RuntimeError so that try() statements do
     // not suppress it.
-    VELOX_FAIL(e.what());
+    VELOX_FAIL_UNSUPPORTED_INPUT_UNCATCHABLE(e.what());
   }
   seconds_ = sysSeconds.count();
 }
@@ -79,9 +85,9 @@ void Timestamp::toTimezone(const tz::TimeZone& zone) {
     seconds_ = zone.to_local(std::chrono::seconds(seconds_)).count();
   } catch (const std::invalid_argument& e) {
     // Invalid argument means we hit a conversion not supported by
-    // external/date. Need to throw a RuntimeError so that try() statements do
-    // not suppress it.
-    VELOX_FAIL(e.what());
+    // external/date. This is a special case where we intentionally throw
+    // VeloxRuntimeError to avoid it being suppressed by TRY().
+    VELOX_FAIL_UNSUPPORTED_INPUT_UNCATCHABLE(e.what());
   }
 }
 
@@ -89,7 +95,7 @@ const tz::TimeZone& Timestamp::defaultTimezone() {
   static const tz::TimeZone* kDefault = ({
     // TODO: We are hard-coding PST/PDT here to be aligned with the current
     // behavior in DWRF reader/writer.  Once they are fixed, we can use
-    // date::current_zone() here.
+    // tzdb::current_zone() here.
     //
     // See https://github.com/facebookincubator/velox/issues/8127
     auto* tz = tz::locateZone("America/Los_Angeles");
@@ -211,6 +217,7 @@ StringView Timestamp::tmToStringView(
     }
     const auto [endPosition, errorCode] =
         std::to_chars(position + offset, position + offset + numDigits, value);
+    std::ignore = endPosition;
     VELOX_DCHECK_EQ(
         errorCode,
         std::errc(),

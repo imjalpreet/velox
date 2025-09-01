@@ -22,25 +22,30 @@ exec::ExprPtr SparkCastCallToSpecialForm::constructSpecialForm(
     const TypePtr& type,
     std::vector<exec::ExprPtr>&& compiledChildren,
     bool trackCpuUsage,
-    const core::QueryConfig& /*config*/) {
+    const core::QueryConfig& config) {
   VELOX_CHECK_EQ(
       compiledChildren.size(),
       1,
       "CAST statements expect exactly 1 argument, received {}.",
       compiledChildren.size());
+  // In Spark SQL (with ANSI mode off), both CAST and TRY_CAST behave like
+  // Velox's try_cast, so we set 'isTryCast' to true by default in CastExpr.
+  // The distinction between CAST (ANSI off) and TRY_CAST is limited to
+  // overflow handling, which is managed by the 'allowOverflow' flag in
+  // SparkCastHooks.
   return std::make_shared<SparkCastExpr>(
       type,
       std::move(compiledChildren[0]),
       trackCpuUsage,
-      false,
-      std::make_shared<SparkCastHooks>());
+      true,
+      std::make_shared<SparkCastHooks>(config, true));
 }
 
 exec::ExprPtr SparkTryCastCallToSpecialForm::constructSpecialForm(
     const TypePtr& type,
     std::vector<exec::ExprPtr>&& compiledChildren,
     bool trackCpuUsage,
-    const core::QueryConfig& /*config*/) {
+    const core::QueryConfig& config) {
   VELOX_CHECK_EQ(
       compiledChildren.size(),
       1,
@@ -51,6 +56,6 @@ exec::ExprPtr SparkTryCastCallToSpecialForm::constructSpecialForm(
       std::move(compiledChildren[0]),
       trackCpuUsage,
       true,
-      std::make_shared<SparkCastHooks>());
+      std::make_shared<SparkCastHooks>(config, false));
 }
 } // namespace facebook::velox::functions::sparksql

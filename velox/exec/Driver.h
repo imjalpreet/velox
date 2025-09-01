@@ -13,22 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #pragma once
+
+#include <memory>
+
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/Future.h>
 #include <folly/portability/SysSyscall.h>
-#include <memory>
 
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/StatsReporter.h"
-#include "velox/common/future/VeloxPromise.h"
-#include "velox/common/process/ThreadDebugInfo.h"
+#include "velox/common/base/TraceConfig.h"
 #include "velox/common/time/CpuWallTimer.h"
-#include "velox/connectors/Connector.h"
 #include "velox/core/PlanFragment.h"
-#include "velox/core/PlanNode.h"
-#include "velox/core/QueryCtx.h"
-#include "velox/exec/Spiller.h"
+#include "velox/exec/BlockingReason.h"
 
 namespace facebook::velox::exec {
 
@@ -61,14 +60,6 @@ enum class StopReason {
 std::string stopReasonString(StopReason reason);
 
 std::ostream& operator<<(std::ostream& out, const StopReason& reason);
-
-struct DriverStats {
-  static constexpr const char* kTotalPauseTime = "totalDriverPauseWallNanos";
-  static constexpr const char* kTotalOffThreadTime =
-      "totalDriverOffThreadWallNanos";
-
-  std::unordered_map<std::string, RuntimeMetric> runtimeStats;
-};
 
 /// Represents a Driver's state. This is used for cancellation, forcing
 /// release of and for waiting for memory. The fields are serialized on
@@ -183,41 +174,6 @@ struct ThreadState {
   }
 };
 
-enum class BlockingReason {
-  kNotBlocked,
-  kWaitForConsumer,
-  kWaitForSplit,
-  /// Some operators can get blocked due to the producer(s) (they are
-  /// currently waiting data from) not having anything produced. Used by
-  /// LocalExchange, LocalMergeExchange, Exchange and MergeExchange operators.
-  kWaitForProducer,
-  kWaitForJoinBuild,
-  /// For a build operator, it is blocked waiting for the probe operators to
-  /// finish probing before build the next hash table from one of the
-  /// previously spilled partition data. For a probe operator, it is blocked
-  /// waiting for all its peer probe operators to finish probing before
-  /// notifying the build operators to build the next hash table from the
-  /// previously spilled data.
-  kWaitForJoinProbe,
-  /// Used by MergeJoin operator, indicating that it was blocked by the right
-  /// side input being unavailable.
-  kWaitForMergeJoinRightSide,
-  kWaitForMemory,
-  kWaitForConnector,
-  /// Build operator is blocked waiting for all its peers to stop to run group
-  /// spill on all of them.
-  kWaitForSpill,
-  /// Some operators (like Table Scan) may run long loops and can 'voluntarily'
-  /// exit them because Task requested to yield or stop or after a certain time.
-  /// This is the blocking reason used in such cases.
-  kYield,
-  /// Operator is blocked waiting for its associated query memory arbitration to
-  /// finish.
-  kWaitForArbitration,
-};
-
-std::string blockingReasonToString(BlockingReason reason);
-
 class BlockingState {
  public:
   BlockingState(
@@ -257,7 +213,7 @@ class BlockingState {
   ContinueFuture future_;
   Operator* operator_;
   BlockingReason reason_;
-  uint64_t sinceMicros_;
+  uint64_t sinceUs_;
 
   static std::atomic_uint64_t numBlockedDrivers_;
 };
@@ -278,6 +234,10 @@ struct DriverCtx {
   std::shared_ptr<Task> task;
   Driver* driver{nullptr};
   facebook::velox::process::ThreadDebugInfo threadDebugInfo;
+  /// Tracks the traced operator ids. It is also used to avoid tracing the
+  /// auxiliary operator such as the aggregation operator used by the table
+  /// writer to generate the columns stats.
+  std::unordered_map<int32_t, std::string> tracedOperatorMap;
 
   DriverCtx(
       std::shared_ptr<Task> _task,
@@ -287,6 +247,8 @@ struct DriverCtx {
       uint32_t _partitionId);
 
   const core::QueryConfig& queryConfig() const;
+
+  const std::optional<TraceConfig>& traceConfig() const;
 
   velox::memory::MemoryPool* addOperatorPool(
       const core::PlanNodeId& planNodeId,
@@ -298,7 +260,8 @@ struct DriverCtx {
   common::PrefixSortConfig prefixSortConfig() const {
     return common::PrefixSortConfig{
         queryConfig().prefixSortNormalizedKeyMaxBytes(),
-        queryConfig().prefixSortMinRows()};
+        queryConfig().prefixSortMinRows(),
+        queryConfig().prefixSortMaxStringPrefixLength()};
   }
 };
 
@@ -353,6 +316,26 @@ struct OpCallStatus {
   std::atomic<const char*> method{kOpMethodNone};
 };
 
+struct PushdownFilters {
+  /// Keep a single instance across drivers so that we do not need to repeatedly
+  /// merge them in different drivers.
+  folly::F14FastMap<column_index_t, common::FilterPtr> filters;
+
+  /// Indices added here will never be removed.
+  folly::F14FastSet<column_index_t> dynamicFilteredColumns;
+
+  /// Whether static filters has been added to filters.  This only needs to be
+  /// done once per node by the first driver.
+  bool staticFiltersInitialized = false;
+};
+
+/// Pushdown filters on nodes in the pipeline.  Locks must be acquired in the
+/// order from downstream to upstream (i.e. it's forbidden that we acquire the
+/// upstream node lock first, and then acquire the downstream node lock while we
+/// hold the upstream lock).
+using PipelinePushdownFilters =
+    std::vector<folly::Synchronized<PushdownFilters>>;
+
 class Driver : public std::enable_shared_from_this<Driver> {
  public:
   static void enqueue(std::shared_ptr<Driver> instance);
@@ -360,14 +343,18 @@ class Driver : public std::enable_shared_from_this<Driver> {
   /// Run the pipeline until it produces a batch of data or gets blocked.
   /// Return the data produced or nullptr if pipeline finished processing and
   /// will not produce more data. Return nullptr and set 'future' if
-  /// pipeline got blocked.
+  /// pipeline got blocked. 'blockingOp' and 'blockingReason' are set if the
+  /// driver is blocked by an operator.
   ///
   /// This API supports execution of a Task synchronously in the caller's
   /// thread. The caller must use either this API or 'enqueue', but not both.
   /// When using 'enqueue', the last operator in the pipeline (sink) must not
   /// return any data from Operator::getOutput(). When using 'next', the last
   /// operator must produce data that will be returned to caller.
-  RowVectorPtr next(ContinueFuture* future);
+  RowVectorPtr next(
+      ContinueFuture* future,
+      Operator*& blockingOp,
+      BlockingReason& blockingReason);
 
   /// Invoked to initialize the operators from this driver once on its first
   /// execution.
@@ -397,9 +384,14 @@ class Driver : public std::enable_shared_from_this<Driver> {
   /// time slice limit if set.
   bool shouldYield() const;
 
+  /// Inline function to check if operator batch size stats are enabled.
+  inline bool enableOperatorBatchSizeStats() const {
+    return enableOperatorBatchSizeStats_;
+  }
+
   /// Checks if the associated query is under memory arbitration or not. The
   /// function returns true if it is and set future which is fulfilled when the
-  /// the memory arbiration finishes.
+  /// memory arbitration finishes.
   bool checkUnderArbitration(ContinueFuture* future);
 
   void initializeOperatorStats(std::vector<OperatorStats>& stats);
@@ -417,6 +409,30 @@ class Driver : public std::enable_shared_from_this<Driver> {
       const Operator* filterSource,
       const std::vector<column_index_t>& channels) const;
 
+  /// Try to add new dynamic filters from `filterSource' to its upstream
+  /// operator which accept dynamic filters.  `channels' are the inputs for
+  /// `filterSource'.
+  ///
+  /// `makeFilter' is called with a lock held on the node of `filterSource' in
+  /// `pushdownFilters_'.  It should return whether a filter should be added,
+  /// and set the FilterPtr output parameter with a new filter if one is
+  /// generated.  If `makeFilter' returns true but FilterPtr is not set, it
+  /// means a filter is already generated by another operator on the same node,
+  /// and we just need to set the new merged filter on the accepting operator.
+  ///
+  /// Return the number of filters produced.
+  int pushdownFilters(
+      Operator* filterSource,
+      const std::vector<column_index_t>& channels,
+      const std::function<bool(column_index_t, common::FilterPtr&)>&
+          makeFilter);
+
+  int operatorIndex(const Operator* op) const;
+
+  const std::shared_ptr<PipelinePushdownFilters>& pushdownFilters() const {
+    return pushdownFilters_;
+  }
+
   /// Returns the Operator with 'planNodeId' or nullptr if not found. For
   /// example, hash join probe accesses the corresponding build by id.
   Operator* findOperator(std::string_view planNodeId) const;
@@ -428,6 +444,10 @@ class Driver : public std::enable_shared_from_this<Driver> {
   /// Returns the Operator with 'operatorId' (basically by index) or nullptr if
   /// not found.
   Operator* findOperatorNoThrow(int32_t operatorId) const;
+
+  Operator* sourceOperator() const;
+
+  Operator* sinkOperator() const;
 
   /// Returns a list of all operators.
   std::vector<Operator*> operators() const;
@@ -456,6 +476,47 @@ class Driver : public std::enable_shared_from_this<Driver> {
     return blockingReason_;
   }
 
+  /// Invoked by the task to start the barrier processing on this driver.
+  void startBarrier();
+
+  /// Returns true if the driver is under barrier processing.
+  bool hasBarrier() const {
+    return barrier_.has_value();
+  }
+
+  /// Invoked to start draining the output of this driver pipeline from the
+  /// source operator to the sink operator in order with one operator drained
+  /// at a time. This only applies to the driver that is under barrier
+  /// processing.
+  void drainOutput();
+
+  /// Returns true if the driver is draining output.
+  bool isDraining() const;
+
+  /// Returns true if the specified operator is draining.
+  bool isDraining(int32_t operatorId) const;
+
+  /// Returns true if the specified operator has drained its output, and the
+  /// driver is still draining.
+  bool hasDrained(int32_t operatorId) const;
+
+  /// Invoked by the draining operator to indicate that it has finished drain
+  /// operation.
+  void finishDrain(int32_t operatorId);
+
+  /// Invoked to drop the input to the specified operator. This only applies
+  /// when the driver is under barrier processing.
+  ///
+  /// NOTE: this will result in needsOutput to return false for ALL upstream
+  /// operators.
+  void dropInput(int32_t operatorId);
+
+  /// Returns false if the specified operator should drop its output or output
+  /// processing. This only applies if dropInput() has called on an operator
+  /// and all its upstream operators within the same pipeline should skip
+  /// their output.
+  bool shouldDropOutput(int32_t operatorId) const;
+
   /// Returns the process-wide number of driver cpu yields.
   static std::atomic_uint64_t& yieldCount();
 
@@ -470,6 +531,34 @@ class Driver : public std::enable_shared_from_this<Driver> {
   }
 
  private:
+  // Ensures that the thread is removed from its Task's thread count on exit.
+  class CancelGuard {
+   public:
+    CancelGuard(
+        const std::shared_ptr<Driver>& driver,
+        Task* task,
+        ThreadState* state,
+        std::function<void(StopReason)> onTerminate)
+        : driver_(driver),
+          task_(task),
+          state_(state),
+          onTerminate_(std::move(onTerminate)) {}
+
+    void notThrown() {
+      isThrow_ = false;
+    }
+
+    ~CancelGuard();
+
+   private:
+    std::shared_ptr<Driver> const driver_;
+    Task* const task_;
+    ThreadState* const state_;
+    const std::function<void(StopReason reason)> onTerminate_;
+
+    bool isThrow_{true};
+  };
+
   Driver() = default;
 
   // Invoked to record the driver cpu yield count.
@@ -490,32 +579,59 @@ class Driver : public std::enable_shared_from_this<Driver> {
 
   void updateStats();
 
+  // Defines the driver barrier processing state.
+  struct BarrierState {
+    // If set, the driver has started output draining. It points to the operator
+    // that is currently draining output.
+    std::optional<int32_t> drainingOpId{std::nullopt};
+    // If set, the specified operator doesn't need any more input to finish the
+    // draining operation. All the upstream operators within the same driver
+    // should drop their output or output processing.
+    std::optional<int32_t> dropInputOpId{std::nullopt};
+  };
+
+  // Invoked to start draining on the next operator. If there is no "next"
+  // operator in this driver pipeline, then we pass the draining signal to the
+  // downstream operator. Hence "next" refers to the immediate downstream
+  // operator.
+  void drainNextOperator();
+
+  // Invoked when the last operator (sink) has finished draining, and send the
+  // draining signal to consumer driver pipeline through connected queues.
+  void finishBarrier();
+
   void close();
 
-  // Push down dynamic filters produced by the operator at the specified
-  // position in the pipeline.
-  void pushdownFilters(int operatorIndex);
+  using TimingMemberPtr = CpuWallTiming OperatorStats::*;
+  template <typename Func>
+  void withDeltaCpuWallTimer(
+      Operator* op,
+      TimingMemberPtr opTimingMember,
+      Func&& opFunction);
 
-  // If 'trackOperatorCpuUsage_' is true, returns initialized timer object to
-  // track cpu and wall time of an operation. Returns null otherwise.
-  // The delta CpuWallTiming object would be passes to 'func' upon
-  // destruction of the timer.
-  template <typename F>
-  std::unique_ptr<DeltaCpuWallTimer<F>> createDeltaCpuWallTimer(F&& func) {
-    return trackOperatorCpuUsage_
-        ? std::make_unique<DeltaCpuWallTimer<F>>(std::move(func))
-        : nullptr;
-  }
+  // Adjusts 'timing' by removing the lazy load wall time, CPU time, and input
+  // bytes accrued since last time timing information was recorded for 'op'. The
+  // accrued lazy load times are credited to the source operator of 'this'. The
+  // per-operator runtimeStats for lazy load are left in place to reflect which
+  // operator triggered the load but these do not bias the op's timing.
+  CpuWallTiming processLazyIoStats(Operator& op, const CpuWallTiming& timing);
 
-  // Adjusts 'timing' by removing the lazy load wall and CPU times
-  // accrued since last time timing information was recorded for
-  // 'op'. The accrued lazy load times are credited to the source
-  // operator of 'this'. The per-operator runtimeStats for lazy load
-  // are left in place to reflect which operator triggered the load
-  // but these do not bias the op's timing.
-  CpuWallTiming processLazyTiming(Operator& op, const CpuWallTiming& timing);
+  inline void validateOperatorOutputResult(
+      const RowVectorPtr& result,
+      const Operator& op);
+
+  inline StopReason blockDriver(
+      const std::shared_ptr<Driver>& self,
+      size_t blockedOperatorId,
+      ContinueFuture&& future,
+      std::shared_ptr<BlockingState>& blockingState,
+      CancelGuard& guard);
 
   std::unique_ptr<DriverCtx> ctx_;
+
+  // If set, the operator output batch size stats will be collected during
+  // driver execution.
+  bool enableOperatorBatchSizeStats_{false};
 
   // If not zero, specifies the driver cpu time slice.
   size_t cpuSliceMs_{0};
@@ -523,6 +639,9 @@ class Driver : public std::enable_shared_from_this<Driver> {
   bool operatorsInitialized_{false};
 
   std::atomic_bool closed_{false};
+
+  // If set, the driver is under a barrier processing.
+  std::optional<BarrierState> barrier_;
 
   OpCallStatus opCallStatus_;
 
@@ -547,13 +666,26 @@ class Driver : public std::enable_shared_from_this<Driver> {
   // of DriverFactory::createDriver().
   bool isAdaptable_{true};
 
+  // Pushdown filters on the pipeline.  This is generated per split group per
+  // pipeline.
+  std::shared_ptr<PipelinePushdownFilters> pushdownFilters_;
+
   friend struct DriverFactory;
 };
 
 using OperatorSupplier = std::function<
     std::unique_ptr<Operator>(int32_t operatorId, DriverCtx* ctx)>;
 
-using Consumer = std::function<BlockingReason(RowVectorPtr, ContinueFuture*)>;
+/// The function used by CallbackSink operator to push output data or drained
+/// signal to the consumer pipeline.
+/// @param data If not null, the produced output data.
+/// @param drained If true, the producer pipeline has drained its output. If it
+/// is true, then 'data' is null, otherwise not null.
+/// @param future Returns a valid 'future' when consumer pipeline has excessive
+/// buffered data and becomes ready when the excessive data buffers get
+/// consumed.
+using Consumer = std::function<
+    BlockingReason(RowVectorPtr data, bool drained, ContinueFuture* future)>;
 using ConsumerSupplier = std::function<Consumer()>;
 
 struct DriverFactory;
@@ -570,7 +702,7 @@ struct DriverFactory {
   std::vector<std::shared_ptr<const core::PlanNode>> planNodes;
   /// Function that will generate the final operator of a driver being
   /// constructed.
-  OperatorSupplier consumerSupplier;
+  OperatorSupplier operatorSupplier;
   /// Maximum number of drivers that can be run concurrently in this pipeline.
   uint32_t maxDrivers;
   /// Number of drivers that will be run concurrently in this pipeline for one
@@ -602,6 +734,7 @@ struct DriverFactory {
   std::shared_ptr<Driver> createDriver(
       std::unique_ptr<DriverCtx> ctx,
       std::shared_ptr<ExchangeClient> exchangeClient,
+      std::shared_ptr<PipelinePushdownFilters> filters,
       std::function<int(int pipelineId)> numDrivers);
 
   /// Replaces operators at indices 'begin' to 'end - 1' with
@@ -617,8 +750,7 @@ struct DriverFactory {
   static void registerAdapter(DriverAdapter adapter);
 
   bool supportsSerialExecution() const {
-    return !needsPartitionedOutput() && !needsExchangeClient() &&
-        !needsLocalExchange();
+    return !needsPartitionedOutput() && !needsExchangeClient();
   }
 
   const core::PlanNodeId& leafNodeId() const {
@@ -653,16 +785,29 @@ struct DriverFactory {
     return std::nullopt;
   }
 
-  /// Returns LocalPartition plan node ID if the pipeline gets data from a
-  /// local exchange.
-  std::optional<core::PlanNodeId> needsLocalExchange() const {
+  /// Returns true if the pipeline gets data from a local exchange. The function
+  /// sets plan node in 'planNode'.
+  bool needsLocalExchange(core::PlanNodePtr& planNode) const {
     VELOX_CHECK(!planNodes.empty());
     if (auto exchangeNode =
             std::dynamic_pointer_cast<const core::LocalPartitionNode>(
                 planNodes.front())) {
-      return exchangeNode->id();
+      planNode = exchangeNode;
+      return true;
     }
-    return std::nullopt;
+    return false;
+  }
+
+  /// Returns true if the pipeline gets data from a table scan. The function
+  /// sets plan node id in 'planNodeId'.
+  bool needsTableScan(core::PlanNodeId& planNodeId) const {
+    VELOX_CHECK(!planNodes.empty());
+    if (auto scanNode = std::dynamic_pointer_cast<const core::TableScanNode>(
+            planNodes.front())) {
+      planNodeId = scanNode->id();
+      return true;
+    }
+    return false;
   }
 
   /// Returns plan node IDs for which Hash Join Bridges must be created based
@@ -676,35 +821,29 @@ struct DriverFactory {
   static std::vector<DriverAdapter> adapters;
 };
 
-/// Begins and ends a section where a thread is running but not counted in its
-/// Task. Using this, a Driver thread can for example stop its own Task. For
-/// arbitrating memory overbooking, the contending threads go suspended and each
-/// in turn enters a global critical section. When running the arbitration
-/// strategy, a thread can stop and restart Tasks, including its own. When a
-/// Task is stopped, its drivers are blocked or suspended and the strategy
-/// thread can alter the Task's memory including spilling or killing the whole
-/// Task. Other threads waiting to run the arbitration, are in a suspended state
-/// which also means that they are instantaneously killable or spillable.
-class SuspendedSection {
- public:
-  explicit SuspendedSection(Driver* driver);
-  ~SuspendedSection();
-
- private:
-  Driver* driver_;
-};
-
 /// Provides the execution context of a driver thread. This is set to a
 /// per-thread local variable if the running thread is a driver thread.
-struct DriverThreadContext {
-  const DriverCtx& driverCtx;
+class DriverThreadContext {
+ public:
+  explicit DriverThreadContext(const DriverCtx* driverCtx)
+      : driverCtx_(driverCtx) {}
+
+  const DriverCtx* driverCtx() const {
+    VELOX_CHECK_NOT_NULL(driverCtx_);
+    return driverCtx_;
+  }
+
+ private:
+  const DriverCtx* driverCtx_;
 };
 
 /// Object used to set/restore the driver thread context when driver execution
 /// starts/leaves the driver thread.
 class ScopedDriverThreadContext {
  public:
-  explicit ScopedDriverThreadContext(const DriverCtx& driverCtx);
+  explicit ScopedDriverThreadContext(const DriverCtx* driverCtx);
+  explicit ScopedDriverThreadContext(
+      const DriverThreadContext* _driverThreadCtx);
   ~ScopedDriverThreadContext();
 
  private:
@@ -721,7 +860,7 @@ DriverThreadContext* driverThreadContext();
 template <>
 struct fmt::formatter<facebook::velox::exec::StopReason>
     : formatter<std::string> {
-  auto format(facebook::velox::exec::StopReason s, format_context& ctx) {
+  auto format(facebook::velox::exec::StopReason s, format_context& ctx) const {
     return formatter<std::string>::format(
         facebook::velox::exec::stopReasonString(s), ctx);
   }

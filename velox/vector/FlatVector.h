@@ -18,7 +18,6 @@
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
 #include <folly/dynamic.h>
-#include <gflags/gflags_declare.h>
 
 #include "velox/common/base/SimdUtil.h"
 #include "velox/vector/BaseVector.h"
@@ -57,7 +56,7 @@ class FlatVector final : public SimpleVector<T> {
       velox::memory::MemoryPool* pool,
       const TypePtr& type,
       BufferPtr nulls,
-      size_t length,
+      vector_size_t length,
       BufferPtr values,
       std::vector<BufferPtr>&& stringBuffers,
       const SimpleVectorStats<T>& stats = {},
@@ -92,7 +91,7 @@ class FlatVector final : public SimpleVector<T> {
       VELOX_CHECK_EQ(
           0,
           cnt,
-          "FlatVector with null values buffer must have all rows set to null")
+          "FlatVector with null values buffer must have all rows set to null");
       return;
     }
     auto byteSize = BaseVector::byteSize<T>(BaseVector::length_);
@@ -142,23 +141,23 @@ class FlatVector final : public SimpleVector<T> {
     return values_;
   }
 
-  /// Ensures that 'values_' is singly-referenced and has space for 'size'
-  /// elements. Sets elements between the old and new sizes to T() if
-  /// the new size > old size.
+  /// Ensures that 'values_' is singly-referenced and has space for the current
+  /// size of the Vector. Sets any newly added elements to T() if the new size >
+  /// old size.
   ///
   /// If 'values_' is nullptr, read-only, not uniquely-referenced, or doesn't
   /// have capacity for 'size' elements allocates new buffer and copies data to
   /// it. Updates 'rawValues_' to point to element 0 of
   /// values_->as<T>().
-  BufferPtr mutableValues(vector_size_t size) {
-    const auto numNewBytes = BaseVector::byteSize<T>(size);
+  BufferPtr mutableValues(vector_size_t /*ignored*/ = 0) {
+    const auto numNewBytes = BaseVector::byteSize<T>(BaseVector::length_);
     if (values_ && !values_->isView() && values_->unique()) {
       if (values_->size() < numNewBytes) {
-        AlignedBuffer::reallocate<T>(&values_, size, T());
+        AlignedBuffer::reallocate<T>(&values_, BaseVector::length_, T());
       }
     } else {
-      BufferPtr newValues =
-          AlignedBuffer::allocate<T>(size, BaseVector::pool(), T());
+      BufferPtr newValues = AlignedBuffer::allocate<T>(
+          BaseVector::length_, BaseVector::pool(), T());
       if (values_) {
         const auto numCopyBytes =
             std::min<vector_size_t>(values_->size(), numNewBytes);
@@ -169,7 +168,7 @@ class FlatVector final : public SimpleVector<T> {
         } else {
           auto dst = newValues->asMutable<T>();
           auto src = values_->as<T>();
-          if (Buffer::is_pod_like_v<T>) {
+          if constexpr (Buffer::is_pod_like_v<T>) {
             memcpy(dst, src, numCopyBytes);
           } else {
             std::copy(src, src + numCopyBytes / sizeof(T), dst);
@@ -235,7 +234,7 @@ class FlatVector final : public SimpleVector<T> {
   void set(vector_size_t idx, T value) {
     VELOX_DCHECK_LT(idx, BaseVector::length_);
     ensureValues();
-    VELOX_DCHECK(!values_->isView())
+    VELOX_DCHECK(!values_->isView());
     rawValues_[idx] = value;
     if (BaseVector::nulls_) {
       BaseVector::setNull(idx, false);
@@ -272,14 +271,15 @@ class FlatVector final : public SimpleVector<T> {
       const BaseVector* source,
       const folly::Range<const BaseVector::CopyRange*>& ranges) override;
 
-  VectorPtr copyPreserveEncodings(
+  VectorPtr testingCopyPreserveEncodings(
       velox::memory::MemoryPool* pool = nullptr) const override {
+    const auto allocPool = pool ? pool : BaseVector::pool_;
     return std::make_shared<FlatVector<T>>(
-        pool ? pool : BaseVector::pool_,
+        allocPool,
         BaseVector::type_,
-        AlignedBuffer::copy(BaseVector::pool_, BaseVector::nulls_),
+        AlignedBuffer::copy(allocPool, BaseVector::nulls_),
         BaseVector::length_,
-        AlignedBuffer::copy(BaseVector::pool_, values_),
+        AlignedBuffer::copy(allocPool, values_),
         std::vector<BufferPtr>(stringBuffers_),
         SimpleVector<T>::stats_,
         BaseVector::distinctValueCount_,
@@ -326,16 +326,32 @@ class FlatVector final : public SimpleVector<T> {
 
     auto thisValue = valueAtFast(index);
     auto otherValue = other->valueAtFast(otherIndex);
-    auto result = SimpleVector<T>::comparePrimitiveAsc(thisValue, otherValue);
+    auto result = this->typeUsesCustomComparison_
+        ? SimpleVector<T>::comparePrimitiveAscWithCustomComparison(
+              this->type_.get(), thisValue, otherValue)
+        : SimpleVector<T>::comparePrimitiveAsc(thisValue, otherValue);
+
     return flags.ascending ? result : result * -1;
   }
 
-  void sortIndices(std::vector<vector_size_t>& indices, CompareFlags flags)
-      const override {
+  template <bool useCustomComparison, typename ValueAt, typename IsNullAt>
+  void sortIndices(
+      ValueAt valueAt,
+      IsNullAt isNullAt,
+      std::vector<vector_size_t>& indices,
+      CompareFlags flags) const {
     auto compareNonNull = [&](vector_size_t left, vector_size_t right) {
-      auto leftValue = valueAtFast(left);
-      auto rightValue = valueAtFast(right);
-      auto result = SimpleVector<T>::comparePrimitiveAsc(leftValue, rightValue);
+      auto leftValue = valueAt(left);
+      auto rightValue = valueAt(right);
+
+      int result;
+      if constexpr (useCustomComparison) {
+        result = SimpleVector<T>::comparePrimitiveAscWithCustomComparison(
+            this->type_.get(), leftValue, rightValue);
+      } else {
+        result = SimpleVector<T>::comparePrimitiveAsc(leftValue, rightValue);
+      }
+
       return (flags.ascending ? result : result * -1) < 0;
     };
 
@@ -344,8 +360,8 @@ class FlatVector final : public SimpleVector<T> {
           indices.begin(),
           indices.end(),
           [&](vector_size_t left, vector_size_t right) {
-            bool leftNull = BaseVector::isNullAt(left);
-            bool rightNull = BaseVector::isNullAt(right);
+            bool leftNull = isNullAt(left);
+            bool rightNull = isNullAt(right);
             if (leftNull || rightNull) {
               return BaseVector::compareNulls(leftNull, rightNull, flags)
                          .value() < 0;
@@ -358,33 +374,39 @@ class FlatVector final : public SimpleVector<T> {
     }
   }
 
+  void sortIndices(std::vector<vector_size_t>& indices, CompareFlags flags)
+      const override {
+    if (this->typeUsesCustomComparison_) {
+      sortIndices<true>(
+          [this](vector_size_t idx) { return valueAtFast(idx); },
+          [this](vector_size_t idx) { return BaseVector::isNullAt(idx); },
+          indices,
+          flags);
+    } else {
+      sortIndices<false>(
+          [this](vector_size_t idx) { return valueAtFast(idx); },
+          [this](vector_size_t idx) { return BaseVector::isNullAt(idx); },
+          indices,
+          flags);
+    }
+  }
+
   void sortIndices(
       std::vector<vector_size_t>& indices,
       const vector_size_t* mapping,
       CompareFlags flags) const override {
-    auto compareNonNull = [&](vector_size_t left, vector_size_t right) {
-      auto leftValue = valueAtFast(mapping[left]);
-      auto rightValue = valueAtFast(mapping[right]);
-      auto result = SimpleVector<T>::comparePrimitiveAsc(leftValue, rightValue);
-      return (flags.ascending ? result : result * -1) < 0;
-    };
-
-    if (BaseVector::rawNulls_) {
-      std::sort(
-          indices.begin(),
-          indices.end(),
-          [&](vector_size_t left, vector_size_t right) {
-            bool leftNull = BaseVector::isNullAt(mapping[left]);
-            bool rightNull = BaseVector::isNullAt(mapping[right]);
-            if (leftNull || rightNull) {
-              return BaseVector::compareNulls(leftNull, rightNull, flags)
-                         .value() < 0;
-            }
-
-            return compareNonNull(left, right);
-          });
+    if (this->typeUsesCustomComparison_) {
+      sortIndices<true>(
+          [&](vector_size_t idx) { return valueAtFast(mapping[idx]); },
+          [&](vector_size_t idx) { return BaseVector::isNullAt(mapping[idx]); },
+          indices,
+          flags);
     } else {
-      std::sort(indices.begin(), indices.end(), compareNonNull);
+      sortIndices<false>(
+          [&](vector_size_t idx) { return valueAtFast(mapping[idx]); },
+          [&](vector_size_t idx) { return BaseVector::isNullAt(mapping[idx]); },
+          indices,
+          flags);
     }
   }
 
@@ -401,8 +423,8 @@ class FlatVector final : public SimpleVector<T> {
     return size;
   }
 
-  /// Used for vectors of type VARCHAR and VARBINARY to hold data referenced by
-  /// StringView's. It is safe to share these among multiple vectors. These
+  /// Used for vectors of type VARCHAR and VARBINARY to hold data referenced
+  /// by StringView's. It is safe to share these among multiple vectors. These
   /// buffers are append only. It is allowed to append data, but it is
   /// prohibited to modify already written data.
   const std::vector<BufferPtr>& stringBuffers() const {
@@ -422,8 +444,8 @@ class FlatVector final : public SimpleVector<T> {
     }
   }
 
-  /// Used for vectors of type VARCHAR and VARBINARY to release the data buffers
-  /// referenced by StringView's.
+  /// Used for vectors of type VARCHAR and VARBINARY to release the data
+  /// buffers referenced by StringView's.
   void clearStringBuffers() {
     VELOX_DCHECK_GE(stringBuffers_.size(), stringBufferSet_.size());
 
@@ -474,13 +496,13 @@ class FlatVector final : public SimpleVector<T> {
 
   /// This API is available only for string vectors (T = StringView).
   ///
-  /// Finds an existing string buffer that's singly-referenced (not shared) and
-  /// have enough unused capacity to fit 'size' bytes. If found, resizes the
-  /// buffer to add 'size' bytes and returns a pointer to the start of writable
-  /// memory. If not found, allocates new buffer, adds it to 'stringBuffers',
-  /// sets buffer size to 'size' and returns a pointer to the start of writable
-  /// memory.
-  /// The caller must ensure not to write more then 'size' bytes.
+  /// Finds an existing string buffer that's singly-referenced (not shared)
+  /// and have enough unused capacity to fit 'size' bytes. If found, resizes
+  /// the buffer to add 'size' bytes and returns a pointer to the start of
+  /// writable memory. If not found, allocates new buffer, adds it to
+  /// 'stringBuffers', sets buffer size to 'size' and returns a pointer to the
+  /// start of writable memory. The caller must ensure not to write more then
+  /// 'size' bytes.
   ///
   /// If allocates new buffer and 'exactSize' is true, allocates 'size' bytes.
   /// Otherwise, allocates at least kInitialStringSize bytes.
@@ -495,9 +517,10 @@ class FlatVector final : public SimpleVector<T> {
   }
 
   /// Calls BaseVector::prapareForReuse() to check and reset nulls buffer if
-  /// needed, checks and resets values buffer. Resets all strings buffers except
-  /// the first one. Keeps the first string buffer if singly-referenced and
-  /// mutable. Resizes the buffer to zero to allow for reuse instead of append.
+  /// needed, checks and resets values buffer. Resets all strings buffers
+  /// except the first one. Keeps the first string buffer if singly-referenced
+  /// and mutable. Resizes the buffer to zero to allow for reuse instead of
+  /// append.
   void prepareForReuse() override;
 
   void validate(const VectorValidateOptions& options) const override {
@@ -510,6 +533,7 @@ class FlatVector final : public SimpleVector<T> {
   }
 
   void unsafeSetSize(vector_size_t newSize) {
+    VELOX_CHECK_GE(newSize, 0, "Size must be non-negative.");
     this->length_ = newSize;
   }
 
@@ -569,8 +593,8 @@ class FlatVector final : public SimpleVector<T> {
   // Used by 'acquireSharedStringBuffers()' to fast check if a buffer to share
   // has already been referenced by 'stringBuffers_'.
   //
-  // NOTE: we need to ensure 'stringBuffers_' and 'stringBufferSet_' are always
-  // consistent.
+  // NOTE: we need to ensure 'stringBuffers_' and 'stringBufferSet_' are
+  // always consistent.
   folly::F14FastSet<const Buffer*> stringBufferSet_;
 };
 
@@ -586,10 +610,22 @@ Range<bool> FlatVector<bool>::asRange() const;
 template <>
 void FlatVector<StringView>::set(vector_size_t idx, StringView value);
 
+/// For types that requires buffer allocation this should be called only if
+/// value is inlined or if value is already allocated in a buffer within the
+/// vector. Used by StringWriter to allow UDFs to write directly into the
+/// buffers and avoid copying.
 template <>
-void FlatVector<StringView>::setNoCopy(
+inline void FlatVector<StringView>::setNoCopy(
     const vector_size_t idx,
-    const StringView& value);
+    const StringView& value) {
+  VELOX_DCHECK_LT(idx, BaseVector::length_);
+  ensureValues();
+  VELOX_DCHECK(!values_->isView());
+  if (BaseVector::nulls_) {
+    BaseVector::setNull(idx, false);
+  }
+  rawValues_[idx] = value;
+}
 
 template <>
 void FlatVector<bool>::set(vector_size_t idx, bool value);
@@ -614,6 +650,10 @@ char* FlatVector<StringView>::getRawStringBufferWithSpace(
 
 template <>
 void FlatVector<StringView>::prepareForReuse();
+
+template <>
+VectorPtr FlatVector<StringView>::testingCopyPreserveEncodings(
+    velox::memory::MemoryPool* pool) const;
 
 template <typename T>
 using FlatVectorPtr = std::shared_ptr<FlatVector<T>>;

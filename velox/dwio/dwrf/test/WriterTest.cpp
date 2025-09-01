@@ -33,7 +33,7 @@ namespace facebook::velox::dwrf {
 class WriterTest : public Test {
  public:
   static void SetUpTestCase() {
-    MemoryManager::testingSetInstance({});
+    MemoryManager::testingSetInstance(MemoryManager::Options{});
   }
 
   WriterTest() : pool_(memoryManager()->addLeafPool("WriterTest")) {}
@@ -61,7 +61,10 @@ class WriterTest : public Test {
     std::string data(sinkPtr_->data(), sinkPtr_->size());
     auto readFile = std::make_shared<InMemoryReadFile>(std::move(data));
     auto input = std::make_unique<BufferedInput>(std::move(readFile), *pool_);
-    return std::make_unique<ReaderBase>(*pool_, std::move(input));
+    dwio::common::ReaderOptions readerOpts{pool_.get()};
+    auto reader = std::make_unique<ReaderBase>(readerOpts, std::move(input));
+    reader->loadCache();
+    return reader;
   }
 
   auto& getContext() {
@@ -171,7 +174,6 @@ TEST_P(AllWriterCompressionTest, compression) {
   if (compressionKind_ == CompressionKind::CompressionKind_SNAPPY ||
       compressionKind_ == CompressionKind::CompressionKind_LZO ||
       compressionKind_ == CompressionKind::CompressionKind_LZ4 ||
-      compressionKind_ == CompressionKind::CompressionKind_GZIP ||
       compressionKind_ == CompressionKind::CompressionKind_MAX) {
     VELOX_ASSERT_THROW(
         writeFooter(*schema),
@@ -399,15 +401,13 @@ TEST_P(SupportedCompressionTest, ValidateStreamSizeConfigEnabled) {
   validateStreamSize(std::numeric_limits<int32_t>::max());
 
   uint32_t int32Max = std::numeric_limits<int32_t>::max();
-  EXPECT_THROW(validateStreamSize(int32Max + 1), exception::LoggedException);
+  VELOX_ASSERT_THROW(validateStreamSize(int32Max + 1), "");
 
-  EXPECT_THROW(
-      validateStreamSize(std::numeric_limits<uint64_t>::max()),
-      exception::LoggedException);
+  VELOX_ASSERT_THROW(
+      validateStreamSize(std::numeric_limits<uint64_t>::max()), "");
 
-  EXPECT_THROW(
-      validateStreamSize(std::numeric_limits<uint32_t>::max()),
-      exception::LoggedException);
+  VELOX_ASSERT_THROW(
+      validateStreamSize(std::numeric_limits<uint32_t>::max()), "");
   writer.close();
 }
 

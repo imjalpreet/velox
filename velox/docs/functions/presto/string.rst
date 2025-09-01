@@ -93,6 +93,12 @@ String Functions
         SELECT ltrim('test', 't'); -- est
         SELECT ltrim('tetris', 'te'); -- ris
 
+.. function:: replaceFirst(string, search, replace) -> varchar
+
+    Removes the first instances of ``search`` with ``replace`` in ``string``.
+
+    If ``search`` is an empty string, inserts ``replace`` in front of ``string``.
+
 .. function:: replace(string, search) -> varchar
 
     Removes all instances of ``search`` from ``string``.
@@ -180,6 +186,14 @@ String Functions
         SELECT(split_to_map('a:1;b:2;a:3', ';', ':', (k, v1, v2) -> v1)); -- {"a": "1", "b": "2"}
         SELECT(split_to_map('a:1;b:2;a:3', ';', ':', (k, v1, v2) -> v2)); -- {"a": "3", "b": "2"}
 
+.. function:: split_to_multimap(string, entryDelimiter, keyValueDelimiter) -> map<varchar, array<varchar>>
+
+    Splits ``string`` by ``entryDelimiter`` and ``keyValueDelimiter`` and returns a map containing an array of values for each unique key.
+    ``entryDelimiter`` splits ``string`` into key-value pairs. ``keyValueDelimiter`` splits each pair into key and value.
+    The values for each key will be in the same order as they appeared in ``string``.
+
+    Note that ``entryDelimiter`` and ``keyValueDelimiter`` are interpreted literally, i.e., as full string matches.
+
 .. function:: starts_with(string, substring) -> boolean
 
     Returns whether ``string`` starts with ``substring``.
@@ -214,7 +228,13 @@ String Functions
 
         SELECT strrpos('aaa', 'aa', 2); -- 1
 
+.. function:: trail(string, N) -> varchar
+
+    Returns the last ``N`` characters of the input ``string`` up to at most the length of ``string``.
+
 .. function:: substr(string, start) -> varchar
+.. function:: substring(string, start) -> varchar
+    :noindex:
 
     Returns the rest of ``string`` from the starting position ``start``.
     Positions start with ``1``. A negative starting position is interpreted
@@ -222,6 +242,8 @@ String Functions
     value of ``start`` is greater then length of the ``string``.
 
 .. function:: substr(string, start, length) -> varchar
+    :noindex:
+.. function:: substring(string, start, length) -> varchar
     :noindex:
 
     Returns a substring from ``string`` of length ``length`` from the starting

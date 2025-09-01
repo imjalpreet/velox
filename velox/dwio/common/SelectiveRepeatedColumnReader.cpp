@@ -63,7 +63,7 @@ void prepareResult(
           result->encoding() == VectorEncoding::Simple::ARRAY) ||
          (type->kind() == TypeKind::MAP &&
           result->encoding() == VectorEncoding::Simple::MAP)) &&
-        result.unique())) {
+        result.use_count() == 1)) {
     VLOG(1) << "Reallocating result " << type->kind() << " vector of size "
             << size;
     result = BaseVector::create(type, size, pool);
@@ -75,36 +75,37 @@ void prepareResult(
   // makeOffsetsAndSizes.  Child vectors are handled in child column readers.
 }
 
-vector_size_t
-advanceNestedRows(const RowSet& rows, vector_size_t i, vector_size_t last) {
-  while (i + 16 < rows.size() && rows[i + 16] < last) {
-    i += 16;
-  }
-  while (i < rows.size() && rows[i] < last) {
-    ++i;
-  }
-  return i;
-}
-
 } // namespace
+
+void SelectiveRepeatedColumnReader::ensureAllLengthsBuffer(vector_size_t size) {
+  if (!allLengthsHolder_ ||
+      allLengthsHolder_->capacity() < size * sizeof(vector_size_t)) {
+    allLengthsHolder_ = allocateIndices(size, memoryPool_);
+    allLengths_ = allLengthsHolder_->asMutable<vector_size_t>();
+  }
+}
 
 void SelectiveRepeatedColumnReader::makeNestedRowSet(
     const RowSet& rows,
     int32_t maxRow) {
-  if (!allLengthsHolder_ ||
-      allLengthsHolder_->capacity() < (maxRow + 1) * sizeof(vector_size_t)) {
-    allLengthsHolder_ = allocateIndices(maxRow + 1, memoryPool_);
-    allLengths_ = allLengthsHolder_->asMutable<vector_size_t>();
-  }
+  ensureAllLengthsBuffer(maxRow + 1);
   auto* nulls = nullsInReadRange_ ? nullsInReadRange_->as<uint64_t>() : nullptr;
   // Reads the lengths, leaves an uninitialized gap for a null
   // map/list. Reading these checks the null mask.
   readLengths(allLengths_, maxRow + 1, nulls);
-  vector_size_t nestedLength{0};
+
+  vector_size_t nestedLength;
+  if (nestedRowsAllSelected_) {
+    nestedLength = sumLengths(allLengths_, nulls, 0, maxRow + 1);
+    childTargetReadOffset_ += nestedLength;
+    nestedRows_ = RowSet(iota(nestedLength, nestedRowsHolder_), nestedLength);
+    return;
+  }
+
+  nestedLength = 0;
   for (auto row : rows) {
     if (!nulls || !bits::isBitNull(nulls, row)) {
-      nestedLength +=
-          std::min(scanSpec_->maxArrayElementsCount(), allLengths_[row]);
+      nestedLength += prunedLengthAt(row);
     }
   }
   nestedRowsHolder_.resize(nestedLength);
@@ -121,8 +122,7 @@ void SelectiveRepeatedColumnReader::makeNestedRowSet(
     if (nulls && bits::isBitNull(nulls, row)) {
       continue;
     }
-    const auto lengthAtRow =
-        std::min(scanSpec_->maxArrayElementsCount(), allLengths_[row]);
+    const auto lengthAtRow = prunedLengthAt(row);
     std::iota(
         nestedRowsHolder_.data() + nestedRow,
         nestedRowsHolder_.data() + nestedRow + lengthAtRow,
@@ -142,8 +142,32 @@ void SelectiveRepeatedColumnReader::makeOffsetsAndSizes(
       result.mutableOffsets(rows.size())->asMutable<vector_size_t>();
   auto* rawSizes = result.mutableSizes(rows.size())->asMutable<vector_size_t>();
   auto* nulls = nullsInReadRange_ ? nullsInReadRange_->as<uint64_t>() : nullptr;
-  vector_size_t currentRow = 0;
+  numValues_ = rows.size();
   vector_size_t currentOffset = 0;
+  if (nestedRowsAllSelected_ && rows.size() == outputRows().size()) {
+    if (nulls) {
+      for (int i = 0; i < rows.size(); ++i) {
+        VELOX_DCHECK_EQ(i, rows[i]);
+        rawOffsets[i] = currentOffset;
+        if (bits::isBitNull(nulls, i)) {
+          rawSizes[i] = 0;
+          anyNulls_ = true;
+        } else {
+          rawSizes[i] = allLengths_[i];
+          currentOffset += allLengths_[i];
+        }
+      }
+    } else {
+      for (int i = 0; i < rows.size(); ++i) {
+        VELOX_DCHECK_EQ(i, rows[i]);
+        rawOffsets[i] = currentOffset;
+        rawSizes[i] = allLengths_[i];
+        currentOffset += allLengths_[i];
+      }
+    }
+    return;
+  }
+  vector_size_t currentRow = 0;
   vector_size_t nestedRowIndex = 0;
   for (int i = 0; i < rows.size(); ++i) {
     const auto row = rows[i];
@@ -163,7 +187,6 @@ void SelectiveRepeatedColumnReader::makeOffsetsAndSizes(
       nestedRowIndex = newNestedRowIndex;
     }
   }
-  numValues_ = rows.size();
 }
 
 RowSet SelectiveRepeatedColumnReader::applyFilter(const RowSet& rows) {
@@ -218,16 +241,22 @@ uint64_t SelectiveListColumnReader::skip(uint64_t numValues) {
 }
 
 void SelectiveListColumnReader::read(
-    vector_size_t offset,
+    int64_t offset,
     const RowSet& rows,
     const uint64_t* incomingNulls) {
   // Catch up if the child is behind the length stream.
   child_->seekTo(childTargetReadOffset_, false);
   prepareRead<char>(offset, rows, incomingNulls);
   auto activeRows = applyFilter(rows);
+  nestedRowsAllSelected_ = activeRows.size() == rows.back() + 1 &&
+      scanSpec_->maxArrayElementsCount() ==
+          std::numeric_limits<vector_size_t>::max();
   makeNestedRowSet(activeRows, rows.back());
   if (child_ && !nestedRows_.empty()) {
     child_->read(child_->readOffset(), nestedRows_, nullptr);
+    nestedRowsAllSelected_ = nestedRowsAllSelected_ &&
+        nestedRows_.size() == child_->outputRows().size();
+    nestedRows_ = child_->outputRows();
   }
   numValues_ = activeRows.size();
   readOffset_ = offset + rows.back() + 1;
@@ -287,7 +316,7 @@ uint64_t SelectiveMapColumnReader::skip(uint64_t numValues) {
 }
 
 void SelectiveMapColumnReader::read(
-    vector_size_t offset,
+    int64_t offset,
     const RowSet& rows,
     const uint64_t* incomingNulls) {
   // Catch up if child readers are behind the length stream.
@@ -300,12 +329,21 @@ void SelectiveMapColumnReader::read(
 
   prepareRead<char>(offset, rows, incomingNulls);
   const auto activeRows = applyFilter(rows);
+  nestedRowsAllSelected_ = activeRows.size() == rows.back() + 1;
+  VELOX_CHECK_EQ(
+      scanSpec_->maxArrayElementsCount(),
+      std::numeric_limits<vector_size_t>::max());
   makeNestedRowSet(activeRows, rows.back());
   if (keyReader_ && elementReader_ && !nestedRows_.empty()) {
     keyReader_->read(keyReader_->readOffset(), nestedRows_, nullptr);
+    nestedRowsAllSelected_ = nestedRowsAllSelected_ &&
+        nestedRows_.size() == keyReader_->outputRows().size();
     nestedRows_ = keyReader_->outputRows();
     if (!nestedRows_.empty()) {
       elementReader_->read(elementReader_->readOffset(), nestedRows_, nullptr);
+      nestedRowsAllSelected_ = nestedRowsAllSelected_ &&
+          nestedRows_.size() == elementReader_->outputRows().size();
+      nestedRows_ = elementReader_->outputRows();
     }
   }
   numValues_ = activeRows.size();

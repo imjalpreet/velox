@@ -19,23 +19,34 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/random/uniform_int_distribution.hpp>
 
+#include "velox/exec/fuzzer/FuzzerUtil.h"
 #include "velox/expression/ReverseSignatureBinder.h"
-#include "velox/expression/SignatureBinder.h"
+#include "velox/functions/prestosql/types/IPAddressType.h"
+#include "velox/functions/prestosql/types/IPPrefixType.h"
+#include "velox/functions/prestosql/types/JsonType.h"
 #include "velox/type/Type.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
 namespace facebook::velox::fuzzer {
 
+using exec::test::sanitizeTryResolveType;
+
 std::string typeToBaseName(const TypePtr& type) {
   if (type->isDecimal()) {
     return "decimal";
+  } else if (isIPPrefixType(type)) {
+    return "ipprefix";
+  } else if (isIPAddressType(type)) {
+    return "ipaddress";
+  } else if (isJsonType(type)) {
+    return "json";
   }
   return boost::algorithm::to_lower_copy(std::string{type->kindName()});
 }
 
 std::optional<TypeKind> baseNameToTypeKind(const std::string& typeName) {
   auto kindName = boost::algorithm::to_upper_copy(typeName);
-  return tryMapNameToTypeKind(kindName);
+  return TypeKindName::tryToTypeKind(kindName);
 }
 
 namespace {
@@ -97,6 +108,39 @@ void ArgumentTypeFuzzer::determineUnboundedIntegerVariables(
   }
 }
 
+void ArgumentTypeFuzzer::determineUnboundedEnumVariables(
+    const exec::TypeSignature& type) {
+  if (boost::algorithm::to_lower_copy(type.baseName()) != "bigint_enum") {
+    return;
+  }
+
+  for (const auto& param : type.parameters()) {
+    const auto paramName = param.baseName();
+
+    auto it = variables().find(paramName);
+    if (it != variables().end() && it->second.isEnumParameter()) {
+      if (longEnumParameterBindings_.find(paramName) ==
+          longEnumParameterBindings_.end()) {
+        // Generate a random LongEnumParameter with a random name and random
+        // values.
+        // TODO: Revisit when implementing custom input generator for enum type,
+        // and when enum_key function is removed from the fuzzer skip list.
+        int numValues = rand32(0, 20);
+        std::string enumName =
+            fmt::format("test.enum.{}{}", paramName, numValues);
+        std::unordered_map<std::string, int64_t> enumValues;
+        for (int i = 0; i < numValues; i++) {
+          std::string key = fmt::format("VALUE{}", i);
+          enumValues[key] = i;
+        }
+
+        LongEnumParameter enumParam(enumName, enumValues);
+        longEnumParameterBindings_[paramName] = enumParam;
+      }
+    }
+  }
+}
+
 void ArgumentTypeFuzzer::determineUnboundedTypeVariables() {
   for (auto& [variableName, variableInfo] : variables()) {
     if (!variableInfo.isTypeParameter()) {
@@ -119,11 +163,11 @@ void ArgumentTypeFuzzer::determineUnboundedTypeVariables() {
 }
 
 TypePtr ArgumentTypeFuzzer::randType() {
-  return velox::randType(rng_, 2);
+  return velox::randType(rng_, scalarTypes_, 2);
 }
 
 TypePtr ArgumentTypeFuzzer::randOrderableType() {
-  return velox::randOrderableType(rng_, 2);
+  return velox::randOrderableType(rng_, scalarTypes_, 2);
 }
 
 bool ArgumentTypeFuzzer::fuzzArgumentTypes(uint32_t maxVariadicArgs) {
@@ -169,6 +213,7 @@ bool ArgumentTypeFuzzer::fuzzArgumentTypes(uint32_t maxVariadicArgs) {
 
     bindings_ = binder.bindings();
     integerBindings_ = binder.integerBindings();
+    longEnumParameterBindings_ = binder.longEnumParameterBindings();
   }
 
   const auto& formalArgs = signature_.argumentTypes();
@@ -177,14 +222,19 @@ bool ArgumentTypeFuzzer::fuzzArgumentTypes(uint32_t maxVariadicArgs) {
   determineUnboundedTypeVariables();
   for (const auto& argType : formalArgs) {
     determineUnboundedIntegerVariables(argType);
+    determineUnboundedEnumVariables(argType);
   }
   for (auto i = 0; i < formalArgsCnt; i++) {
     TypePtr actualArg;
     if (formalArgs[i].baseName() == "any") {
       actualArg = randType();
     } else {
-      actualArg = exec::SignatureBinder::tryResolveType(
-          formalArgs[i], variables(), bindings_, integerBindings_);
+      actualArg = sanitizeTryResolveType(
+          formalArgs[i],
+          variables(),
+          bindings_,
+          integerBindings_,
+          longEnumParameterBindings_);
       VELOX_CHECK(actualArg != nullptr);
     }
     argumentTypes_.push_back(actualArg);
@@ -212,14 +262,19 @@ TypePtr ArgumentTypeFuzzer::fuzzReturnType() {
 
   determineUnboundedTypeVariables();
   determineUnboundedIntegerVariables(signature_.returnType());
+  determineUnboundedEnumVariables(signature_.returnType());
 
   const auto& returnType = signature_.returnType();
 
   if (returnType.baseName() == "any") {
     returnType_ = randType();
   } else {
-    returnType_ = exec::SignatureBinder::tryResolveType(
-        returnType, variables(), bindings_, integerBindings_);
+    returnType_ = sanitizeTryResolveType(
+        returnType,
+        variables(),
+        bindings_,
+        integerBindings_,
+        longEnumParameterBindings_);
   }
 
   VELOX_CHECK_NOT_NULL(returnType_);
@@ -238,7 +293,7 @@ std::optional<int> ArgumentTypeFuzzer::tryFixedBinding(
         isPositiveInteger(name),
         "Precision and scale of a decimal type must refer to a variable "
         "or specify a positive integer constant: {}",
-        name)
+        name);
     return std::stoi(name);
   }
 
@@ -259,7 +314,7 @@ std::pair<std::optional<int>, std::optional<int>>
 ArgumentTypeFuzzer::tryBindFixedPrecisionScale(
     const exec::TypeSignature& type) {
   VELOX_CHECK(isDecimalBaseName(type.baseName()));
-  VELOX_CHECK_EQ(2, type.parameters().size())
+  VELOX_CHECK_EQ(2, type.parameters().size());
 
   const auto& precisionName = type.parameters()[0].baseName();
   const auto& scaleName = type.parameters()[1].baseName();

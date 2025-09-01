@@ -14,7 +14,47 @@
  * limitations under the License.
  */
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
-#include "velox/exec/Aggregate.h"
+#include "velox/functions/prestosql/aggregates/ApproxDistinctAggregates.h"
+#include "velox/functions/prestosql/aggregates/ApproxMostFrequentAggregate.h"
+#include "velox/functions/prestosql/aggregates/ApproxPercentileAggregate.h"
+#include "velox/functions/prestosql/aggregates/ArbitraryAggregate.h"
+#include "velox/functions/prestosql/aggregates/ArrayAggAggregate.h"
+#include "velox/functions/prestosql/aggregates/AverageAggregate.h"
+#include "velox/functions/prestosql/aggregates/BitwiseAggregates.h"
+#include "velox/functions/prestosql/aggregates/BitwiseXorAggregate.h"
+#include "velox/functions/prestosql/aggregates/BoolAggregates.h"
+#include "velox/functions/prestosql/aggregates/CentralMomentsAggregates.h"
+#include "velox/functions/prestosql/aggregates/ChecksumAggregate.h"
+#include "velox/functions/prestosql/aggregates/ClassificationAggregation.h"
+#include "velox/functions/prestosql/aggregates/CountAggregate.h"
+#include "velox/functions/prestosql/aggregates/CountIfAggregate.h"
+#include "velox/functions/prestosql/aggregates/CovarianceAggregates.h"
+#include "velox/functions/prestosql/aggregates/EntropyAggregates.h"
+#include "velox/functions/prestosql/aggregates/GeometricMeanAggregate.h"
+#include "velox/functions/prestosql/aggregates/HistogramAggregate.h"
+#include "velox/functions/prestosql/aggregates/MapAggAggregate.h"
+#include "velox/functions/prestosql/aggregates/MapUnionAggregate.h"
+#include "velox/functions/prestosql/aggregates/MapUnionSumAggregate.h"
+#include "velox/functions/prestosql/aggregates/MaxByAggregate.h"
+#include "velox/functions/prestosql/aggregates/MaxSizeForStatsAggregate.h"
+#include "velox/functions/prestosql/aggregates/MergeAggregate.h"
+#include "velox/functions/prestosql/aggregates/MinByAggregate.h"
+#include "velox/functions/prestosql/aggregates/MinMaxAggregates.h"
+#include "velox/functions/prestosql/aggregates/MultiMapAggAggregate.h"
+#include "velox/functions/prestosql/aggregates/NoisyApproxSfmAggregate.h"
+#include "velox/functions/prestosql/aggregates/NoisyAvgGaussianAggregate.h"
+#include "velox/functions/prestosql/aggregates/NoisyCountGaussianAggregate.h"
+#include "velox/functions/prestosql/aggregates/NoisyCountIfGaussianAggregate.h"
+#include "velox/functions/prestosql/aggregates/NoisySumGaussianAggregate.h"
+#include "velox/functions/prestosql/aggregates/NumericHistogramAggregate.h"
+#include "velox/functions/prestosql/aggregates/QDigestAggAggregate.h"
+#include "velox/functions/prestosql/aggregates/ReduceAgg.h"
+#include "velox/functions/prestosql/aggregates/SetAggregates.h"
+#include "velox/functions/prestosql/aggregates/SumAggregate.h"
+#include "velox/functions/prestosql/aggregates/SumDataSizeForStatsAggregate.h"
+#include "velox/functions/prestosql/aggregates/VarianceAggregates.h"
+#include "velox/functions/prestosql/types/JsonRegistration.h"
+#include "velox/functions/prestosql/types/TDigestRegistration.h"
 
 namespace facebook::velox::aggregate::prestosql {
 
@@ -44,6 +84,10 @@ extern void registerBitwiseXorAggregate(
     bool onlyPrestoSignatures,
     bool overwrite);
 extern void registerChecksumAggregate(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite);
+extern void registerClassificationFunctions(
     const std::string& prefix,
     bool withCompanionFunctions,
     bool overwrite);
@@ -129,7 +173,11 @@ extern void registerMinMaxAggregates(
     const std::string& prefix,
     bool withCompanionFunctions,
     bool overwrite);
-extern void registerMinMaxByAggregates(
+extern void registerMaxByAggregates(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite);
+extern void registerMinByAggregates(
     const std::string& prefix,
     bool withCompanionFunctions,
     bool overwrite);
@@ -141,16 +189,23 @@ extern void registerVarianceAggregates(
     const std::string& prefix,
     bool withCompanionFunctions,
     bool overwrite);
+extern void registerTDigestAggregate(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite);
 
 void registerAllAggregateFunctions(
     const std::string& prefix,
     bool withCompanionFunctions,
     bool onlyPrestoSignatures,
     bool overwrite) {
+  registerJsonType();
+  registerTDigestType();
   registerApproxDistinctAggregates(prefix, withCompanionFunctions, overwrite);
   registerApproxMostFrequentAggregate(
       prefix, withCompanionFunctions, overwrite);
   registerApproxPercentileAggregate(prefix, withCompanionFunctions, overwrite);
+  registerQDigestAggAggregate(prefix, overwrite);
   registerArbitraryAggregate(prefix, withCompanionFunctions, overwrite);
   registerArrayAggAggregate(prefix, withCompanionFunctions, overwrite);
   registerAverageAggregate(prefix, withCompanionFunctions, overwrite);
@@ -161,6 +216,7 @@ void registerAllAggregateFunctions(
   registerBoolAggregates(prefix, withCompanionFunctions, overwrite);
   registerCentralMomentsAggregates(prefix, withCompanionFunctions, overwrite);
   registerChecksumAggregate(prefix, withCompanionFunctions, overwrite);
+  registerClassificationFunctions(prefix, withCompanionFunctions, overwrite);
   registerCountAggregate(prefix, withCompanionFunctions, overwrite);
   registerCountIfAggregate(prefix, withCompanionFunctions, overwrite);
   registerCovarianceAggregates(prefix, withCompanionFunctions, overwrite);
@@ -175,23 +231,25 @@ void registerAllAggregateFunctions(
   registerMultiMapAggAggregate(prefix, withCompanionFunctions, overwrite);
   registerSumDataSizeForStatsAggregate(
       prefix, withCompanionFunctions, overwrite);
+  registerMergeAggregate(prefix, withCompanionFunctions, overwrite);
   registerMinMaxAggregates(prefix, withCompanionFunctions, overwrite);
-  registerMinMaxByAggregates(prefix, withCompanionFunctions, overwrite);
+  registerMaxByAggregates(prefix, withCompanionFunctions, overwrite);
+  registerMinByAggregates(prefix, withCompanionFunctions, overwrite);
+  registerNoisyAvgGaussianAggregate(prefix, withCompanionFunctions, overwrite);
+  registerNoisyCountIfGaussianAggregate(
+      prefix, withCompanionFunctions, overwrite);
+  registerNoisyCountGaussianAggregate(
+      prefix, withCompanionFunctions, overwrite);
+  registerNoisySumGaussianAggregate(prefix, withCompanionFunctions, overwrite);
   registerReduceAgg(prefix, withCompanionFunctions, overwrite);
   registerSetAggAggregate(prefix, withCompanionFunctions, overwrite);
   registerSetUnionAggregate(prefix, withCompanionFunctions, overwrite);
   registerSumAggregate(prefix, withCompanionFunctions, overwrite);
   registerVarianceAggregates(prefix, withCompanionFunctions, overwrite);
+  registerTDigestAggregate(prefix, withCompanionFunctions, overwrite);
+  registerNoisyApproxSfmAggregate(prefix, withCompanionFunctions, overwrite);
+  registerNumericHistogramAggregate(prefix, withCompanionFunctions, overwrite);
 }
-
-extern void registerCountDistinctAggregate(
-    const std::string& prefix,
-    bool withCompanionFunctions,
-    bool overwrite);
-extern void registerInternalArrayAggAggregate(
-    const std::string& prefix,
-    bool withCompanionFunctions,
-    bool overwrite);
 
 void registerInternalAggregateFunctions(const std::string& prefix) {
   bool withCompanionFunctions = false;

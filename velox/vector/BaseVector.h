@@ -39,8 +39,7 @@
 #include "velox/vector/VectorEncoding.h"
 #include "velox/vector/VectorUtil.h"
 
-namespace facebook {
-namespace velox {
+namespace facebook::velox {
 
 template <typename T>
 class SimpleVector;
@@ -71,14 +70,14 @@ class BaseVector {
   BaseVector(const BaseVector&) = delete;
   BaseVector& operator=(const BaseVector&) = delete;
 
-  static constexpr uint64_t kNullHash = 1;
+  static constexpr uint64_t kNullHash = bits::kNullHash;
 
   BaseVector(
       velox::memory::MemoryPool* pool,
       TypePtr type,
       VectorEncoding::Simple encoding,
       BufferPtr nulls,
-      size_t length,
+      vector_size_t length,
       std::optional<vector_size_t> distinctValueCount = std::nullopt,
       std::optional<vector_size_t> nullCount = std::nullopt,
       std::optional<ByteCount> representedByteCount = std::nullopt,
@@ -108,7 +107,7 @@ class BaseVector {
 
   inline bool isIndexInRange(vector_size_t index) const {
     // This compiles better than index >= 0 && index < length_.
-    return static_cast<uint32_t>(index) < length_;
+    return static_cast<uint32_t>(index) < static_cast<uint32_t>(length_);
   }
 
   template <typename T>
@@ -144,6 +143,28 @@ class BaseVector {
         typeid(T).name(),
         typeid(*this).name());
     return static_cast<const T*>(this);
+  }
+
+  template <typename T>
+  T* asChecked() {
+    auto* casted = as<T>();
+    VELOX_CHECK_NOT_NULL(
+        casted,
+        "Wrong type cast expected {}, but got {}",
+        typeid(T).name(),
+        typeid(*this).name());
+    return casted;
+  }
+
+  template <typename T>
+  const T* asChecked() const {
+    auto* casted = as<T>();
+    VELOX_CHECK_NOT_NULL(
+        casted,
+        "Wrong type cast expected {}, but got {}",
+        typeid(T).name(),
+        typeid(*this).name());
+    return casted;
   }
 
   template <typename T>
@@ -184,6 +205,10 @@ class BaseVector {
 
   const TypePtr& type() const {
     return type_;
+  }
+
+  bool typeUsesCustomComparison() const {
+    return typeUsesCustomComparison_;
   }
 
   /// Changes vector type. The new type can have a different
@@ -231,8 +256,12 @@ class BaseVector {
     return const_cast<uint64_t*>(rawNulls_);
   }
 
-  BufferPtr& mutableNulls(vector_size_t size) {
-    ensureNullsCapacity(size);
+  /// Ensures the vector has capacity for the nulls and returns the shared
+  /// pointer to the buffer containing them.
+  /// Optional parameter 'setNotNull' is passed to ensureNullsCapacity() and is
+  /// used to ensure all the rows will be 'not nulls' if set to true.
+  BufferPtr& mutableNulls(vector_size_t size, bool setNotNull = false) {
+    ensureNullsCapacity(size, setNotNull);
     return nulls_;
   }
 
@@ -306,9 +335,10 @@ class BaseVector {
   /// When CompareFlags is ASCENDING, returns < 0 if 'this' at 'index' is less
   /// than 'other' at 'otherIndex', 0 if equal and > 0 otherwise.
   /// When CompareFlags is DESCENDING, returns < 0 if 'this' at 'index' is
-  /// larger than 'other' at 'otherIndex', 0 if equal and < 0 otherwise. If
-  /// flags.nullHandlingMode is not NullAsValue, the function may returns
-  /// std::nullopt if null encountered.
+  /// larger than 'other' at 'otherIndex', 0 if equal and < 0 otherwise.
+  ///
+  /// If flags.nullHandlingMode is not NullAsValue, the function may return
+  /// std::nullopt if nulls are encountered.
   virtual std::optional<int32_t> compare(
       const BaseVector* other,
       vector_size_t index,
@@ -401,6 +431,12 @@ class BaseVector {
     vector_size_t sourceIndex;
     vector_size_t targetIndex;
     vector_size_t count;
+
+    /// Whether `next` can be merged with this range to form a new range.
+    bool mergeable(const CopyRange& next) const {
+      return next.sourceIndex == sourceIndex + count &&
+          next.targetIndex == targetIndex + count;
+    }
   };
 
   /// Sets null flags for each row in 'ranges' to 'isNull'.
@@ -508,24 +544,61 @@ class BaseVector {
 
   /// This makes a deep copy of the Vector allocating new child Vectors and
   /// Buffers recursively.  Unlike copy, this preserves encodings recursively.
-  virtual VectorPtr copyPreserveEncodings(
+  virtual VectorPtr testingCopyPreserveEncodings(
       velox::memory::MemoryPool* pool = nullptr) const = 0;
 
   /// Construct a zero-copy slice of the vector with the indicated offset and
   /// length.
   virtual VectorPtr slice(vector_size_t offset, vector_size_t length) const = 0;
 
-  /// Returns a vector of the type of 'source' where 'indices' contains
-  /// an index into 'source' for each element of 'source'. The
-  /// resulting vector has position i set to source[i]. This is
-  /// equivalent to wrapping 'source' in a dictionary with 'indices'
-  /// but this may reuse structure if said structure is uniquely owned
-  /// or if a copy is more efficient than dictionary wrapping.
+  /// Transposes two sets of dictionary indices into one level of indirection.
+  /// Sets result[i] = base[indices[i]] for i = 0 ... i < size.
+  static void transposeIndices(
+      const vector_size_t* base,
+      vector_size_t size,
+      const vector_size_t* indices,
+      vector_size_t* result);
+
+  /// Transposes two levels of indices into a single level with nulls. sets
+  /// result[i] = base[indices[i]] where i is not null in 'wrapNulls' and
+  /// indices[i] is not null in 'baseNulls'. If indices[i] is null in
+  /// 'baseNulls' or i is null in 'wrapNulls', then 'resultNulls' is null at i.
+  /// 'wrapNulls' may be nullptr, meaning that no new nulls are added.
+  static void transposeIndicesWithNulls(
+      const vector_size_t* baseIndices,
+      const uint64_t* baseNulls,
+      vector_size_t wrapSize,
+      const vector_size_t* wrapIndices,
+      const uint64_t* wrapNulls,
+      vector_size_t* resultIndices,
+      uint64_t* resultNulls);
+
+  /// Flattens 'dictionaryValues', which is a dictionary and replaces
+  /// it with its base. 'size' is the number of valid elements in
+  /// 'indices' and 'nulls'. Null positions may have an invalid
+  /// index. Rewrites 'indices' from being indices into
+  /// 'dictionaryValues' to being indices into the latter's
+  /// base. Rewrites 'nulls' to be nulls from 'dictionaryValues' and
+  /// its base vector. This is used when a dictionary vector loads a
+  /// lazy values vector and finds out that the loaded is itself a
+  /// dictionary.
+  static void transposeDictionaryValues(
+      vector_size_t wrapSize,
+      BufferPtr& wrapNulls,
+      BufferPtr& wrapIndices,
+      std::shared_ptr<BaseVector>& dictionaryValues);
+
+  // Returns a vector of the type of 'source' where 'indices' contains
+  // an index into 'source' for each element of 'source'. The
+  // resulting vector has position i set to source[i]. This is
+  // equivalent to wrapping 'source' in a dictionary with 'indices'
+  // but this may reuse structure if said structure is uniquely owned
+  // or if a copy is more efficient than dictionary wrapping.
   static VectorPtr transpose(BufferPtr indices, VectorPtr&& source);
 
   static VectorPtr createConstant(
       const TypePtr& type,
-      variant value,
+      Variant value,
       vector_size_t size,
       velox::memory::MemoryPool* pool);
 
@@ -534,11 +607,18 @@ class BaseVector {
       vector_size_t size,
       velox::memory::MemoryPool* pool);
 
+  /// Wraps the 'vector' in the provided dictionary encoding. If the input
+  /// vector is constant and the nulls buffer is empty, this method may return a
+  /// ConstantVector. Additionally, if 'flattenIfRedundant' is true, this method
+  /// may return a flattened version of the expected dictionary vector if
+  /// applying the dictionary encoding would result in a suboptimally encoded
+  /// vector.
   static VectorPtr wrapInDictionary(
       BufferPtr nulls,
       BufferPtr indices,
       vector_size_t size,
-      VectorPtr vector);
+      VectorPtr vector,
+      bool flattenIfRedundant = false);
 
   static VectorPtr
   wrapInSequence(BufferPtr lengths, vector_size_t size, VectorPtr vector);
@@ -548,14 +628,9 @@ class BaseVector {
   /// before making a new ConstantVector. The result vector is either a
   /// ConstantVector holding a scalar value or a ConstantVector wrapping flat or
   /// lazy vector. The result cannot be a wrapping over another constant or
-  /// dictionary vector. If copyBase is true and the result vector wraps a
-  /// vector, the wrapped vector is newly constructed by copying the value from
-  /// the original, guaranteeing no Vectors are shared with 'vector'.
-  static VectorPtr wrapInConstant(
-      vector_size_t length,
-      vector_size_t index,
-      VectorPtr vector,
-      bool copyBase = false);
+  /// dictionary vector.
+  static VectorPtr
+  wrapInConstant(vector_size_t length, vector_size_t index, VectorPtr vector);
 
   /// Makes 'result' writable for 'rows'. A wrapper (e.g. dictionary, constant,
   /// sequence) is flattened and a multiply referenced flat vector is copied.
@@ -582,7 +657,7 @@ class BaseVector {
   /// Returns true if the following conditions hold:
   ///  * The vector is singly referenced.
   ///  * The vector has a Flat-like encoding (Flat, Array, Map, Row).
-  ///  * Any child Buffers are mutable  and singly referenced.
+  ///  * Any child Buffers are mutable and singly referenced.
   ///  * All of these conditions hold for child Vectors recursively.
   /// This function is templated rather than taking a
   /// std::shared_ptr<BaseVector> because if we were to do that the compiler
@@ -590,7 +665,7 @@ class BaseVector {
   /// unique.
   template <typename T>
   static bool isVectorWritable(const std::shared_ptr<T>& vector) {
-    if (!vector.unique()) {
+    if (vector.use_count() != 1) {
       return false;
     }
 
@@ -622,7 +697,7 @@ class BaseVector {
     VELOX_UNSUPPORTED("Vector is not a wrapper");
   }
 
-  virtual VectorPtr& valueVector() {
+  virtual void setValueVector(VectorPtr valueVector) {
     VELOX_UNSUPPORTED("Vector is not a wrapper");
   }
 
@@ -646,8 +721,12 @@ class BaseVector {
 
   /// If 'this' is a wrapper, returns the wrap info, interpretation depends on
   /// encoding.
-  virtual BufferPtr wrapInfo() const {
-    throw std::runtime_error("Vector is not a wrapper");
+  virtual const BufferPtr& wrapInfo() const {
+    VELOX_UNSUPPORTED("Vector is not a wrapper");
+  }
+
+  virtual void setWrapInfo(BufferPtr wrapInfo) {
+    VELOX_UNSUPPORTED("Vector is not a wrapper");
   }
 
   template <typename T = BaseVector>
@@ -697,7 +776,7 @@ class BaseVector {
       velox::memory::MemoryPool* pool,
       BufferPtr* buffer,
       RawT** raw) {
-    vector_size_t minBytes = byteSize<T>(size);
+    auto minBytes = static_cast<uint64_t>(byteSize<T>(size));
     if (*buffer && (*buffer)->capacity() >= minBytes && (*buffer)->unique()) {
       (*buffer)->setSize(minBytes);
       if (raw) {
@@ -766,6 +845,11 @@ class BaseVector {
   std::string toString() const {
     return toString(false);
   }
+
+  static constexpr std::string_view kNullValueString = "null";
+
+  /// Returns the value at specified index as a Variant.
+  Variant variantAt(vector_size_t index) const;
 
   /// Returns string representation of the value in the specified row.
   virtual std::string toString(vector_size_t index) const;
@@ -882,24 +966,18 @@ class BaseVector {
     ensureNullsCapacity(length_, true);
   }
 
-  // Slice a buffer with specific type.
-  //
-  // For boolean type and if the offset is not multiple of 8, return a shifted
-  // copy; otherwise return a BufferView into the original buffer (with shared
-  // ownership of original buffer).
-  static BufferPtr sliceBuffer(
-      const Type&,
-      const BufferPtr&,
-      vector_size_t offset,
-      vector_size_t length,
-      memory::MemoryPool*);
-
   BufferPtr sliceNulls(vector_size_t offset, vector_size_t length) const {
-    return sliceBuffer(*BOOLEAN(), nulls_, offset, length, pool_);
+    return nulls_ ? Buffer::slice<bool>(nulls_, offset, length, pool_) : nulls_;
   }
 
   TypePtr type_;
   const TypeKind typeKind_;
+  // Whether `type_` is a type that provides custom comparison operations.
+  // We use this instead of calling type_->providesCustomCompare() because
+  // having a constant field helps the compiler to pull this condition up in
+  // loops, and `type_` itself is non-constant (though it can only be modified
+  // logically, so this property is safe to store).
+  const bool typeUsesCustomComparison_;
   const VectorEncoding::Simple encoding_;
   BufferPtr nulls_;
   // Caches raw pointer to 'nulls->as<uint64_t>().
@@ -1008,8 +1086,17 @@ std::string printIndices(
     const BufferPtr& indices,
     vector_size_t maxIndicesToPrint = 10);
 
-} // namespace velox
-} // namespace facebook
+template <typename OutputStream>
+OutputStream& operator<<(
+    OutputStream& out,
+    const BaseVector::CopyRange& range) {
+  out << "{sourceIndex=" << range.sourceIndex
+      << " targetIndex=" << range.targetIndex << " count=" << range.count
+      << "}";
+  return out;
+}
+
+} // namespace facebook::velox
 
 namespace folly {
 
@@ -1043,7 +1130,7 @@ struct fmt::formatter<facebook::velox::VectorEncoding::Simple> {
   auto format(
       const facebook::velox::VectorEncoding::Simple& x,
       FormatContext& ctx) const {
-    return format_to(
+    return fmt::format_to(
         ctx.out(), "{}", facebook::velox::VectorEncoding::mapSimpleToName(x));
   }
 };

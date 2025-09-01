@@ -17,6 +17,7 @@
 #include <arrow/c/abi.h>
 #include <arrow/c/bridge.h>
 #include <arrow/testing/gtest_util.h>
+#include <arrow/util/config.h>
 #include <gtest/gtest.h>
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -30,7 +31,7 @@ static void mockRelease(ArrowSchema*) {}
 class ArrowBridgeSchemaExportTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void testScalarType(
@@ -87,6 +88,11 @@ class ArrowBridgeSchemaExportTest : public testing::Test {
       EXPECT_STREQ("+m", schema->format);
       ASSERT_EQ(schema->n_children, 1);
       schema = schema->children[0];
+      // Map data should be a non-nullable struct type
+      ASSERT_EQ(schema->flags & ARROW_FLAG_NULLABLE, 0);
+      ASSERT_EQ(schema->n_children, 2);
+      // Map data key type should be a non-nullable
+      ASSERT_EQ(schema->children[0]->flags & ARROW_FLAG_NULLABLE, 0);
     } else if (type->kind() == TypeKind::ROW) {
       EXPECT_STREQ("+s", schema->format);
     }
@@ -288,6 +294,15 @@ TEST_F(ArrowBridgeSchemaExportTest, constant) {
   testConstant(MAP(UNKNOWN(), REAL()), "+m");
   testConstant(ROW({TIMESTAMP(), DOUBLE()}), "+s");
   testConstant(ROW({UNKNOWN(), UNKNOWN()}), "+s");
+  VELOX_ASSERT_THROW(
+      testConstant(ARRAY(INTEGER()), "+l", {false, true}),
+      "Flattening is only supported for scalar types.");
+  VELOX_ASSERT_THROW(
+      testConstant(MAP(BOOLEAN(), REAL()), "+m", {false, true}),
+      "Flattening is only supported for scalar types.");
+  VELOX_ASSERT_THROW(
+      testConstant(ROW({BOOLEAN(), REAL()}), "+s", {false, true}),
+      "Flattening is only supported for scalar types.");
 }
 
 class ArrowBridgeSchemaImportTest : public ArrowBridgeSchemaExportTest {
@@ -487,7 +502,7 @@ TEST_F(ArrowBridgeSchemaImportTest, unsupported) {
 class ArrowBridgeSchemaTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void roundtripTest(
@@ -537,8 +552,13 @@ TEST_F(ArrowBridgeSchemaTest, validateInArrow) {
       {BOOLEAN(), arrow::boolean()},
       {VARCHAR(), arrow::utf8()},
       {VARCHAR(), arrow::utf8_view()},
+#if ARROW_VERSION_MAJOR >= 18
+      {DECIMAL(10, 4), arrow::decimal128(10, 4)},
+      {DECIMAL(20, 15), arrow::decimal128(20, 15)},
+#else
       {DECIMAL(10, 4), arrow::decimal(10, 4)},
       {DECIMAL(20, 15), arrow::decimal(20, 15)},
+#endif
       {ARRAY(DOUBLE()), arrow::list(arrow::float64())},
       {ARRAY(ARRAY(DOUBLE())), arrow::list(arrow::list(arrow::float64()))},
       {MAP(VARCHAR(), REAL()), arrow::map(arrow::utf8(), arrow::float32())},

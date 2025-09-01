@@ -79,9 +79,7 @@ class DwrfRowReader : public StrideIndexProvider,
     return selectedSchema_;
   }
 
-  uint64_t rowNumber() const {
-    return previousRow_;
-  }
+  uint64_t rowNumber();
 
   uint64_t seekToRow(uint64_t rowNumber);
 
@@ -110,6 +108,9 @@ class DwrfRowReader : public StrideIndexProvider,
   void updateRuntimeStats(
       dwio::common::RuntimeStatistics& stats) const override {
     stats.skippedStrides += skippedStrides_;
+    stats.processedStrides += processedStrides_;
+    stats.footerBufferOverread += getReader().footerBufferOverread();
+    stats.numStripes += stripeCeiling_ - firstStripe_;
     stats.columnReaderStatistics.flattenStringDictionaryValues +=
         columnReaderStatistics_.flattenStringDictionaryValues;
   }
@@ -154,7 +155,7 @@ class DwrfRowReader : public StrideIndexProvider,
       const dwio::common::Statistics& stats,
       uint32_t nodeId) const;
 
-  bool isEmptyFile() const {
+  bool emptyFile() const {
     return stripeCeiling_ == firstStripe_;
   }
 
@@ -175,6 +176,8 @@ class DwrfRowReader : public StrideIndexProvider,
   std::unique_ptr<dwio::common::UnitLoader> getUnitLoader();
 
   const dwio::common::RowReaderOptions options_;
+  dwio::common::ColumnReaderOptions columnReaderOptions_;
+
   // column selector
   const std::shared_ptr<dwio::common::ColumnSelector> columnSelector_;
   const std::function<void(std::chrono::high_resolution_clock::duration)>
@@ -204,6 +207,9 @@ class DwrfRowReader : public StrideIndexProvider,
   // Number of skipped strides.
   int64_t skippedStrides_{0};
 
+  // Number of processed strides.
+  int64_t processedStrides_{0};
+
   // Set to true after clearing filter caches, i.e. adding a dynamic filter.
   // Causes filters to be re-evaluated against stride stats on next stride
   // instead of next stripe.
@@ -215,6 +221,9 @@ class DwrfRowReader : public StrideIndexProvider,
 
   std::unique_ptr<dwio::common::UnitLoader> unitLoader_;
   DwrfUnit* currentUnit_;
+
+  mutable std::optional<size_t> estimatedRowSize_;
+  mutable bool hasRowEstimate_{false};
 };
 
 class DwrfReader : public dwio::common::Reader {
@@ -346,7 +355,6 @@ class DwrfReader : public dwio::common::Reader {
 
  private:
   std::shared_ptr<ReaderBase> readerBase_;
-  const dwio::common::ReaderOptions options_;
 };
 
 class DwrfReaderFactory : public dwio::common::ReaderFactory {

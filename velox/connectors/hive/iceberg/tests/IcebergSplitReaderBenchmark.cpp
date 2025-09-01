@@ -16,7 +16,6 @@
 
 #include "velox/connectors/hive/iceberg/tests/IcebergSplitReaderBenchmark.h"
 #include <filesystem>
-#include "velox/exec/tests/utils/PrefixSortUtils.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::dwio;
@@ -116,6 +115,7 @@ IcebergSplitReaderBenchmark::makeIcebergSplit(
       std::nullopt,
       customSplitInfo,
       nullptr,
+      /*cacheable=*/true,
       deleteFiles);
 }
 
@@ -215,7 +215,7 @@ std::shared_ptr<ScanSpec> IcebergSplitReaderBenchmark::createScanSpec(
     RowTypePtr& rowType,
     const std::vector<FilterSpec>& filterSpecs,
     std::vector<uint64_t>& hitRows,
-    std::unordered_map<Subfield, std::unique_ptr<Filter>>& filters) {
+    SubfieldFilters& filters) {
   std::unique_ptr<FilterGenerator> filterGenerator =
       std::make_unique<FilterGenerator>(rowType, 0);
   filters = filterGenerator->makeSubfieldFilters(
@@ -271,7 +271,7 @@ void IcebergSplitReaderBenchmark::readSingleColumn(
       createFilterSpec(columnName, startPct, selectPct, rowType, false, false));
 
   std::vector<uint64_t> hitRows;
-  std::unordered_map<Subfield, std::unique_ptr<Filter>> filters;
+  SubfieldFilters filters;
   auto scanSpec =
       createScanSpec(*batches, rowType, filterSpecs, hitRows, filters);
 
@@ -295,6 +295,8 @@ void IcebergSplitReaderBenchmark::readSingleColumn(
   const RowTypePtr readerOutputType;
   const std::shared_ptr<io::IoStatistics> ioStats =
       std::make_shared<io::IoStatistics>();
+  const std::shared_ptr<filesystems::File::IoStats> fsStats =
+      std::make_shared<filesystems::File::IoStats>();
 
   std::shared_ptr<memory::MemoryPool> root =
       memory::memoryManager()->addRootPool(
@@ -312,7 +314,7 @@ void IcebergSplitReaderBenchmark::readSingleColumn(
           connectorPool.get(),
           connectorSessionProperties_.get(),
           nullptr,
-          exec::test::defaultPrefixSortConfig(),
+          common::PrefixSortConfig(),
           nullptr,
           nullptr,
           "query.IcebergSplitReader",
@@ -322,7 +324,7 @@ void IcebergSplitReaderBenchmark::readSingleColumn(
           "");
 
   FileHandleFactory fileHandleFactory(
-      std::make_unique<SimpleLRUCache<std::string, FileHandle>>(
+      std::make_unique<SimpleLRUCache<FileHandleKey, FileHandle>>(
           hiveConfig->numCacheFileHandles()),
       std::make_unique<FileHandleGenerator>(connectorSessionProperties_));
 
@@ -340,13 +342,14 @@ void IcebergSplitReaderBenchmark::readSingleColumn(
             hiveConfig,
             rowType,
             ioStats,
+            fsStats,
             &fileHandleFactory,
             nullptr,
             scanSpec);
 
     std::shared_ptr<random::RandomSkipTracker> randomSkip;
     icebergSplitReader->configureReaderOptions(randomSkip);
-    icebergSplitReader->prepareSplit(nullptr, runtimeStats_, nullptr);
+    icebergSplitReader->prepareSplit(nullptr, runtimeStats_);
 
     // Filter range is generated from a small sample data of 4096 rows. So the
     // upperBound and lowerBound are introduced to estimate the result size.

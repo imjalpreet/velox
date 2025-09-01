@@ -1,6 +1,6 @@
-===========================
+=============
 Map Functions
-===========================
+=============
 
 .. spark:function:: element_at(map(K,V), key) -> V
 
@@ -8,11 +8,29 @@ Map Functions
 
 .. spark:function:: map(K, V, K, V, ...) -> map(K,V)
 
-    Returns a map created using the given key/value pairs. Keys are not allowed to be null. ::
+    Returns a map created using the given key/value pairs. If there is duplicate key, by default that
+    key's value comes from last value for that key in the arguments.
+    If configuration `throw_exception_on_duplicate_map_keys` is set true,
+    throws exception for duplicate keys. Keys are not allowed to be null. ::
 
         SELECT map(1, 2, 3, 4); -- {1 -> 2, 3 -> 4}
+        SELECT map(1, 2, 3, 4, 1, 5); -- {1 -> 5, 3 -> 4} (LAST_WIN behavior)
+        SELECT map(1, 2, 3, 4, 1, 5); -- "Duplicate map key (1) was found" (EXCEPTION behavior)
 
         SELECT map(array(1, 2), array(3, 4)); -- {[1, 2] -> [3, 4]}
+
+.. spark:function:: map_concat(map1(K,V), map2(K,V), ..., mapN(K,V)) -> map(K,V)
+
+    Returns the union of all the given maps. If a key is found in multiple given maps,
+    by default that key's value in the resulting map comes from the last one of those maps.
+    If configuration `throw_exception_on_duplicate_map_keys` is set true, throws exception
+    for duplicate keys. Allows single map input.  ::
+
+        SELECT map_concat(map(1, 'a', 2, 'b'), map(3, 'c')); -- {1 -> 'a', 2 -> 'b', 3 -> 'c'}
+        SELECT map_concat(map(1, 'a', 2, 'b'), map(3, NULL)); -- {1 -> 'a', 2 -> 'b', 3 -> NULL}
+        SELECT map_concat(map(1, 'a', 2, 'b')); -- {1 -> 'a', 2 -> 'b'}
+        SELECT map_concat(map(1, 'a', 2, 'b'), map(3, 'c', 2, 'd')); -- {1 -> 'a', 2 -> 'd', 3 -> 'c'} (LAST_WIN behavior)
+        SELECT map_concat(map(1, 'a', 2, 'b'), map(3, 'c', 2, 'd')); --  "Duplicate map key 2 was found" (EXCEPTION behavior)
 
 .. spark:function:: map_entries(map(K,V)) -> array(row(K,V))
 
@@ -57,7 +75,7 @@ Map Functions
                             (k, v1, v2) -> k || CAST(v1/v2 AS VARCHAR));
 
 .. spark:function:: size(map(K,V), legacySizeOfNull) -> integer
-   :noindex:
+    :noindex:
 
     Returns the size of the input map. Returns null for null input if ``legacySizeOfNull``
     is set to false. Otherwise, returns -1 for null input. ::

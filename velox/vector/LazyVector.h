@@ -199,7 +199,12 @@ class VectorLoader {
       const SelectivityVector& rows,
       ValueHook* hook,
       vector_size_t resultSize,
-      VectorPtr* result);
+      VectorPtr* result,
+      memory::MemoryPool* pool);
+
+  virtual bool supportsHook() const {
+    return false;
+  }
 
  protected:
   virtual void loadInternal(
@@ -224,6 +229,8 @@ class LazyVector : public BaseVector {
  public:
   static constexpr const char* kCpuNanos = "dataSourceLazyCpuNanos";
   static constexpr const char* kWallNanos = "dataSourceLazyWallNanos";
+  static constexpr const char* kInputBytes = "dataSourceLazyInputBytes";
+
   LazyVector(
       velox::memory::MemoryPool* pool,
       TypePtr type,
@@ -240,6 +247,7 @@ class LazyVector : public BaseVector {
         vector_(std::move(vector)) {}
 
   void reset(std::unique_ptr<VectorLoader>&& loader, vector_size_t size) {
+    VELOX_CHECK_GE(size, 0, "Size must be non-negative.");
     BaseVector::length_ = size;
     loader_ = std::move(loader);
     allLoaded_ = false;
@@ -303,7 +311,7 @@ class LazyVector : public BaseVector {
     return loadedVector()->wrappedIndex(index);
   }
 
-  BufferPtr wrapInfo() const override {
+  const BufferPtr& wrapInfo() const override {
     return loadedVector()->wrapInfo();
   }
 
@@ -343,6 +351,10 @@ class LazyVector : public BaseVector {
 
   VectorPtr slice(vector_size_t offset, vector_size_t length) const override;
 
+  bool supportsHook() const {
+    return loader_->supportsHook();
+  }
+
   // Loads 'rows' of 'vector'. 'vector' may be an arbitrary wrapping
   // of a LazyVector. 'rows' are translated through the wrappers. If
   // there is no LazyVector inside 'vector', this has no
@@ -361,9 +373,10 @@ class LazyVector : public BaseVector {
 
   void validate(const VectorValidateOptions& options) const override;
 
-  VectorPtr copyPreserveEncodings(
-      velox::memory::MemoryPool* /* pool */ = nullptr) const override {
-    VELOX_UNSUPPORTED("copyPreserveEncodings not defined for LazyVector");
+  VectorPtr testingCopyPreserveEncodings(
+      velox::memory::MemoryPool* pool = nullptr) const override {
+    VELOX_CHECK(isLoaded());
+    return loadedVector()->testingCopyPreserveEncodings(pool);
   }
 
  private:

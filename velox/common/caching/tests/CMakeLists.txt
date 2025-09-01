@@ -16,12 +16,8 @@ add_executable(simple_lru_cache_test SimpleLRUCacheTest.cpp)
 add_test(simple_lru_cache_test simple_lru_cache_test)
 target_link_libraries(
   simple_lru_cache_test
-  PRIVATE
-    Folly::folly
-    velox_time
-    glog::glog
-    GTest::gtest
-    GTest::gtest_main)
+  PRIVATE velox_common_base Folly::folly velox_time glog::glog GTest::gtest GTest::gtest_main
+)
 
 add_executable(
   velox_cache_test
@@ -29,28 +25,27 @@ add_executable(
   CacheTTLControllerTest.cpp
   SsdFileTest.cpp
   SsdFileTrackerTest.cpp
-  StringIdMapTest.cpp)
+  StringIdMapTest.cpp
+)
 add_test(velox_cache_test velox_cache_test)
 target_link_libraries(
   velox_cache_test
   PRIVATE
     velox_caching
     velox_file
+    velox_file_test_utils
     velox_memory
     velox_temp_path
+    velox_flag_definitions
     Folly::folly
     glog::glog
     GTest::gtest
-    GTest::gtest_main)
+    GTest::gtest_main
+)
 
 add_executable(cached_factory_test CachedFactoryTest.cpp)
 add_test(cached_factory_test cached_factory_test)
 target_link_libraries(
   cached_factory_test
-  PRIVATE
-    velox_process
-    Folly::folly
-    velox_time
-    glog::glog
-    GTest::gtest
-    GTest::gtest_main)
+  PRIVATE velox_common_base Folly::folly velox_time glog::glog GTest::gtest GTest::gtest_main
+)

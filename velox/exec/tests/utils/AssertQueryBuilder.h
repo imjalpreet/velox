@@ -35,6 +35,9 @@ class AssertQueryBuilder {
   /// Change requested number of drivers. Default is 1.
   AssertQueryBuilder& maxDrivers(int32_t maxDrivers);
 
+  /// Change the query memory pool capacity. Default has no limit
+  AssertQueryBuilder& maxQueryCapacity(int64_t maxCapacity);
+
   /// Change task's 'destination', the partition number assigned to the task.
   /// Default is 0.
   AssertQueryBuilder& destination(int32_t destination);
@@ -42,6 +45,10 @@ class AssertQueryBuilder {
   /// Use serial execution mode to execute the Velox plan.
   /// Default is false.
   AssertQueryBuilder& serialExecution(bool serial);
+
+  /// Use barrier task execution mode to execute the Velox plan.
+  /// Default is false.
+  AssertQueryBuilder& barrierExecution(bool barrier);
 
   /// Set configuration property. May be called multiple times to set multiple
   /// properties.
@@ -64,6 +71,11 @@ class AssertQueryBuilder {
       const std::string& connectorId,
       const std::string& key,
       const std::string& value);
+
+  AssertQueryBuilder& connectorSessionProperties(
+      const std::unordered_map<
+          std::string,
+          std::unordered_map<std::string, std::string>>& properties);
 
   // Methods to add splits.
 
@@ -104,6 +116,10 @@ class AssertQueryBuilder {
   AssertQueryBuilder& splits(
       const std::vector<std::shared_ptr<connector::ConnectorSplit>>&
           connectorSplits);
+
+  /// Indicate that the splits should be added with sequence numbers to the task
+  /// when the query runs.
+  AssertQueryBuilder& addSplitWithSequence(bool addWithSequence);
 
   /// Sets the QueryCtx.
   AssertQueryBuilder& queryCtx(const std::shared_ptr<core::QueryCtx>& ctx) {
@@ -175,6 +191,9 @@ class AssertQueryBuilder {
       memory::MemoryPool* pool,
       std::shared_ptr<Task>& task);
 
+  /// Run the query and return the number of result rows.
+  uint64_t runWithoutResults(std::shared_ptr<Task>& task);
+
  private:
   std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>>
   readCursor();
@@ -192,6 +211,9 @@ class AssertQueryBuilder {
   std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
       connectorSessionProperties_;
   std::unordered_map<core::PlanNodeId, std::vector<Split>> splits_;
+  bool addSplitWithSequence_{false};
+  // The sequence Id to be used when addSplitWithSequence_ is true.
+  int32_t sequenceId_{0};
 };
 
 } // namespace facebook::velox::exec::test

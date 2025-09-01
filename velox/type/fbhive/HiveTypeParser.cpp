@@ -17,14 +17,12 @@
 #include "velox/type/fbhive/HiveTypeParser.h"
 
 #include <cctype>
-#include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "velox/common/base/Exceptions.h"
 
-using facebook::velox::Type;
-using facebook::velox::TypeKind;
+namespace facebook::velox::type::fbhive {
 
 namespace {
 /// Returns true only if 'str' contains digits.
@@ -41,8 +39,6 @@ bool isSupportedSpecialChar(char c) {
 }
 } // namespace
 
-namespace facebook::velox::type::fbhive {
-
 HiveTypeParser::HiveTypeParser() {
   metadata_.resize(static_cast<size_t>(TokenType::MaxTokenType));
   setupMetadata<TokenType::Boolean, TypeKind::BOOLEAN>("boolean");
@@ -58,6 +54,7 @@ HiveTypeParser::HiveTypeParser() {
   setupMetadata<TokenType::Binary, TypeKind::VARBINARY>(
       {"binary", "varbinary"});
   setupMetadata<TokenType::Timestamp, TypeKind::TIMESTAMP>("timestamp");
+  setupMetadata<TokenType::Opaque, TypeKind::OPAQUE>("opaque");
   setupMetadata<TokenType::List, TypeKind::ARRAY>("array");
   setupMetadata<TokenType::Map, TypeKind::MAP>("map");
   setupMetadata<TokenType::Struct, TypeKind::ROW>({"struct", "row"});
@@ -72,7 +69,7 @@ HiveTypeParser::HiveTypeParser() {
   setupMetadata<TokenType::EndOfStream, TypeKind::INVALID>();
 }
 
-std::shared_ptr<const Type> HiveTypeParser::parse(const std::string& ser) {
+TypePtr HiveTypeParser::parse(const std::string& ser) {
   remaining_ = folly::StringPiece(ser);
   Result result = parseType();
   VELOX_CHECK(
@@ -80,14 +77,23 @@ std::shared_ptr<const Type> HiveTypeParser::parse(const std::string& ser) {
       "Input remaining after parsing the Hive type \"{}\"\n"
       "Remaining: \"{}\"",
       ser,
-      remaining_);
+      remaining_.toString());
   return result.type;
 }
 
 Result HiveTypeParser::parseType() {
   Token nt = nextToken();
   VELOX_CHECK(!nt.isEOS(), "Unexpected end of stream parsing type!!!");
-  if (nt.isValidType() && nt.isPrimitiveType()) {
+
+  if (!nt.isValidType()) {
+    VELOX_FAIL(
+        "Unexpected token {} at {}. typeKind = {}",
+        nt.value.toString(),
+        remaining_.toString(),
+        nt.typeKind());
+  }
+
+  if (nt.isPrimitiveType()) {
     if (nt.metadata->tokenString[0] == "decimal") {
       eatToken(TokenType::LeftRoundBracket);
       Token precision = nextToken();
@@ -118,36 +124,44 @@ Result HiveTypeParser::parseType() {
       eatToken(TokenType::RightRoundBracket);
     }
     return Result{scalarType};
-  } else if (nt.isValidType()) {
+  } else if (nt.isOpaqueType()) {
+    eatToken(TokenType::StartSubType);
+    folly::StringPiece innerTypeName =
+        eatToken(TokenType::Identifier, true).value;
+    eatToken(TokenType::EndSubType);
+
+    auto typeIndex = getTypeIdForOpaqueTypeAlias(innerTypeName.str());
+    auto instance = std::make_shared<const OpaqueType>(typeIndex);
+    return Result{instance};
+  } else {
     ResultList resultList = parseTypeList(TypeKind::ROW == nt.typeKind());
     switch (nt.typeKind()) {
       case velox::TypeKind::ROW:
         return Result{velox::ROW(
             std::move(resultList.names), std::move(resultList.typelist))};
       case velox::TypeKind::MAP: {
-        VELOX_CHECK(
-            resultList.typelist.size() == 2,
+        VELOX_CHECK_EQ(
+            resultList.typelist.size(),
+            2,
             "wrong param count for map type def");
         return Result{
             velox::MAP(resultList.typelist.at(0), resultList.typelist.at(1))};
       }
       case velox::TypeKind::ARRAY: {
-        VELOX_CHECK(
-            resultList.typelist.size() == 1,
+        VELOX_CHECK_EQ(
+            resultList.typelist.size(),
+            1,
             "wrong param count for array type def");
         return Result{velox::ARRAY(resultList.typelist.at(0))};
       }
       default:
-        VELOX_FAIL("unsupported kind: " + std::to_string((int)nt.typeKind()));
+        VELOX_FAIL("unsupported kind: " + mapTypeKindToName(nt.typeKind()));
     }
-  } else {
-    VELOX_FAIL(fmt::format(
-        "Unexpected token {} at {}", nt.value, remaining_.toString()));
   }
 }
 
 ResultList HiveTypeParser::parseTypeList(bool hasFieldNames) {
-  std::vector<std::shared_ptr<const Type>> subTypeList{};
+  std::vector<TypePtr> subTypeList{};
   std::vector<std::string> names{};
   eatToken(TokenType::StartSubType);
   while (true) {
@@ -246,6 +260,10 @@ bool Token::isValidType() const {
 
 bool Token::isEOS() const {
   return metadata->tokenType == TokenType::EndOfStream;
+}
+
+bool Token::isOpaqueType() const {
+  return metadata->tokenType == TokenType::Opaque;
 }
 
 int8_t HiveTypeParser::makeTokenId(TokenType tokenType) const {

@@ -28,6 +28,34 @@
 namespace facebook::velox::memory {
 
 class MemoryPool;
+class ArbitrationOperation;
+
+#define VELOX_MEM_POOL_CAP_EXCEEDED(errorMessage)                   \
+  _VELOX_THROW(                                                     \
+      ::facebook::velox::VeloxRuntimeError,                         \
+      ::facebook::velox::error_source::kErrorSourceRuntime.c_str(), \
+      ::facebook::velox::error_code::kMemCapExceeded.c_str(),       \
+      /* isRetriable */ true,                                       \
+      "{}",                                                         \
+      errorMessage);
+
+#define VELOX_MEM_ARBITRATION_FAILED(errorMessage)                   \
+  _VELOX_THROW(                                                      \
+      ::facebook::velox::VeloxRuntimeError,                          \
+      ::facebook::velox::error_source::kErrorSourceRuntime.c_str(),  \
+      ::facebook::velox::error_code::kMemArbitrationFailure.c_str(), \
+      /* isRetriable */ true,                                        \
+      "{}",                                                          \
+      errorMessage);
+
+#define VELOX_MEM_POOL_ABORTED(errorMessage)                        \
+  _VELOX_THROW(                                                     \
+      ::facebook::velox::VeloxRuntimeError,                         \
+      ::facebook::velox::error_source::kErrorSourceRuntime.c_str(), \
+      ::facebook::velox::error_code::kMemAborted.c_str(),           \
+      /* isRetriable */ true,                                       \
+      "{}",                                                         \
+      errorMessage);
 
 using MemoryArbitrationStateCheckCB = std::function<void(MemoryPool&)>;
 
@@ -66,6 +94,19 @@ class MemoryArbitrator {
 
     /// Additional configs that are arbitrator implementation specific.
     std::unordered_map<std::string, std::string> extraConfigs{};
+
+    std::string toString() const {
+      std::stringstream ss;
+      for (const auto& extraConfig : extraConfigs) {
+        ss << extraConfig.first << "=" << extraConfig.second << ";";
+      }
+      return fmt::format(
+          "kind={};capacity={};arbitrationStateCheckCb={};{}",
+          kind,
+          succinctBytes(capacity),
+          (arbitrationStateCheckCb ? "(set)" : "(unset)"),
+          ss.str());
+    }
   };
 
   using Factory = std::function<std::unique_ptr<MemoryArbitrator>(
@@ -98,10 +139,18 @@ class MemoryArbitrator {
   virtual std::string kind() const = 0;
 
   uint64_t capacity() const {
-    return capacity_;
+    return config_.capacity;
+  }
+
+  const Config& config() const {
+    return config_;
   }
 
   virtual ~MemoryArbitrator() = default;
+
+  /// Invoked by the memory manager to shutdown the memory arbitrator to stop
+  /// serving new memory arbitration requests.
+  virtual void shutdown() = 0;
 
   /// Invoked by the memory manager to add a newly created memory pool. The
   /// memory arbitrator allocates the initial capacity for 'pool' and
@@ -119,7 +168,7 @@ class MemoryArbitrator {
   /// up a number of pools to either shrink its memory capacity without actually
   /// freeing memory or reclaim its used memory to free up enough memory for
   /// 'requestor' to grow.
-  virtual bool growCapacity(MemoryPool* pool, uint64_t requestBytes) = 0;
+  virtual void growCapacity(MemoryPool* pool, uint64_t requestBytes) = 0;
 
   /// Invoked by the memory manager to shrink up to 'targetBytes' free capacity
   /// from a memory 'pool', and returns them back to the arbitrator. If
@@ -153,61 +202,46 @@ class MemoryArbitrator {
   struct Stats {
     /// The number of arbitration requests.
     uint64_t numRequests{0};
+    /// The number of running arbitration requests.
+    uint64_t numRunning{0};
     /// The number of succeeded arbitration requests.
     uint64_t numSucceeded{0};
     /// The number of aborted arbitration requests.
     uint64_t numAborted{0};
     /// The number of arbitration request failures.
     uint64_t numFailures{0};
-    /// The sum of all the arbitration request queue times in microseconds.
-    uint64_t queueTimeUs{0};
-    /// The sum of all the arbitration run times in microseconds.
-    uint64_t arbitrationTimeUs{0};
-    /// The amount of memory bytes freed by reducing the memory pool's capacity
-    /// without actually freeing memory.
-    uint64_t numShrunkBytes{0};
-    /// The amount of memory bytes freed by memory reclamation.
-    uint64_t numReclaimedBytes{0};
+    /// The number of reclaimed unused free bytes.
+    uint64_t reclaimedFreeBytes{0};
+    /// The number of reclaimed used bytes.
+    uint64_t reclaimedUsedBytes{0};
     /// The max memory capacity in bytes.
     uint64_t maxCapacityBytes{0};
     /// The free memory capacity in bytes.
     uint64_t freeCapacityBytes{0};
     /// The free reserved memory capacity in bytes.
     uint64_t freeReservedCapacityBytes{0};
-    /// The sum of all reclaim operation durations during arbitration in
-    /// microseconds.
-    uint64_t reclaimTimeUs{0};
     /// The total number of times of the reclaim attempts that end up failing
     /// due to reclaiming at non-reclaimable stage.
     uint64_t numNonReclaimableAttempts{0};
-    /// The total number of memory capacity shrinks.
-    uint64_t numShrinks{0};
 
     Stats(
         uint64_t _numRequests,
+        uint64_t _numRunning,
         uint64_t _numSucceeded,
         uint64_t _numAborted,
         uint64_t _numFailures,
-        uint64_t _queueTimeUs,
-        uint64_t _arbitrationTimeUs,
-        uint64_t _numShrunkBytes,
-        uint64_t _numReclaimedBytes,
+        uint64_t _reclaimedFreeBytes,
+        uint64_t _reclaimedUsedBytes,
         uint64_t _maxCapacityBytes,
         uint64_t _freeCapacityBytes,
         uint64_t _freeReservedCapacityBytes,
-        uint64_t _reclaimTimeUs,
-        uint64_t _numNonReclaimableAttempts,
-        uint64_t _numShrinks);
+        uint64_t _numNonReclaimableAttempts);
 
     Stats() = default;
 
     Stats operator-(const Stats& other) const;
     bool operator==(const Stats& other) const;
-    bool operator!=(const Stats& other) const;
-    bool operator<(const Stats& other) const;
-    bool operator>(const Stats& other) const;
-    bool operator>=(const Stats& other) const;
-    bool operator<=(const Stats& other) const;
+    std::strong_ordering operator<=>(const Stats& other) const;
 
     bool empty() const {
       return numRequests == 0;
@@ -223,9 +257,7 @@ class MemoryArbitrator {
   virtual std::string toString() const = 0;
 
  protected:
-  explicit MemoryArbitrator(const Config& config)
-      : capacity_(config.capacity),
-        arbitrationStateCheckCb_(config.arbitrationStateCheckCb) {}
+  explicit MemoryArbitrator(const Config& config) : config_(config) {}
 
   /// Helper utilities used by the memory arbitrator implementations to call
   /// protected methods of memory pool.
@@ -234,8 +266,7 @@ class MemoryArbitrator {
 
   static uint64_t shrinkPool(MemoryPool* pool, uint64_t targetBytes);
 
-  const uint64_t capacity_;
-  const MemoryArbitrationStateCheckCB arbitrationStateCheckCb_;
+  const Config config_;
 };
 
 /// Formatter for fmt.
@@ -275,7 +306,7 @@ class MemoryReclaimer {
     /// due to reclaiming at non-reclaimable stage.
     uint64_t numNonReclaimableAttempts{0};
 
-    /// The total execution time to do the reclaim in microseconds.
+    /// The total time to do the reclaim in microseconds.
     uint64_t reclaimExecTimeUs{0};
 
     /// The total reclaimed memory bytes.
@@ -286,14 +317,13 @@ class MemoryReclaimer {
 
     void reset();
 
-    bool operator==(const Stats& other) const;
-    bool operator!=(const Stats& other) const;
+    bool operator==(const Stats& other) const = default;
     Stats& operator+=(const Stats& other);
   };
 
   virtual ~MemoryReclaimer() = default;
 
-  static std::unique_ptr<MemoryReclaimer> create();
+  static std::unique_ptr<MemoryReclaimer> create(int32_t priority = 0);
 
   /// Invoked memory reclaim function from 'pool' and record execution 'stats'.
   static uint64_t run(const std::function<int64_t()>& func, Stats& stats);
@@ -314,6 +344,26 @@ class MemoryReclaimer {
   /// NOTE: it is guaranteed to be called also on failure path if
   /// enterArbitration has been called.
   virtual void leaveArbitration() noexcept {}
+
+  /// Invoked by upper layer reclaimer, to return the priority of this
+  /// reclaimer. The priority determines the reclaiming order of self among all
+  /// same level reclaimers. The smaller the number, the higher the priority.
+  /// Consider the following memory pool & reclaimer structure:
+  ///
+  ///                 rec1(pri 1)
+  ///                /            \
+  ///               /              \
+  ///              /                \
+  ///      rec2(pri 1)           rec3(pri 3)
+  ///      /        \             /        \
+  ///     /          \           /          \
+  /// rec4(pri 1) rec5(pri 0)  rec6(pri 0) rec7(pri 1)
+  ///
+  /// The reclaiming traversing order will be rec1 -> rec2 -> rec5 -> rec4 ->
+  /// rec3 -> rec6 -> rec7
+  virtual int32_t priority() const {
+    return priority_;
+  }
 
   /// Invoked by the memory arbitrator to get the amount of memory bytes that
   /// can be reclaimed from 'pool'. The function returns true if 'pool' is
@@ -349,7 +399,10 @@ class MemoryReclaimer {
   virtual void abort(MemoryPool* pool, const std::exception_ptr& error);
 
  protected:
-  MemoryReclaimer() = default;
+  explicit MemoryReclaimer(int32_t priority) : priority_(priority) {}
+
+ private:
+  const int32_t priority_;
 };
 
 /// Helper class used to measure the memory bytes reclaimed from a memory pool
@@ -405,19 +458,42 @@ class NonReclaimableSectionGuard {
   const bool oldNonReclaimableSectionValue_;
 };
 
-/// The memory arbitration context which is set on per-thread local variable by
-/// memory arbitrator. It is used to indicate a running thread is under memory
-/// arbitration processing or not. This helps to enable sanity check such as all
-/// the memory reservations during memory arbitration should come from the
-/// spilling memory pool.
+/// The memory arbitration context which is set as per-thread local variable by
+/// memory arbitrator. It is used to indicate if a running thread is under
+/// memory arbitration. This helps to enable sanity check such as all the memory
+/// reservations during memory arbitration should come from the spilling memory
+/// pool.
 struct MemoryArbitrationContext {
-  const MemoryPool* requestor;
+  /// Defines the type of memory arbitration.
+  enum class Type {
+    /// Indicates the memory arbitration is triggered by a memory pool for its
+    /// own capacity growth.
+    kLocal,
+    /// Indicates the memory arbitration is triggered by the memory arbitrator
+    /// to free up memory for the system.
+    kGlobal,
+  };
+  static std::string typeName(Type type);
+
+  const Type type;
+  /// The name of the request memory pool for local arbitration. It is empty for
+  /// global memory arbitration type.
+  const std::string requestorName;
+
+  explicit MemoryArbitrationContext(const MemoryPool* requestor);
+
+  MemoryArbitrationContext() : type(Type::kGlobal) {}
 };
 
 /// Object used to set/restore the memory arbitration context when a thread is
 /// under memory arbitration processing.
 class ScopedMemoryArbitrationContext {
  public:
+  ScopedMemoryArbitrationContext();
+
+  explicit ScopedMemoryArbitrationContext(
+      const MemoryArbitrationContext* context);
+
   explicit ScopedMemoryArbitrationContext(const MemoryPool* requestor);
 
   ~ScopedMemoryArbitrationContext();
@@ -427,12 +503,12 @@ class ScopedMemoryArbitrationContext {
   MemoryArbitrationContext currentArbitrationCtx_;
 };
 
-/// Object used to setup arbitration context for a memory pool.
-class ScopedMemoryPoolArbitrationCtx {
+/// Object used to setup arbitration section for a memory pool.
+class MemoryPoolArbitrationSection {
  public:
-  explicit ScopedMemoryPoolArbitrationCtx(MemoryPool* pool);
+  explicit MemoryPoolArbitrationSection(MemoryPool* pool);
 
-  ~ScopedMemoryPoolArbitrationCtx();
+  ~MemoryPoolArbitrationSection();
 
  private:
   MemoryPool* const pool_;
@@ -458,8 +534,7 @@ std::shared_ptr<AsyncSource<Item>> createAsyncMemoryReclaimTask(
         std::unique_ptr<ScopedMemoryArbitrationContext> restoreArbitrationCtx;
         if (arbitrationCtx != nullptr) {
           restoreArbitrationCtx =
-              std::make_unique<ScopedMemoryArbitrationContext>(
-                  arbitrationCtx->requestor);
+              std::make_unique<ScopedMemoryArbitrationContext>(arbitrationCtx);
         }
         return asyncTask();
       });
@@ -492,7 +567,7 @@ struct fmt::formatter<facebook::velox::memory::MemoryArbitrator::Stats>
     : formatter<std::string> {
   auto format(
       facebook::velox::memory::MemoryArbitrator::Stats s,
-      format_context& ctx) {
+      format_context& ctx) const {
     return formatter<std::string>::format(s.toString(), ctx);
   }
 };

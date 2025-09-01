@@ -28,6 +28,7 @@ velox_add_library(
   CountIfAggregate.cpp
   CovarianceAggregates.cpp
   ChecksumAggregate.cpp
+  ClassificationAggregation.cpp
   EntropyAggregates.cpp
   GeometricMeanAggregate.cpp
   HistogramAggregate.cpp
@@ -35,16 +36,28 @@ velox_add_library(
   MapUnionAggregate.cpp
   MapUnionSumAggregate.cpp
   MaxSizeForStatsAggregate.cpp
+  MergeAggregate.cpp
+  NumericHistogramAggregate.cpp
   MinMaxAggregates.cpp
-  MinMaxByAggregates.cpp
+  MaxByAggregate.cpp
+  MinByAggregate.cpp
   MultiMapAggAggregate.cpp
   PrestoHasher.cpp
+  QDigestAggAggregate.cpp
   ReduceAgg.cpp
   RegisterAggregateFunctions.cpp
+  NoisyAvgGaussianAggregate.cpp
+  NoisyCountIfGaussianAggregate.cpp
+  NoisyCountGaussianAggregate.cpp
+  NoisyHelperFunctionFactory.cpp
+  NoisySumGaussianAggregate.cpp
+  NoisyApproxSfmAggregate.cpp
   SetAggregates.cpp
   SumAggregate.cpp
   SumDataSizeForStatsAggregate.cpp
-  VarianceAggregates.cpp)
+  TDigestAggregate.cpp
+  VarianceAggregates.cpp
+)
 
 velox_link_libraries(
   velox_aggregates
@@ -52,10 +65,14 @@ velox_link_libraries(
   velox_exec
   velox_expression
   velox_presto_serializer
+  velox_presto_types
   velox_functions_aggregates
   velox_functions_lib
   velox_functions_util
-  Folly::folly)
+  velox_presto_types
+  velox_functions_sfm
+  Folly::folly
+)
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)

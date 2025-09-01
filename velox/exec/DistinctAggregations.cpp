@@ -20,7 +20,9 @@ namespace facebook::velox::exec {
 
 namespace {
 
-template <typename T>
+template <
+    typename T,
+    typename AccumulatorType = aggregate::prestosql::SetAccumulator<T>>
 class TypedDistinctAggregations : public DistinctAggregations {
  public:
   TypedDistinctAggregations(
@@ -33,8 +35,6 @@ class TypedDistinctAggregations : public DistinctAggregations {
         inputType_(TypedDistinctAggregations::makeInputTypeForAccumulator(
             inputType,
             inputs_)) {}
-
-  using AccumulatorType = aggregate::prestosql::SetAccumulator<T>;
 
   /// Returns metadata about the accumulator used to store unique inputs.
   Accumulator accumulator() const override {
@@ -49,6 +49,9 @@ class TypedDistinctAggregations : public DistinctAggregations {
         },
         [this](folly::Range<char**> groups) {
           for (auto* group : groups) {
+            if (!isInitialized(group)) {
+              continue;
+            }
             auto* accumulator =
                 reinterpret_cast<AccumulatorType*>(group + offset_);
             accumulator->free(*allocator_);
@@ -126,11 +129,11 @@ class TypedDistinctAggregations : public DistinctAggregations {
 
       // Overwrite empty groups over the destructed groups to keep the container
       // in a well formed state.
-      raw_vector<int32_t> temp;
+      raw_vector<int32_t> indices(pool_);
       aggregate.function->initializeNewGroups(
           groups.data(),
           folly::Range<const int32_t*>(
-              iota(groups.size(), temp), groups.size()));
+              iota(groups.size(), indices), groups.size()));
     }
   }
 
@@ -205,6 +208,17 @@ class TypedDistinctAggregations : public DistinctAggregations {
   VectorPtr inputForAccumulator_;
 };
 
+template <TypeKind Kind>
+std::unique_ptr<DistinctAggregations>
+createDistinctAggregationsWithCustomCompare(
+    std::vector<AggregateInfo*> aggregates,
+    const RowTypePtr& inputType,
+    memory::MemoryPool* pool) {
+  return std::make_unique<TypedDistinctAggregations<
+      typename TypeTraits<Kind>::NativeType,
+      aggregate::prestosql::CustomComparisonSetAccumulator<Kind>>>(
+      aggregates, inputType, pool);
+}
 } // namespace
 
 // static
@@ -222,6 +236,15 @@ std::unique_ptr<DistinctAggregations> DistinctAggregations::create(
   }
 
   const auto type = inputType->childAt(aggregates[0]->inputs[0]);
+
+  if (type->providesCustomComparison()) {
+    return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+        createDistinctAggregationsWithCustomCompare,
+        type->kind(),
+        aggregates,
+        inputType,
+        pool);
+  }
 
   switch (type->kind()) {
     case TypeKind::BOOLEAN:
@@ -260,6 +283,9 @@ std::unique_ptr<DistinctAggregations> DistinctAggregations::create(
     case TypeKind::MAP:
     case TypeKind::ROW:
       return std::make_unique<TypedDistinctAggregations<ComplexType>>(
+          aggregates, inputType, pool);
+    case TypeKind::UNKNOWN:
+      return std::make_unique<TypedDistinctAggregations<UnknownValue>>(
           aggregates, inputType, pool);
     default:
       VELOX_UNREACHABLE("Unexpected type {}", type->toString());

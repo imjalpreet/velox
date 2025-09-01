@@ -25,9 +25,12 @@ std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ false>> makeLengthDecoder(
     memory::MemoryPool& pool) {
   EncodingKey encodingKey{fileType.id(), params.flatMapContext().sequence};
   auto& stripe = params.stripeStreams();
-  const auto rleVersion =
-      convertRleVersion(stripe.getEncoding(encodingKey).kind());
-  const auto lenId = encodingKey.forKind(proto::Stream_Kind_LENGTH);
+  const auto rleVersion = convertRleVersion(stripe, encodingKey);
+  const auto lenId = StripeStreamsUtil::getStreamForKind(
+      stripe,
+      encodingKey,
+      proto::Stream_Kind_LENGTH,
+      proto::orc::Stream_Kind_LENGTH);
   const bool lenVints = stripe.getUseVInts(lenId);
   return createRleDecoder</*isSigned=*/false>(
       stripe.getStream(lenId, params.streamLabels().label(), true),
@@ -46,6 +49,7 @@ FlatMapContext flatMapContextFromEncodingKey(const EncodingKey& encodingKey) {
 }
 
 SelectiveListColumnReader::SelectiveListColumnReader(
+    const dwio::common::ColumnReaderOptions& columnReaderOptions,
     const TypePtr& requestedType,
     const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
     DwrfParams& params,
@@ -65,7 +69,6 @@ SelectiveListColumnReader::SelectiveListColumnReader(
     scanSpec.getOrCreateChild(common::ScanSpec::kArrayElementsFieldName);
   }
   scanSpec_->children()[0]->setProjectOut(true);
-  scanSpec_->children()[0]->setExtractValues(true);
 
   auto childParams = DwrfParams(
       stripe,
@@ -73,11 +76,16 @@ SelectiveListColumnReader::SelectiveListColumnReader(
       params.runtimeStatistics(),
       flatMapContextFromEncodingKey(encodingKey));
   child_ = SelectiveDwrfReader::build(
-      childType, fileType_->childAt(0), childParams, *scanSpec_->children()[0]);
+      columnReaderOptions,
+      childType,
+      fileType_->childAt(0),
+      childParams,
+      *scanSpec_->children()[0]);
   children_ = {child_.get()};
 }
 
 SelectiveMapColumnReader::SelectiveMapColumnReader(
+    const dwio::common::ColumnReaderOptions& columnReaderOptions,
     const TypePtr& requestedType,
     const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
     DwrfParams& params,
@@ -97,9 +105,7 @@ SelectiveMapColumnReader::SelectiveMapColumnReader(
     scanSpec_->getOrCreateChild(common::ScanSpec::kMapValuesFieldName);
   }
   scanSpec_->children()[0]->setProjectOut(true);
-  scanSpec_->children()[0]->setExtractValues(true);
   scanSpec_->children()[1]->setProjectOut(true);
-  scanSpec_->children()[1]->setExtractValues(true);
 
   auto& keyType = requestedType_->childAt(0);
   auto keyParams = DwrfParams(
@@ -108,6 +114,7 @@ SelectiveMapColumnReader::SelectiveMapColumnReader(
       params.runtimeStatistics(),
       flatMapContextFromEncodingKey(encodingKey));
   keyReader_ = SelectiveDwrfReader::build(
+      columnReaderOptions,
       keyType,
       fileType_->childAt(0),
       keyParams,
@@ -120,6 +127,7 @@ SelectiveMapColumnReader::SelectiveMapColumnReader(
       params.runtimeStatistics(),
       flatMapContextFromEncodingKey(encodingKey));
   elementReader_ = SelectiveDwrfReader::build(
+      columnReaderOptions,
       valueType,
       fileType_->childAt(1),
       elementParams,

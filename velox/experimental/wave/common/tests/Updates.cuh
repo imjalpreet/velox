@@ -35,7 +35,7 @@ void __device__ testSumNoSync(TestingRow* rows, HashProbe* probe) {
   auto keys = reinterpret_cast<int64_t**>(probe->keys);
   auto indices = keys[0];
   auto deltas = keys[1];
-  int32_t base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
+  auto base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
   int32_t end = base + probe->numRows[blockIdx.x];
 
   for (auto i = base + threadIdx.x; i < end; i += blockDim.x) {
@@ -57,7 +57,7 @@ void __device__ testSumPart(
   auto deltas = keys[1];
   for (auto groupIdx = 0; groupIdx < numGroups; ++groupIdx) {
     auto groupStart = groupIdx * groupStride;
-    int32_t linear = threadIdx.x + blockIdx.x * blockDim.x;
+    auto linear = threadIdx.x + blockIdx.x * blockDim.x;
     if (linear > numParts) {
       break;
     }
@@ -78,7 +78,7 @@ void __device__ testSumMtx(TestingRow* rows, HashProbe* probe) {
   auto keys = reinterpret_cast<int64_t**>(probe->keys);
   auto indices = keys[0];
   auto deltas = keys[1];
-  int32_t base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
+  auto base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
   int32_t end = base + probe->numRows[blockIdx.x];
 
   for (auto i = base + threadIdx.x; i < end; i += blockDim.x) {
@@ -93,7 +93,7 @@ void __device__ testSumAtomic(TestingRow* rows, HashProbe* probe) {
   auto keys = reinterpret_cast<int64_t**>(probe->keys);
   auto indices = keys[0];
   auto deltas = keys[1];
-  int32_t base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
+  auto base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
   int32_t end = base + probe->numRows[blockIdx.x];
 
   for (auto i = base + threadIdx.x; i < end; i += blockDim.x) {
@@ -107,7 +107,7 @@ void __device__ testSumAtomicCoalesceShmem(TestingRow* rows, HashProbe* probe) {
   auto keys = reinterpret_cast<int64_t**>(probe->keys);
   auto indices = keys[0];
   auto deltas = keys[1];
-  int32_t base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
+  auto base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
   int32_t lane = cub::LaneId();
   int32_t end = base + probe->numRows[blockIdx.x];
   extern __shared__ char smem[];
@@ -147,7 +147,7 @@ void __device__ testSumAtomicCoalesceShfl(TestingRow* rows, HashProbe* probe) {
   auto keys = reinterpret_cast<int64_t**>(probe->keys);
   auto indices = keys[0];
   auto deltas = keys[1];
-  int32_t base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
+  auto base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
   int32_t lane = cub::LaneId();
   int32_t end = base + probe->numRows[blockIdx.x];
 
@@ -181,85 +181,12 @@ void __device__ testSumAtomicCoalesceShfl(TestingRow* rows, HashProbe* probe) {
   }
 }
 
-void __device__ testSumExch(TestingRow* rows, HashProbe* probe) {
-  int32_t base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
-  int32_t end = base + probe->numRows[blockIdx.x];
-  auto keys = reinterpret_cast<int64_t**>(probe->keys);
-  auto indices = keys[0];
-  auto deltas = keys[1];
-
-  extern __shared__ __align__(16) char smem[];
-  ProbeShared* shared = reinterpret_cast<ProbeShared*>(smem);
-  if (threadIdx.x == 0) {
-    shared->init(probe, base);
-    shared->blockEnd = end;
-    shared->toDo = probe->numRows[blockIdx.x];
-    shared->numRounds = 0;
-    shared->numUpdated = 0;
-    shared->numTried = 0;
-  }
-  __syncthreads();
-  for (;;) {
-    if (shared->blockEnd <= shared->blockBase) {
-      GPF();
-    }
-    int32_t counter;
-    for (counter = base; counter < shared->blockEnd; counter += blockDim.x) {
-      auto i = counter + threadIdx.x;
-      if (i < shared->blockEnd) {
-        atomicAdd(&shared->numTried, 1);
-        if (shared->inputRetries) {
-          i = shared->inputRetries[i];
-        }
-        auto* row = &rows[indices[i]];
-        if (0 ==
-            asDeviceAtomic<int32_t>(&row->flags)
-                ->exchange(1, cuda::memory_order_consume)) {
-          atomicAdd(
-              (unsigned long long*)&row->count, (unsigned long long)deltas[i]);
-          atomicAdd(&shared->numUpdated, 1);
-          asDeviceAtomic<int32_t>(&row->flags)
-              ->store(0, cuda::memory_order_release);
-        } else {
-          shared
-              ->outputRetries[base + atomicAdd(&shared->numKernelRetries, 1)] =
-              i;
-        }
-      } else {
-        atomicAdd(&shared->numTried, 1 << 16);
-      }
-      // __syncthreads();
-    }
-    __syncthreads();
-    if (shared->numKernelRetries == 0) {
-      if ((shared->numTried & 0xffff) != shared->blockEnd - shared->blockBase) {
-        GPF();
-      }
-      if (shared->done + (shared->blockEnd - shared->blockBase) !=
-          shared->toDo) {
-        GPF();
-      }
-      // printf("%d %d //%d\n", base, end, counter);
-      return;
-    }
-
-    if (threadIdx.x == 0) {
-      shared->done +=
-          (shared->blockEnd - shared->blockBase) - shared->numKernelRetries;
-      ++shared->numRounds;
-      shared->numTried = 0;
-      shared->blockEnd = base + shared->numKernelRetries;
-      shared->nextRound(probe);
-    }
-    __syncthreads();
-  }
-}
 void __device__ testSumMtxCoalesce(TestingRow* rows, HashProbe* probe) {
   constexpr int32_t kWarpThreads = 32;
   auto keys = reinterpret_cast<int64_t**>(probe->keys);
   auto indices = keys[0];
   auto deltas = keys[1];
-  int32_t base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
+  auto base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
   int32_t lane = cub::LaneId();
   int32_t end = base + probe->numRows[blockIdx.x];
 
@@ -299,7 +226,7 @@ void __device__ testSumOrder(TestingRow* rows, HashProbe* probe) {
   auto keys = reinterpret_cast<int64_t**>(probe->keys);
   auto indices = keys[0];
   auto deltas = keys[1];
-  int32_t base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
+  auto base = probe->numRowsPerThread * blockDim.x * blockIdx.x;
   int32_t end = base + probe->numRows[blockIdx.x];
 
   for (auto i = base + threadIdx.x; i < end; i += blockDim.x) {
@@ -315,7 +242,7 @@ void __device__ testSumOrder(TestingRow* rows, HashProbe* probe) {
             ->store(0, cuda::memory_order_release);
         break;
       } else {
-        __nanosleep(waitNano);
+        __nanosleep(10 * waitNano);
         waitNano += threadIdx.x & 31;
       }
     }

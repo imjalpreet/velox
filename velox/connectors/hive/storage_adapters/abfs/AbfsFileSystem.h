@@ -17,9 +17,9 @@
 
 #include "velox/common/file/FileSystems.h"
 
-namespace facebook::velox::filesystems::abfs {
+namespace facebook::velox::filesystems {
 
-/// Implementation of the ABS (Azure Blob Storage) filesystem and file
+/// Implementation of the ABFS (Azure Blob File Storage) filesystem and file
 /// interface. We provide a registration method for reading and writing files so
 /// that the appropriate type of file can be constructed based on a filename.
 /// The supported schema is `abfs(s)://` to align with the valid scheme
@@ -34,8 +34,7 @@ namespace facebook::velox::filesystems::abfs {
 /// https://learn.microsoft.com/en-us/azure/databricks/storage/azure-storage.
 class AbfsFileSystem : public FileSystem {
  public:
-  explicit AbfsFileSystem(
-      const std::shared_ptr<const config::ConfigBase>& config);
+  explicit AbfsFileSystem(std::shared_ptr<const config::ConfigBase> config);
 
   std::string name() const override;
 
@@ -66,18 +65,16 @@ class AbfsFileSystem : public FileSystem {
     VELOX_UNSUPPORTED("list for abfs not implemented");
   }
 
-  void mkdir(std::string_view path) override {
+  void mkdir(
+      std::string_view path,
+      const filesystems::DirectoryOptions& options = {}) override {
     VELOX_UNSUPPORTED("mkdir for abfs not implemented");
   }
 
   void rmdir(std::string_view path) override {
     VELOX_UNSUPPORTED("rmdir for abfs not implemented");
   }
-
- protected:
-  class Impl;
-  std::shared_ptr<Impl> impl_;
 };
 
 void registerAbfsFileSystem();
-} // namespace facebook::velox::filesystems::abfs
+} // namespace facebook::velox::filesystems

@@ -15,12 +15,11 @@
  */
 #pragma once
 
-#include <random>
 #include <unordered_map>
 
 #include "velox/expression/FunctionSignature.h"
-#include "velox/expression/SignatureBinder.h"
 #include "velox/type/Type.h"
+#include "velox/vector/fuzzer/VectorFuzzer.h"
 
 namespace facebook::velox::fuzzer {
 
@@ -33,14 +32,19 @@ class ArgumentTypeFuzzer {
  public:
   ArgumentTypeFuzzer(
       const exec::FunctionSignature& signature,
-      std::mt19937& rng)
-      : ArgumentTypeFuzzer(signature, nullptr, rng) {}
+      FuzzerGenerator& rng,
+      const std::vector<TypePtr>& scalarTypes = velox::defaultScalarTypes())
+      : ArgumentTypeFuzzer(signature, nullptr, rng, scalarTypes) {}
 
   ArgumentTypeFuzzer(
       const exec::FunctionSignature& signature,
       const TypePtr& returnType,
-      std::mt19937& rng)
-      : signature_{signature}, returnType_{returnType}, rng_{rng} {}
+      FuzzerGenerator& rng,
+      const std::vector<TypePtr>& scalarTypes = velox::defaultScalarTypes())
+      : signature_{signature},
+        returnType_{returnType},
+        rng_{rng},
+        scalarTypes_(scalarTypes) {}
 
   /// Generate random argument types. If the desired returnType has been
   /// specified, checks that it can be bound to the return type of signature_.
@@ -77,6 +81,10 @@ class ArgumentTypeFuzzer {
   // Noop if 'type' is not a decimal type signature.
   void determineUnboundedIntegerVariables(const exec::TypeSignature& type);
 
+  // Bind LongEnumParameter variables used in enum type signatures to
+  // randomly generated values if not already bound.
+  void determineUnboundedEnumVariables(const exec::TypeSignature& type);
+
   TypePtr randType();
 
   /// Generates an orderable random type, including structs, and arrays.
@@ -109,8 +117,14 @@ class ArgumentTypeFuzzer {
 
   std::unordered_map<std::string, int> integerBindings_;
 
+  /// Bindings between LongEnumParameter variables and their actual types.
+  std::unordered_map<std::string, LongEnumParameter> longEnumParameterBindings_;
+
   /// RNG to generate random types for unbounded type variables when necessary.
-  std::mt19937& rng_;
+  FuzzerGenerator& rng_;
+
+  /// The set of scalar types that can be used in random argument types.
+  const std::vector<TypePtr> scalarTypes_;
 };
 
 /// Return the kind name of type in lower case. This is expected to match the

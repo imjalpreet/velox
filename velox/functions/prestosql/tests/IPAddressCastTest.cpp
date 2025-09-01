@@ -24,33 +24,58 @@ namespace {
 class IPAddressCastTest : public functions::test::FunctionBaseTest {
  protected:
   std::optional<std::string> castToVarchar(
-      const std::optional<std::string> input) {
+      const std::optional<std::string>& input) {
     auto result = evaluateOnce<std::string>(
         "cast(cast(c0 as ipaddress) as varchar)", input);
     return result;
   }
 
   std::optional<int128_t> castFromVarbinary(
-      const std::optional<std::string> input) {
+      const std::optional<std::string>& input) {
     auto result =
         evaluateOnce<int128_t>("cast(from_hex(c0) as ipaddress)", input);
     return result;
   }
 
-  std::optional<std::string> allCasts(const std::optional<std::string> input) {
+  std::optional<std::string> allCasts(const std::optional<std::string>& input) {
     auto result = evaluateOnce<std::string>(
         "cast(cast(cast(cast(c0 as ipaddress) as varbinary) as ipaddress) as varchar)",
         input);
     return result;
   }
+
+  auto castToIPPrefixAndBackToIpVarchar(
+      const std::optional<std::string>& input) {
+    return evaluateOnce<std::string>(
+        "cast(cast(cast(cast(cast(cast(c0 as ipaddress) as ipprefix) as varchar) as ipprefix) as ipaddress)  as varchar)",
+        input);
+  }
 };
 
-int128_t stringToInt128(std::string value) {
+int128_t stringToInt128(const std::string& value) {
   int128_t res = 0;
   for (char c : value) {
     res = res * 10 + c - '0';
   }
   return res;
+}
+
+TEST_F(IPAddressCastTest, castToIPPrefix) {
+  EXPECT_EQ(castToIPPrefixAndBackToIpVarchar("1.2.3.4"), "1.2.3.4");
+  EXPECT_EQ(castToIPPrefixAndBackToIpVarchar("::ffff:1.2.3.4"), "1.2.3.4");
+  EXPECT_EQ(castToIPPrefixAndBackToIpVarchar("::ffff:102:304"), "1.2.3.4");
+  EXPECT_EQ(castToIPPrefixAndBackToIpVarchar("192.168.0.0"), "192.168.0.0");
+  EXPECT_EQ(
+      castToIPPrefixAndBackToIpVarchar(
+          "2001:0db8:0000:0000:0000:ff00:0042:8329"),
+      "2001:db8::ff00:42:8329");
+  EXPECT_EQ(
+      castToIPPrefixAndBackToIpVarchar("2001:db8:0:0:1:0:0:1"),
+      "2001:db8::1:0:0:1");
+  EXPECT_EQ(castToIPPrefixAndBackToIpVarchar("::1"), "::1");
+  EXPECT_EQ(
+      castToIPPrefixAndBackToIpVarchar("2001:db8::ff00:42:8329"),
+      "2001:db8::ff00:42:8329");
 }
 
 TEST_F(IPAddressCastTest, castToVarchar) {

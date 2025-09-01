@@ -174,8 +174,16 @@ VectorPtr applyMapTyped(
         baseMap->mapValues()->type(), rows.end(), context.pool());
   }
 
+  // Subscript can pass along very large elements vectors that can hold onto
+  // memory and copy operations on them can further put memory pressure. We
+  // try to flatten them if the dictionary layer is much smaller than the
+  // elements vector.
   return BaseVector::wrapInDictionary(
-      nullsBuilder.build(), indices, rows.end(), baseMap->mapValues());
+      nullsBuilder.build(),
+      indices,
+      rows.end(),
+      baseMap->mapValues(),
+      true /*flattenIfRedundant*/);
 }
 
 VectorPtr applyMapComplexType(
@@ -247,7 +255,9 @@ VectorPtr applyMapComplexType(
       auto numKeys = rawSizes[0];
       hashMapPtr->reserve(numKeys * 1.3);
       for (auto i = 0; i < numKeys; ++i) {
-        hashMapPtr->insert(detail::MapKey{mapKeysBase, mapKeysIndices[i], i});
+        const vector_size_t offset = rawOffsets[0] + i;
+        hashMapPtr->insert(
+            detail::MapKey{mapKeysBase, mapKeysIndices[offset], offset});
       }
     }
 
@@ -294,8 +304,16 @@ VectorPtr applyMapComplexType(
         baseMap->mapValues()->type(), rows.end(), context.pool());
   }
 
+  // Subscript can pass along very large elements vectors that can hold onto
+  // memory and copy operations on them can further put memory pressure. We
+  // try to flatten them if the dictionary layer is much smaller than the
+  // elements vector.
   return BaseVector::wrapInDictionary(
-      nullsBuilder.build(), indices, rows.end(), baseMap->mapValues());
+      nullsBuilder.build(),
+      indices,
+      rows.end(),
+      baseMap->mapValues(),
+      true /*flattenIfRedundant*/);
 }
 
 } // namespace
@@ -313,7 +331,8 @@ VectorPtr MapSubscript::applyMap(
   VELOX_CHECK(mapArg->type()->childAt(0)->equivalent(*indexArg->type()));
 
   bool triggerCaching = shouldTriggerCaching(mapArg);
-  if (indexArg->type()->isPrimitiveType()) {
+  if (indexArg->type()->isPrimitiveType() &&
+      !indexArg->type()->providesCustomComparison()) {
     return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
         applyMapTyped,
         indexArg->typeKind(),
@@ -324,6 +343,11 @@ VectorPtr MapSubscript::applyMap(
         indexArg,
         context);
   } else {
+    // We use applyMapComplexType when the key type is complex, but also when it
+    // provides custom comparison operators because the main difference between
+    // applyMapComplexType and applyTyped is that applyMapComplexType calls the
+    // Vector's equalValueAt method, which calls the Types custom comparison
+    // operator internally.
     return applyMapComplexType(
         rows, mapArg, indexArg, context, triggerCaching, lookupTable_);
   }

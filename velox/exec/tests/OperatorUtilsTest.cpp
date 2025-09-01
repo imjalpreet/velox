@@ -189,6 +189,96 @@ class OperatorUtilsTest : public OperatorTestBase {
   std::unique_ptr<DriverCtx> driverCtx_;
 };
 
+TEST_F(OperatorUtilsTest, processFilterResults) {
+  exec::FilterEvalCtx filterEvalCtx;
+  VectorPtr filteredResults;
+
+  // Run case is when filteredResults is a const vector with all rows
+  // selected. We should not have selected indices buffer.
+  {
+    filteredResults = makeConstant(true, 10);
+    SelectivityVector filterRows(10);
+    filterRows.setAll();
+    filterRows.updateBounds();
+    EXPECT_EQ(
+        exec::processFilterResults(
+            filteredResults, filterRows, filterEvalCtx, pool_.get()),
+        10);
+    EXPECT_EQ(nullptr, filterEvalCtx.selectedIndices);
+  }
+
+  // Run case where the size of filteredResults is equal to the number of valid
+  // rows in filterRows. In this case, the selectedIndices should not be null.
+  {
+    // Explicitly set selectedIndices to be nullptr
+    filterEvalCtx.selectedIndices = nullptr;
+    filteredResults = makeConstant(true, 5);
+    SelectivityVector filterRows(10, false);
+    for (auto i = 0; i < 5; ++i) {
+      filterRows.setValid(i, true);
+    }
+    filterRows.updateBounds();
+    EXPECT_EQ(
+        exec::processFilterResults(
+            filteredResults, filterRows, filterEvalCtx, pool_.get()),
+        5);
+    const auto* rawIndices = filterEvalCtx.selectedIndices->as<vector_size_t>();
+    EXPECT_EQ(rawIndices[0], 0);
+    EXPECT_EQ(rawIndices[1], 1);
+    EXPECT_EQ(rawIndices[2], 2);
+    EXPECT_EQ(rawIndices[3], 3);
+    EXPECT_EQ(rawIndices[4], 4);
+  }
+
+  // Run case with 50 rows with the last 10 of them valid to get large
+  // indices in the selected indices buffer.
+  {
+    SelectivityVector filterRows(50);
+    filteredResults = makeFlatVector<bool>(50, [&](vector_size_t row) {
+      filterRows.setValid(row, row >= 40);
+      return true;
+    });
+    filterRows.updateBounds();
+    EXPECT_EQ(
+        exec::processFilterResults(
+            filteredResults, filterRows, filterEvalCtx, pool_.get()),
+        10);
+    const auto* rawIndices = filterEvalCtx.selectedIndices->as<vector_size_t>();
+    EXPECT_EQ(rawIndices[0], 40);
+    EXPECT_EQ(rawIndices[9], 49);
+  }
+
+  // Run case is when filteredResults is a const vector with all rows
+  // but one selected. We check that we get back correct indices.
+  {
+    filteredResults = makeConstant(true, 10);
+    SelectivityVector filterRows(10);
+    filterRows.setAll();
+    filterRows.setValid(4, false);
+    filterRows.updateBounds();
+    EXPECT_EQ(
+        exec::processFilterResults(
+            filteredResults, filterRows, filterEvalCtx, pool_.get()),
+        9);
+    const auto* rawIndices = filterEvalCtx.selectedIndices->as<vector_size_t>();
+    EXPECT_EQ(rawIndices[0], 0);
+    EXPECT_EQ(rawIndices[3], 3);
+    EXPECT_EQ(rawIndices[4], 5);
+    EXPECT_EQ(rawIndices[8], 9);
+  }
+
+  {
+    filteredResults = makeArrayVector<int64_t>({{1}});
+    SelectivityVector filterRows(1);
+    filterRows.setValid(0, false);
+    filterRows.updateBounds();
+    EXPECT_EQ(
+        exec::processFilterResults(
+            filteredResults, filterRows, filterEvalCtx, pool_.get()),
+        0);
+  }
+}
+
 TEST_F(OperatorUtilsTest, wrapChildConstant) {
   auto constant = makeConstant(11, 1'000);
 
@@ -358,6 +448,36 @@ TEST_F(OperatorUtilsTest, addOperatorRuntimeStats) {
   ASSERT_EQ(stats[statsName].min, 100);
 }
 
+TEST_F(OperatorUtilsTest, setOperatorRuntimeStats) {
+  std::unordered_map<std::string, RuntimeMetric> stats;
+  const std::string statsName("stats");
+  const RuntimeCounter minStatsValue(100, RuntimeCounter::Unit::kBytes);
+  const RuntimeCounter maxStatsValue(200, RuntimeCounter::Unit::kBytes);
+  setOperatorRuntimeStats(statsName, minStatsValue, stats);
+  ASSERT_EQ(stats[statsName].count, 1);
+  ASSERT_EQ(stats[statsName].sum, 100);
+  ASSERT_EQ(stats[statsName].max, 100);
+  ASSERT_EQ(stats[statsName].min, 100);
+
+  setOperatorRuntimeStats(statsName, maxStatsValue, stats);
+  ASSERT_EQ(stats[statsName].count, 1);
+  ASSERT_EQ(stats[statsName].sum, 200);
+  ASSERT_EQ(stats[statsName].max, 200);
+  ASSERT_EQ(stats[statsName].min, 200);
+
+  addOperatorRuntimeStats(statsName, maxStatsValue, stats);
+  ASSERT_EQ(stats[statsName].count, 2);
+  ASSERT_EQ(stats[statsName].sum, 400);
+  ASSERT_EQ(stats[statsName].max, 200);
+  ASSERT_EQ(stats[statsName].min, 200);
+
+  setOperatorRuntimeStats(statsName, minStatsValue, stats);
+  ASSERT_EQ(stats[statsName].count, 1);
+  ASSERT_EQ(stats[statsName].sum, 100);
+  ASSERT_EQ(stats[statsName].max, 100);
+  ASSERT_EQ(stats[statsName].min, 100);
+}
+
 TEST_F(OperatorUtilsTest, initializeRowNumberMapping) {
   BufferPtr mapping;
   auto rawMapping = initializeRowNumberMapping(mapping, 10, pool());
@@ -437,6 +557,52 @@ TEST_F(OperatorUtilsTest, projectChildren) {
       ASSERT_EQ(
           projectedChildren[projection.outputChannel].get(),
           srcRowVector->childAt(projection.inputChannel).get());
+    }
+  }
+}
+
+TEST_F(OperatorUtilsTest, projectDuplicateChildren) {
+  // Test wrapping an unloaded lazy vector in dictionary vector multiple
+  // times.
+  auto flatVector = makeNullableFlatVector<int64_t>(
+      std::vector<std::optional<int64_t>>{1, std::nullopt, 3, 4, 5});
+  const auto size = flatVector->size();
+
+  auto lazyVector = std::make_shared<LazyVector>(
+      pool(),
+      BIGINT(),
+      size,
+      std::make_unique<SimpleVectorLoader>([&](RowSet /*rows*/) {
+        return makeFlatVector<int64_t>(
+            size,
+            [&](vector_size_t row) { return flatVector->valueAt(row); },
+            [&](vector_size_t row) { return flatVector->isNullAt(row); });
+      }));
+
+  std::vector<VectorPtr> children = {lazyVector};
+  auto rowVector = makeRowVector(std::move(children));
+
+  std::vector<IdentityProjection> identityProjections;
+  identityProjections.emplace_back(0, 0);
+  identityProjections.emplace_back(0, 1);
+
+  auto mapping = makeIndices(size, [](auto row) { return row % 3; });
+
+  std::vector<VectorPtr> projectedChildren(2);
+  projectChildren(
+      projectedChildren, rowVector, identityProjections, size, mapping);
+
+  for (const auto& projection : identityProjections) {
+    auto* result = projectedChildren[projection.outputChannel].get();
+    result->loadedVector();
+    auto* source = rowVector->childAt(projection.inputChannel).get();
+    for (auto i = 0; i < size; ++i) {
+      auto srcIndex = mapping->as<vector_size_t>()[i];
+      if (result->isNullAt(i)) {
+        ASSERT_TRUE(source->isNullAt(srcIndex));
+      } else {
+        ASSERT_TRUE(result->equalValueAt(source, i, srcIndex));
+      }
     }
   }
 }
@@ -530,4 +696,136 @@ TEST_F(OperatorUtilsTest, outputBatchRows) {
     MockOperator mockOp(driverCtx_.get(), rowType, "MockType2");
     ASSERT_EQ(1000, mockOp.outputRows(3'000'000'000));
   }
+}
+
+TEST_F(OperatorUtilsTest, wrapMany) {
+#if !XSIMD_WITH_AVX2
+  GTEST_SKIP();
+#endif
+
+  // Creates a RowVector with nullable and non-null vectors sharing
+  // different dictionary wraps. Rewraps these with a new wrap with
+  // and without nulls. Checks that the outcome has a single level of
+  // wrapping that combines the dictionaries and nulls and keeps the
+  // new wraps deduplicated where possible.
+  constexpr int32_t kSize = 1001;
+  auto indices1 = makeIndices(kSize, [](vector_size_t i) { return i; });
+  auto indices2 = makeIndicesInReverse(kSize);
+  auto indices3 = makeIndicesInReverse(kSize);
+  auto wrapNulls = AlignedBuffer::allocate<uint64_t>(
+      bits::nwords(kSize), pool_.get(), bits::kNotNull64);
+  for (auto i = 0; i < kSize; i += 5) {
+    bits::setNull(wrapNulls->asMutable<uint64_t>(), i);
+  }
+  // Test dataset: *_a has no nulls, *_b has nulls. plain* is not wrapped.
+  // wrapped1* is wrapped in one dict, wrapped2* is wrapped in another,
+  // wrapped3* is wrapped in a dictionary that adds nulls.
+  auto row = makeRowVector(
+      {"plain_a",
+       "plain_b",
+       "wrapped1_a",
+       "wrapped1_b",
+       "wrapped2_a",
+       "wrapped2_b",
+       "wrapped3_a",
+       "wrapped3_b"},
+
+      {// plain_a
+       makeFlatVector<int32_t>(kSize, [](auto i) { return i; }),
+       // plain_b
+       makeFlatVector<int32_t>(
+           kSize, [](auto i) { return i; }, [](auto i) { return i % 4 == 0; }),
+
+       // wrapped1-a
+       BaseVector::wrapInDictionary(
+           nullptr,
+           indices1,
+           kSize,
+           makeFlatVector<int32_t>(kSize, [](auto i) { return i; })),
+       // wrapped1_b
+       BaseVector::wrapInDictionary(
+           nullptr,
+           indices1,
+           kSize,
+           makeFlatVector<int32_t>(
+               kSize,
+               [](auto i) { return i; },
+               [](auto i) { return i % 4 == 0; })),
+
+       // wrapped2-a
+       BaseVector::wrapInDictionary(
+           nullptr,
+           indices2,
+           kSize,
+           makeFlatVector<int32_t>(kSize, [](auto i) { return i; })),
+       // wrapped2_b
+       BaseVector::wrapInDictionary(
+           nullptr,
+           indices2,
+           kSize,
+           makeFlatVector<int32_t>(
+               kSize,
+               [](auto i) { return i; },
+               [](auto i) { return i % 4 == 0; })),
+       // wrapped3-a
+       BaseVector::wrapInDictionary(
+           wrapNulls,
+           indices3,
+           kSize,
+           makeFlatVector<int32_t>(kSize, [](auto i) { return i; })),
+       // wrapped3_b
+       BaseVector::wrapInDictionary(
+           wrapNulls,
+           indices3,
+           kSize,
+           makeFlatVector<int32_t>(
+               kSize,
+               [](auto i) { return i; },
+               [](auto i) { return i % 4 == 0; }))
+
+      });
+  auto rowType = row->type();
+  std::vector<IdentityProjection> identicalProjections{};
+  for (auto i = 0; i < rowType->size(); ++i) {
+    identicalProjections.emplace_back(i, i);
+  }
+
+  // Now wrap 'row' in 'newIndices' keeping wraps to one level and deduplicating
+  // dictionary transposes.
+  auto newIndices = makeIndicesInReverse(kSize);
+  WrapState state;
+  std::vector<VectorPtr> projected(rowType->size());
+  projectChildren(
+      projected, row, identicalProjections, kSize, newIndices, &state);
+  auto result = makeRowVector(projected);
+  for (auto i = 0; i < kSize; ++i) {
+    EXPECT_TRUE(
+        row->equalValueAt(result.get(), i, newIndices->as<int32_t>()[i]));
+  }
+
+  // The two unwrapped columns get 'newIndices' directly.
+  EXPECT_EQ(projected[0]->wrapInfo(), newIndices);
+  EXPECT_EQ(projected[1]->wrapInfo(), newIndices);
+
+  // The next two have the same wrapper and this is now combined with newIndices
+  // and used twice.
+  EXPECT_NE(projected[2]->wrapInfo(), newIndices);
+  EXPECT_NE(projected[2]->wrapInfo(), indices2);
+  EXPECT_EQ(projected[2]->wrapInfo(), projected[3]->wrapInfo());
+
+  // The next two share a different wrapper.
+  EXPECT_NE(projected[3]->wrapInfo(), projected[4]->wrapInfo());
+  EXPECT_EQ(projected[4]->wrapInfo(), projected[5]->wrapInfo());
+
+  // The next two columns have nulls from their wrapper and thus they each get
+  // their own wrappers.
+  EXPECT_NE(projected[6]->wrapInfo(), projected[7]->wrapInfo());
+
+  // All columns have one level of wrapping.
+  EXPECT_EQ(
+      projected[2]->valueVector()->encoding(), VectorEncoding::Simple::FLAT);
+  EXPECT_EQ(
+      projected[4]->valueVector()->encoding(), VectorEncoding::Simple::FLAT);
+  EXPECT_EQ(
+      projected[6]->valueVector()->encoding(), VectorEncoding::Simple::FLAT);
 }

@@ -15,23 +15,27 @@
  */
 
 #include "velox/exec/fuzzer/MemoryArbitrationFuzzer.h"
-
 #include <boost/random/uniform_int_distribution.hpp>
 
+#include <folly/concurrency/ConcurrentHashMap.h>
 #include "velox/common/file/FileSystems.h"
-#include "velox/common/memory/SharedArbitrator.h"
+#include "velox/common/file/tests/FaultyFileSystem.h"
+#include "velox/common/fuzzer/Utils.h"
 #include "velox/connectors/hive/HiveConnector.h"
-#include "velox/connectors/hive/HiveConnectorSplit.h"
+#include "velox/dwio/dwrf/RegisterDwrfReader.h" // @manual
+#include "velox/dwio/dwrf/RegisterDwrfWriter.h" // @manual
 #include "velox/exec/MemoryReclaimer.h"
-#include "velox/exec/TableWriter.h"
 #include "velox/exec/fuzzer/FuzzerUtil.h"
 #include "velox/exec/tests/utils/ArbitratorTestUtil.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
-#include "velox/functions/lib/aggregates/AverageAggregateBase.h"
-#include "velox/functions/sparksql/aggregates/Register.h"
+#include "velox/serializers/CompactRowSerializer.h"
+#include "velox/serializers/PrestoSerializer.h"
+#include "velox/serializers/UnsafeRowSerializer.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
+
+DECLARE_int64(arbitrator_capacity);
 
 DEFINE_int32(steps, 10, "Number of test iterations.");
 
@@ -66,8 +70,41 @@ DEFINE_int32(
 
 DEFINE_int64(arbitrator_capacity, 256L << 20, "Arbitrator capacity in bytes.");
 
-namespace facebook::velox::exec::test {
+DEFINE_int32(
+    global_arbitration_pct,
+    5,
+    "Each second, the percentage chance of triggering global arbitration by "
+    "calling shrinking pools globally.");
+
+DEFINE_double(
+    spillable_query_ratio,
+    0.7,
+    "The ratio of queries that are spillable.");
+
+DEFINE_double(
+    spill_faulty_fs_ratio,
+    0.2,
+    "Chance of spill filesystem being faulty(expressed as double from 0 to 1)");
+
+DEFINE_double(
+    spill_fs_fault_injection_ratio,
+    0.02,
+    "The chance of actually injecting fault in file operations for spill "
+    "filesystem. This is only applicable when 'spill_faulty_fs_ratio' is "
+    "larger than 0");
+
+DEFINE_int32(
+    task_abort_interval_ms,
+    1000,
+    "After each specified number of milliseconds, abort a random task."
+    "If given 0, no task will be aborted.");
+
+using namespace facebook::velox::tests::utils;
+
+namespace facebook::velox::exec {
 namespace {
+
+using fuzzer::coinToss;
 
 class MemoryArbitrationFuzzer {
  public:
@@ -85,15 +122,13 @@ class MemoryArbitrationFuzzer {
 
   struct Stats {
     size_t successCount{0};
-    size_t failureCount{0};
     size_t oomCount{0};
     size_t abortCount{0};
 
     void print() const {
       std::stringstream ss;
-      ss << "Success count = " << successCount
-         << ", failure count = " << failureCount
-         << ". OOM count  = " << oomCount << " Abort count = " << abortCount;
+      ss << "success count = " << successCount << ", oom count  = " << oomCount
+         << ", abort count = " << abortCount;
       LOG(INFO) << ss.str();
     }
   };
@@ -114,6 +149,8 @@ class MemoryArbitrationFuzzer {
   int32_t randInt(int32_t min, int32_t max) {
     return boost::random::uniform_int_distribution<int32_t>(min, max)(rng_);
   }
+
+  std::shared_ptr<test::TempDirectoryPath> maybeGenerateFaultySpillDirectory();
 
   // Returns a list of randomly generated key types for join and aggregation.
   std::vector<TypePtr> generateKeyTypes(int32_t numKeys);
@@ -175,6 +212,9 @@ class MemoryArbitrationFuzzer {
 
   std::vector<PlanWithSplits> orderByPlans(const std::string& tableDir);
 
+  // Helper method that combines all above plan methods into one.
+  std::vector<PlanWithSplits> allPlans(const std::string& tableDir);
+
   void verify();
 
   static VectorFuzzer::Options getFuzzerOptions() {
@@ -186,6 +226,9 @@ class MemoryArbitrationFuzzer {
     return opts;
   }
 
+  std::string extractQueryIdFromSpillPath(const std::string& spillPath);
+
+  const std::string kQueryIdPrefix = "query_id_";
   FuzzerGenerator rng_;
   size_t currentSeed_{0};
   std::unordered_map<std::string, std::string> queryConfigsWithSpill_{
@@ -203,7 +246,7 @@ class MemoryArbitrationFuzzer {
           memory::kMaxMemory,
           memory::MemoryReclaimer::create())};
   std::shared_ptr<memory::MemoryPool> pool_{
-      memory::memoryManager()->testingDefaultRoot().addLeafChild(
+      memory::memoryManager()->deprecatedSysRootPool().addLeafChild(
           "memoryArbitrationFuzzerLeaf",
           true)};
   std::shared_ptr<memory::MemoryPool> writerPool_{rootPool_->addAggregateChild(
@@ -219,16 +262,34 @@ class MemoryArbitrationFuzzer {
 
 MemoryArbitrationFuzzer::MemoryArbitrationFuzzer(size_t initialSeed)
     : vectorFuzzer_{getFuzzerOptions(), pool_.get()} {
+  // Set timestamp precision as milliseconds, as timestamp may be used as
+  // paritition key, and presto doesn't supports nanosecond precision.
+  vectorFuzzer_.getMutableOptions().timestampPrecision =
+      fuzzer::FuzzerTimestampPrecision::kMilliSeconds;
+  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kPresto)) {
+    serializer::presto::PrestoVectorSerde::registerNamedVectorSerde();
+  }
+  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kCompactRow)) {
+    serializer::CompactRowVectorSerde::registerNamedVectorSerde();
+  }
+  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kUnsafeRow)) {
+    serializer::spark::UnsafeRowVectorSerde::registerNamedVectorSerde();
+  }
   // Make sure not to run out of open file descriptors.
   std::unordered_map<std::string, std::string> hiveConfig = {
       {connector::hive::HiveConfig::kNumCacheFileHandles, "1000"}};
+  connector::registerConnectorFactory(
+      std::make_shared<connector::hive::HiveConnectorFactory>());
   const auto hiveConnector =
       connector::getConnectorFactory(
           connector::hive::HiveConnectorFactory::kHiveConnectorName)
           ->newConnector(
-              kHiveConnectorId,
+              test::kHiveConnectorId,
               std::make_shared<config::ConfigBase>(std::move(hiveConfig)));
   connector::registerConnector(hiveConnector);
+  dwrf::registerDwrfReaderFactory();
+  dwrf::registerDwrfWriterFactory();
+
   seed(initialSeed);
 }
 
@@ -394,7 +455,7 @@ MemoryArbitrationFuzzer::hashJoinPlans(
       (core::isLeftSemiProjectJoin(joinType) ||
        core::isLeftSemiFilterJoin(joinType) || core::isAntiJoin(joinType))
       ? asRowType(probeInput[0]->type())->names()
-      : concat(
+      : test::concat(
             asRowType(probeInput[0]->type()), asRowType(buildInput[0]->type()))
             ->names();
 
@@ -405,22 +466,23 @@ MemoryArbitrationFuzzer::hashJoinPlans(
 
   std::vector<PlanWithSplits> plans;
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  auto plan =
-      PlanBuilder(planNodeIdGenerator)
-          .values(probeInput)
-          .hashJoin(
-              probeKeys,
-              buildKeys,
-              PlanBuilder(planNodeIdGenerator).values(buildInput).planNode(),
-              /*filter=*/"",
-              outputColumns,
-              joinType,
-              false)
-          .planNode();
+  auto plan = test::PlanBuilder(planNodeIdGenerator)
+                  .values(probeInput)
+                  .hashJoin(
+                      probeKeys,
+                      buildKeys,
+                      test::PlanBuilder(planNodeIdGenerator)
+                          .values(buildInput)
+                          .planNode(),
+                      /*filter=*/"",
+                      outputColumns,
+                      joinType,
+                      false)
+                  .planNode();
   plans.push_back(PlanWithSplits{std::move(plan), {}});
 
-  if (!isTableScanSupported(probeInput[0]->type()) ||
-      !isTableScanSupported(buildInput[0]->type())) {
+  if (!test::isTableScanSupported(probeInput[0]->type()) ||
+      !test::isTableScanSupported(buildInput[0]->type())) {
     return plans;
   }
 
@@ -429,13 +491,13 @@ MemoryArbitrationFuzzer::hashJoinPlans(
   const auto buildType = asRowType(buildInput[0]->type());
   core::PlanNodeId probeScanId;
   core::PlanNodeId buildScanId;
-  plan = PlanBuilder(planNodeIdGenerator)
+  plan = test::PlanBuilder(planNodeIdGenerator)
              .tableScan(probeType)
              .capturePlanNodeId(probeScanId)
              .hashJoin(
                  probeKeys,
                  buildKeys,
-                 PlanBuilder(planNodeIdGenerator)
+                 test::PlanBuilder(planNodeIdGenerator)
                      .tableScan(buildType)
                      .capturePlanNodeId(buildScanId)
                      .planNode(),
@@ -462,14 +524,14 @@ MemoryArbitrationFuzzer::hashJoinPlans(const std::string& tableDir) {
 
   const auto numKeys = randInt(1, 5);
   const std::vector<TypePtr> keyTypes = generateKeyTypes(numKeys);
-  std::vector<std::string> probeKeys = makeNames("t", keyTypes.size());
-  std::vector<std::string> buildKeys = makeNames("u", keyTypes.size());
+  std::vector<std::string> probeKeys = test::makeNames("t", keyTypes.size());
+  std::vector<std::string> buildKeys = test::makeNames("u", keyTypes.size());
   const auto probeInput = generateProbeInput(probeKeys, keyTypes);
   const auto buildInput = generateBuildInput(probeInput, probeKeys, buildKeys);
-  const std::vector<Split> probeScanSplits =
-      makeSplits(probeInput, fmt::format("{}/probe", tableDir), writerPool_);
-  const std::vector<Split> buildScanSplits =
-      makeSplits(buildInput, fmt::format("{}/build", tableDir), writerPool_);
+  const std::vector<Split> probeScanSplits = test::makeSplits(
+      probeInput, fmt::format("{}/probe", tableDir), writerPool_);
+  const std::vector<Split> buildScanSplits = test::makeSplits(
+      buildInput, fmt::format("{}/build", tableDir), writerPool_);
 
   std::vector<PlanWithSplits> totalPlans;
   for (const auto& joinType : kJoinTypes) {
@@ -494,10 +556,11 @@ MemoryArbitrationFuzzer::aggregatePlans(const std::string& tableDir) {
   const auto numKeys = randInt(1, 5);
   // Reuse the hash join utilities to generate aggregation keys and inputs.
   const std::vector<TypePtr> keyTypes = generateKeyTypes(numKeys);
-  const std::vector<std::string> groupingKeys = makeNames("g", keyTypes.size());
+  const std::vector<std::string> groupingKeys =
+      test::makeNames("g", keyTypes.size());
   const auto aggregateInput = generateAggregateInput(groupingKeys, keyTypes);
   const std::vector<std::string> aggregates{"count(1)"};
-  const std::vector<Split> splits = makeSplits(
+  const std::vector<Split> splits = test::makeSplits(
       aggregateInput, fmt::format("{}/aggregate", tableDir), writerPool_);
 
   std::vector<PlanWithSplits> plans;
@@ -508,7 +571,7 @@ MemoryArbitrationFuzzer::aggregatePlans(const std::string& tableDir) {
         std::make_shared<core::PlanNodeIdGenerator>();
     core::PlanNodeId scanId;
     auto plan = PlanWithSplits{
-        PlanBuilder(planNodeIdGenerator)
+        test::PlanBuilder(planNodeIdGenerator)
             .tableScan(inputRowType)
             .capturePlanNodeId(scanId)
             .singleAggregation(groupingKeys, aggregates, {})
@@ -517,7 +580,7 @@ MemoryArbitrationFuzzer::aggregatePlans(const std::string& tableDir) {
     plans.push_back(std::move(plan));
 
     plan = PlanWithSplits{
-        PlanBuilder()
+        test::PlanBuilder()
             .values(aggregateInput)
             .singleAggregation(groupingKeys, aggregates, {})
             .planNode(),
@@ -531,7 +594,7 @@ MemoryArbitrationFuzzer::aggregatePlans(const std::string& tableDir) {
         std::make_shared<core::PlanNodeIdGenerator>();
     core::PlanNodeId scanId;
     auto plan = PlanWithSplits{
-        PlanBuilder(planNodeIdGenerator)
+        test::PlanBuilder(planNodeIdGenerator)
             .tableScan(inputRowType)
             .capturePlanNodeId(scanId)
             .partialAggregation(groupingKeys, aggregates, {})
@@ -541,7 +604,7 @@ MemoryArbitrationFuzzer::aggregatePlans(const std::string& tableDir) {
     plans.push_back(std::move(plan));
 
     plan = PlanWithSplits{
-        PlanBuilder()
+        test::PlanBuilder()
             .values(aggregateInput)
             .partialAggregation(groupingKeys, aggregates, {})
             .finalAggregation()
@@ -556,7 +619,7 @@ MemoryArbitrationFuzzer::aggregatePlans(const std::string& tableDir) {
         std::make_shared<core::PlanNodeIdGenerator>();
     core::PlanNodeId scanId;
     auto plan = PlanWithSplits{
-        PlanBuilder(planNodeIdGenerator)
+        test::PlanBuilder(planNodeIdGenerator)
             .tableScan(inputRowType)
             .capturePlanNodeId(scanId)
             .partialAggregation(groupingKeys, aggregates, {})
@@ -567,7 +630,7 @@ MemoryArbitrationFuzzer::aggregatePlans(const std::string& tableDir) {
     plans.push_back(std::move(plan));
 
     plan = PlanWithSplits{
-        PlanBuilder()
+        test::PlanBuilder()
             .values(aggregateInput)
             .partialAggregation(groupingKeys, aggregates, {})
             .intermediateAggregation()
@@ -590,7 +653,7 @@ MemoryArbitrationFuzzer::rowNumberPlans(const std::string& tableDir) {
   std::vector<std::string> projectFields = keyNames;
   projectFields.emplace_back("row_number");
   auto plan = PlanWithSplits{
-      PlanBuilder()
+      test::PlanBuilder()
           .values(input)
           .rowNumber(keyNames)
           .project(projectFields)
@@ -598,17 +661,17 @@ MemoryArbitrationFuzzer::rowNumberPlans(const std::string& tableDir) {
       {}};
   plans.push_back(std::move(plan));
 
-  if (!isTableScanSupported(input[0]->type())) {
+  if (!test::isTableScanSupported(input[0]->type())) {
     return plans;
   }
 
-  const std::vector<Split> splits =
-      makeSplits(input, fmt::format("{}/row_number", tableDir), writerPool_);
+  const std::vector<Split> splits = test::makeSplits(
+      input, fmt::format("{}/row_number", tableDir), writerPool_);
 
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
   core::PlanNodeId scanId;
   plan = PlanWithSplits{
-      PlanBuilder(planNodeIdGenerator)
+      test::PlanBuilder(planNodeIdGenerator)
           .tableScan(asRowType(input[0]->type()))
           .capturePlanNodeId(scanId)
           .rowNumber(keyNames)
@@ -628,20 +691,21 @@ MemoryArbitrationFuzzer::orderByPlans(const std::string& tableDir) {
   std::vector<PlanWithSplits> plans;
 
   auto plan = PlanWithSplits{
-      PlanBuilder().values(input).orderBy(keyNames, false).planNode(), {}};
+      test::PlanBuilder().values(input).orderBy(keyNames, false).planNode(),
+      {}};
   plans.push_back(std::move(plan));
 
-  if (!isTableScanSupported(input[0]->type())) {
+  if (!test::isTableScanSupported(input[0]->type())) {
     return plans;
   }
 
-  const std::vector<Split> splits =
-      makeSplits(input, fmt::format("{}/order_by", tableDir), writerPool_);
+  const std::vector<Split> splits = test::makeSplits(
+      input, fmt::format("{}/order_by", tableDir), writerPool_);
 
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
   core::PlanNodeId scanId;
   plan = PlanWithSplits{
-      PlanBuilder(planNodeIdGenerator)
+      test::PlanBuilder(std::move(planNodeIdGenerator))
           .tableScan(asRowType(input[0]->type()))
           .capturePlanNodeId(scanId)
           .orderBy(keyNames, false)
@@ -652,75 +716,238 @@ MemoryArbitrationFuzzer::orderByPlans(const std::string& tableDir) {
   return plans;
 }
 
-void MemoryArbitrationFuzzer::verify() {
-  const auto outputDirectory = TempDirectoryPath::create();
-  const auto spillDirectory = exec::test::TempDirectoryPath::create();
-  const auto tableScanDir = exec::test::TempDirectoryPath::create();
-
+std::vector<MemoryArbitrationFuzzer::PlanWithSplits>
+MemoryArbitrationFuzzer::allPlans(const std::string& tableDir) {
   std::vector<PlanWithSplits> plans;
-  for (const auto& plan : hashJoinPlans(tableScanDir->getPath())) {
+  for (const auto& plan : hashJoinPlans(tableDir)) {
     plans.push_back(plan);
   }
-  for (const auto& plan : aggregatePlans(tableScanDir->getPath())) {
+  for (const auto& plan : aggregatePlans(tableDir)) {
     plans.push_back(plan);
   }
-  for (const auto& plan : rowNumberPlans(tableScanDir->getPath())) {
+  for (const auto& plan : rowNumberPlans(tableDir)) {
     plans.push_back(plan);
   }
-  for (const auto& plan : orderByPlans(tableScanDir->getPath())) {
+  for (const auto& plan : orderByPlans(tableDir)) {
     plans.push_back(plan);
   }
+  return plans;
+}
+
+std::string MemoryArbitrationFuzzer::extractQueryIdFromSpillPath(
+    const std::string& spillPath) {
+  std::vector<std::string> parts;
+  folly::split('/', spillPath, parts);
+  for (const auto& part : parts) {
+    if (part.starts_with(kQueryIdPrefix)) {
+      return part;
+    }
+  }
+  VELOX_FAIL("No query id found in spill path: {}", spillPath);
+}
+
+// Stats that keeps track of per thread execution status in verify()
+folly::ConcurrentHashMap<std::string, folly::Unit> spillFsTaskSet;
+
+std::shared_ptr<test::TempDirectoryPath>
+MemoryArbitrationFuzzer::maybeGenerateFaultySpillDirectory() {
+  FuzzerGenerator fsRng(rng_());
+  const auto injectFsFault = coinToss(fsRng, FLAGS_spill_faulty_fs_ratio);
+  if (!injectFsFault) {
+    return exec::test::TempDirectoryPath::create(false);
+  }
+  using OpType = FaultFileOperation::Type;
+  static const std::vector<std::unordered_set<OpType>> opTypes{
+      {OpType::kRead},
+      {OpType::kReadv},
+      {OpType::kWrite},
+      {OpType::kRead, OpType::kReadv},
+      {OpType::kRead, OpType::kWrite},
+      {OpType::kReadv, OpType::kWrite}};
+
+  const auto directory = exec::test::TempDirectoryPath::create(true);
+  auto faultyFileSystem = std::dynamic_pointer_cast<FaultyFileSystem>(
+      filesystems::getFileSystem(directory->getPath(), nullptr));
+  faultyFileSystem->setFileInjectionHook(
+      [this, injectTypes = opTypes[getRandomIndex(fsRng, opTypes.size() - 1)]](
+          FaultFileOperation* op) {
+        if (injectTypes.count(op->type) == 0) {
+          return;
+        }
+        FuzzerGenerator fsRng(rng_());
+        if (coinToss(fsRng, FLAGS_spill_fs_fault_injection_ratio)) {
+          auto queryId = extractQueryIdFromSpillPath(op->path);
+          spillFsTaskSet.insert(queryId, folly::Unit());
+          VELOX_FAIL(
+              "Fault file injection on {} of query {} path {}",
+              FaultFileOperation::typeString(op->type),
+              queryId,
+              op->path,
+              process::StackTrace().toString());
+        }
+      });
+  return directory;
+}
+
+void MemoryArbitrationFuzzer::verify() {
+  auto spillDirectory = maybeGenerateFaultySpillDirectory();
+  const auto tableScanDir = exec::test::TempDirectoryPath::create(false);
+
+  auto plans = allPlans(tableScanDir->getPath());
 
   SCOPE_EXIT {
-    waitForAllTasksToBeDeleted();
+    test::waitForAllTasksToBeDeleted();
+    if (auto faultyFileSystem = std::dynamic_pointer_cast<FaultyFileSystem>(
+            filesystems::getFileSystem(spillDirectory->getPath(), nullptr))) {
+      faultyFileSystem->clearFileFaultInjections();
+    }
   };
 
   const auto numThreads = FLAGS_num_threads;
   std::atomic_bool stop{false};
   std::vector<std::thread> queryThreads;
   queryThreads.reserve(numThreads);
+  // A map to keep track of the query task abort request. The key is the query
+  // id and the value indicates if an abort request is injected.
+  folly::ConcurrentHashMap<std::string, bool> queryTaskAbortRequestMap;
+  std::atomic_int32_t queryCount{0};
   for (int i = 0; i < numThreads; ++i) {
     auto seed = rng_();
-    queryThreads.emplace_back([&, i, seed]() {
+    queryThreads.emplace_back([&, spillDirectory, i, seed]() {
       FuzzerGenerator rng(seed);
       while (!stop) {
+        const auto queryId = fmt::format("{}{}", kQueryIdPrefix, queryCount++);
+        queryTaskAbortRequestMap.insert(queryId, false);
         try {
-          const auto queryCtx = newQueryCtx(
+          const auto queryCtx = test::newQueryCtx(
               memory::memoryManager(),
               executor_.get(),
-              FLAGS_arbitrator_capacity);
+              FLAGS_arbitrator_capacity,
+              queryId);
+
           const auto plan = plans.at(getRandomIndex(rng, plans.size() - 1));
-          AssertQueryBuilder builder(plan.plan);
+          test::AssertQueryBuilder builder(plan.plan);
           builder.queryCtx(queryCtx);
           for (const auto& [planNodeId, nodeSplits] : plan.splits) {
             builder.splits(planNodeId, nodeSplits);
           }
 
-          if (coinToss(rng, 0.3)) {
-            builder.queryCtx(queryCtx).copyResults(pool_.get());
+          if (coinToss(rng, FLAGS_spillable_query_ratio)) {
+            auto res = builder.configs(queryConfigsWithSpill_)
+                           .spillDirectory(
+                               spillDirectory->getPath() +
+                               fmt::format("/{}/{}", i, queryId))
+                           .queryCtx(queryCtx)
+                           .copyResults(pool_.get());
           } else {
-            auto res =
-                builder.configs(queryConfigsWithSpill_)
-                    .spillDirectory(
-                        spillDirectory->getPath() + fmt::format("/{}/", i))
-                    .queryCtx(queryCtx)
-                    .copyResults(pool_.get());
+            builder.queryCtx(queryCtx).copyResults(pool_.get());
           }
           ++stats_.wlock()->successCount;
+          VELOX_CHECK(spillFsTaskSet.find(queryId) == spillFsTaskSet.end());
         } catch (const VeloxException& e) {
           auto lockedStats = stats_.wlock();
           if (e.errorCode() == error_code::kMemCapExceeded.c_str()) {
             ++lockedStats->oomCount;
           } else if (e.errorCode() == error_code::kMemAborted.c_str()) {
             ++lockedStats->abortCount;
+          } else if (e.errorCode() == error_code::kInvalidState.c_str()) {
+            const auto injectedSpillFsFault =
+                spillFsTaskSet.find(queryId) != spillFsTaskSet.end();
+            if (injectedSpillFsFault) {
+              spillFsTaskSet.erase(queryId);
+            }
+            const auto injectedTaskAbortRequest =
+                queryTaskAbortRequestMap.find(queryId)->second;
+
+            // Debug logging to understand the failure
+            if (!injectedSpillFsFault && !injectedTaskAbortRequest) {
+              LOG(ERROR) << "============== VELOX_CHECK failure debug info:";
+              LOG(ERROR) << "  queryId: " << queryId;
+              LOG(ERROR) << "  spillFsTaskSet size: " << spillFsTaskSet.size();
+              LOG(ERROR) << "  spillFsTaskSet contents:";
+              // Iterate through spillFsTaskSet to log contents
+              for (auto it = spillFsTaskSet.cbegin();
+                   it != spillFsTaskSet.cend();
+                   ++it) {
+                LOG(ERROR) << "    key: " << it->first;
+              }
+              LOG(ERROR) << "  error message: " << e.message();
+            }
+
+            VELOX_CHECK(
+                injectedSpillFsFault || injectedTaskAbortRequest,
+                "injectedSpillFsFault: {}, injectedTaskAbortRequest: {}, error message: {}",
+                injectedSpillFsFault,
+                injectedTaskAbortRequest,
+                e.message());
+
+            if (injectedTaskAbortRequest && !injectedSpillFsFault) {
+              VELOX_CHECK(
+                  e.message().find("Aborted for external error") !=
+                      std::string::npos,
+                  e.message());
+            } else if (!injectedTaskAbortRequest && injectedSpillFsFault) {
+              VELOX_CHECK(
+                  e.message().find("Fault file injection on") !=
+                      std::string::npos,
+                  e.message());
+            } else {
+              VELOX_CHECK(
+                  e.message().find("Fault file injection on") !=
+                          std::string::npos ||
+                      e.message().find("Aborted for external error") !=
+                          std::string::npos,
+                  e.message());
+            }
           } else {
-            ++lockedStats->failureCount;
+            LOG(ERROR) << "Unexpected exception:\n" << e.what();
             std::rethrow_exception(std::current_exception());
           }
         }
+        queryTaskAbortRequestMap.erase(queryId);
       }
     });
   }
+
+  // Inject global arbitration from a background thread.
+  auto shrinkRng = FuzzerGenerator(rng_());
+  std::thread globalShrinkThread([&]() {
+    while (!stop) {
+      if (getRandomIndex(shrinkRng, 99) < FLAGS_global_arbitration_pct) {
+        memory::memoryManager()->shrinkPools();
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+  });
+
+  // Inject random task abortion from a background thread.
+  auto abortRng = FuzzerGenerator(rng_());
+  std::thread abortControlThread([&]() {
+    if (FLAGS_task_abort_interval_ms == 0) {
+      return;
+    }
+    while (!stop) {
+      try {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(FLAGS_task_abort_interval_ms));
+        auto tasksList = Task::getRunningTasks();
+
+        // queryThreads start a new Task each time a Task finishes, but we still
+        // may get unlucky and hit a point where there are no tasks running.
+        if (!tasksList.empty()) {
+          vector_size_t index = getRandomIndex(abortRng, tasksList.size() - 1);
+          auto& task = tasksList[index];
+          const auto queryId = task->queryCtx()->queryId();
+          queryTaskAbortRequestMap.assign(queryId, true);
+          task->requestAbort();
+        }
+      } catch (const VeloxException& e) {
+        LOG(ERROR) << "Unexpected exception in abortControlScheduler:\n"
+                   << e.what();
+        std::rethrow_exception(std::current_exception());
+      }
+    }
+  });
 
   std::this_thread::sleep_for(
       std::chrono::seconds(FLAGS_iteration_duration_sec));
@@ -729,27 +956,22 @@ void MemoryArbitrationFuzzer::verify() {
   for (auto& queryThread : queryThreads) {
     queryThread.join();
   }
+  globalShrinkThread.join();
+  abortControlThread.join();
 }
 
 void MemoryArbitrationFuzzer::go() {
   VELOX_USER_CHECK(
       FLAGS_steps > 0 || FLAGS_duration_sec > 0,
-      "Either --steps or --duration_sec needs to be greater than zero.")
+      "Either --steps or --duration_sec needs to be greater than zero.");
   VELOX_USER_CHECK_GE(FLAGS_batch_size, 10, "Batch size must be at least 10.");
 
   const auto startTime = std::chrono::system_clock::now();
   size_t iteration = 0;
 
-  bool enableGlobalArbitration = true;
   while (!isDone(iteration, startTime)) {
     LOG(WARNING) << "==============================> Started iteration "
                  << iteration << " (seed: " << currentSeed_ << ")";
-
-    // Test enable/disable global arbitration.
-    dynamic_cast<memory::SharedArbitrator*>(
-        memory::memoryManager()->arbitrator())
-        ->testingSetGlobalArbitration(enableGlobalArbitration);
-
     verify();
 
     LOG(INFO) << "==============================> Done with iteration "
@@ -758,8 +980,6 @@ void MemoryArbitrationFuzzer::go() {
 
     reSeed();
     ++iteration;
-    // Revert the flag.
-    enableGlobalArbitration = !enableGlobalArbitration;
   }
 }
 
@@ -768,4 +988,4 @@ void MemoryArbitrationFuzzer::go() {
 void memoryArbitrationFuzzer(size_t seed) {
   MemoryArbitrationFuzzer(seed).go();
 }
-} // namespace facebook::velox::exec::test
+} // namespace facebook::velox::exec

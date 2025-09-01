@@ -55,7 +55,7 @@ class FileInputStream : public ByteInputStream {
 
   void readBytes(uint8_t* bytes, int32_t size) override;
 
-  std::string_view nextView(int32_t size) override;
+  std::string_view nextView(int64_t size) override;
 
   std::string toString() const override;
 
@@ -122,6 +122,8 @@ class FileInputStream : public ByteInputStream {
   // Sets to read-ahead future if valid.
   folly::SemiFuture<uint64_t> readAheadWait_{
       folly::SemiFuture<uint64_t>::makeEmpty()};
+
+  ByteRange range_;
 
   Stats stats_;
 };

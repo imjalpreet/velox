@@ -20,36 +20,39 @@
 namespace facebook::velox::functions {
 namespace {
 
+// This implements InPredicate using a set over VectorValues (pairs of
+// BaseVector, index). Can be used in place of Filters for Types not supported
+// by Filters or when custom comparisons are needed.
 // Returns NULL if
 // - input value is NULL
 // - in-list is NULL or empty
 // - input value doesn't have an exact match, but has an indeterminate match in
 // the in-list. E.g., 'array[null] in (array[1])' or 'array[1] in
 // (array[null])'.
-class ComplexTypeInPredicate : public exec::VectorFunction {
+class VectorSetInPredicate : public exec::VectorFunction {
  public:
-  struct ComplexValue {
+  struct VectorValue {
     BaseVector* vector;
     vector_size_t index;
   };
 
-  struct ComplexValueHash {
-    size_t operator()(ComplexValue value) const {
+  struct VectorValueHash {
+    size_t operator()(VectorValue value) const {
       return value.vector->hashValueAt(value.index);
     }
   };
 
-  struct ComplexValueEqualTo {
-    bool operator()(ComplexValue left, ComplexValue right) const {
+  struct VectorValueEqualTo {
+    bool operator()(VectorValue left, VectorValue right) const {
       return left.vector->equalValueAt(right.vector, left.index, right.index);
     }
   };
 
-  using ComplexSet =
-      folly::F14FastSet<ComplexValue, ComplexValueHash, ComplexValueEqualTo>;
+  using VectorSet =
+      folly::F14FastSet<VectorValue, VectorValueHash, VectorValueEqualTo>;
 
-  ComplexTypeInPredicate(
-      ComplexSet uniqueValues,
+  VectorSetInPredicate(
+      VectorSet uniqueValues,
       bool hasNull,
       VectorPtr originalValues)
       : uniqueValues_{std::move(uniqueValues)},
@@ -58,7 +61,7 @@ class ComplexTypeInPredicate : public exec::VectorFunction {
 
   static std::shared_ptr<exec::VectorFunction>
   create(const VectorPtr& values, vector_size_t offset, vector_size_t size) {
-    ComplexSet uniqueValues;
+    VectorSet uniqueValues;
     bool hasNull = false;
 
     for (auto i = offset; i < offset + size; i++) {
@@ -68,7 +71,7 @@ class ComplexTypeInPredicate : public exec::VectorFunction {
       uniqueValues.insert({values.get(), i});
     }
 
-    return std::make_shared<ComplexTypeInPredicate>(
+    return std::make_shared<VectorSetInPredicate>(
         std::move(uniqueValues), hasNull, values);
   }
 
@@ -84,11 +87,12 @@ class ComplexTypeInPredicate : public exec::VectorFunction {
     result->clearNulls(rows);
     auto* boolResult = result->asUnchecked<FlatVector<bool>>();
 
-    rows.applyToSelected([&](vector_size_t row) {
+    context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
       if (arg->isNullAt(row)) {
         boolResult->setNull(row, true);
       } else {
-        const bool found = uniqueValues_.contains({arg.get(), row});
+        const bool found =
+            uniqueValues_.contains(VectorValue({arg.get(), row}));
         if (found) {
           if (arg->containsNullAt(row)) {
             boolResult->setNull(row, true);
@@ -126,7 +130,7 @@ class ComplexTypeInPredicate : public exec::VectorFunction {
 
   // Set of unique values to check against. This set doesn't include any value
   // that is null or contains null.
-  const ComplexSet uniqueValues_;
+  const VectorSet uniqueValues_;
 
   // Boolean indicating whether one of the value was null or contained null.
   const bool hasNull_;
@@ -339,10 +343,15 @@ class InPredicate : public exec::VectorFunction {
     }
 
     const auto& elements = arrayVector->elements();
+    const auto& elementType = elements->type();
+
+    if (elementType->providesCustomComparison()) {
+      return VectorSetInPredicate::create(elements, offset, size);
+    }
 
     std::pair<std::unique_ptr<common::Filter>, bool> filter;
 
-    switch (inListType->childAt(0)->kind()) {
+    switch (elementType->kind()) {
       case TypeKind::HUGEINT:
         filter = createHugeintValuesFilter<int128_t>(elements, offset, size);
         break;
@@ -384,7 +393,7 @@ class InPredicate : public exec::VectorFunction {
       case TypeKind::MAP:
         [[fallthrough]];
       case TypeKind::ROW:
-        return ComplexTypeInPredicate::create(elements, offset, size);
+        return VectorSetInPredicate::create(elements, offset, size);
       default:
         VELOX_UNSUPPORTED(
             "Unsupported in-list type for IN predicate: {}",
@@ -534,12 +543,15 @@ class InPredicate : public exec::VectorFunction {
       if (simpleArg->isNullAt(rows.begin())) {
         localResult = createBoolConstantNull(rows.end(), context);
       } else {
-        bool pass = testFunction(simpleArg->valueAt(rows.begin()));
-        if (!pass && passOrNull) {
-          localResult = createBoolConstantNull(rows.end(), context);
-        } else {
-          localResult = createBoolConstant(pass, rows.end(), context);
-        }
+        static const SelectivityVector oneRow(1, true);
+        context.applyToSelectedNoThrow(oneRow, [&](vector_size_t row) {
+          bool pass = testFunction(simpleArg->valueAt(rows.begin()));
+          if (!pass && passOrNull) {
+            localResult = createBoolConstantNull(rows.end(), context);
+          } else {
+            localResult = createBoolConstant(pass, rows.end(), context);
+          }
+        });
       }
 
       context.moveOrCopyResult(localResult, rows, result);
@@ -556,7 +568,7 @@ class InPredicate : public exec::VectorFunction {
     auto* rawResults = boolResult->mutableRawValues<uint64_t>();
 
     if (flatArg->mayHaveNulls() || passOrNull) {
-      rows.applyToSelected([&](auto row) {
+      context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
         if (flatArg->isNullAt(row)) {
           boolResult->setNull(row, true);
         } else {
@@ -569,7 +581,7 @@ class InPredicate : public exec::VectorFunction {
         }
       });
     } else {
-      rows.applyToSelected([&](auto row) {
+      context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
         bool pass = testFunction(flatArg->valueAtFast(row));
         bits::setBit(rawResults, row, pass);
       });

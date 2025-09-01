@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+if(${VELOX_BUILD_TESTING})
+  add_subdirectory(tests)
+endif()
 
-add_subdirectory(tests)
+add_library(velox_wave_decode GpuDecoder.cu)
 
-velox_add_library(velox_wave_decode GpuDecoder.cu)
-
-velox_link_libraries(velox_wave_decode velox_wave_common)
+target_link_libraries(velox_wave_decode velox_wave_common CUDA::cudart breeze_cuda)

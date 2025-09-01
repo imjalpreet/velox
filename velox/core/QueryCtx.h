@@ -26,7 +26,7 @@
 
 namespace facebook::velox {
 class Config;
-};
+}
 
 namespace facebook::velox::core {
 
@@ -51,7 +51,8 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
       cache::AsyncDataCache* cache = cache::AsyncDataCache::getInstance(),
       std::shared_ptr<memory::MemoryPool> pool = nullptr,
       folly::Executor* spillExecutor = nullptr,
-      const std::string& queryId = "");
+      const std::string& queryId = "",
+      std::shared_ptr<filesystems::TokenProvider> tokenProvider = {});
 
   static std::string generatePoolName(const std::string& queryId);
 
@@ -89,6 +90,10 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
     return connectorSessionProperties_;
   }
 
+  std::shared_ptr<filesystems::TokenProvider> fsTokenProvider() const {
+    return fsTokenProvider_;
+  }
+
   /// Overrides the previous configuration. Note that this function is NOT
   /// thread-safe and should probably only be used in tests.
   void testingOverrideConfigUnsafe(
@@ -115,12 +120,16 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
 
   /// Checks if the associated query is under memory arbitration or not. The
   /// function returns true if it is and set future which is fulfilled when the
-  /// the memory arbiration finishes.
+  /// memory arbitration finishes.
   bool checkUnderArbitration(ContinueFuture* future);
 
-  /// Updates the aggregated spill bytes of this query, and and throws if
-  /// exceeds the max spill bytes limit.
+  /// Updates the aggregated spill bytes of this query, and throws if exceeds
+  /// the max spill bytes limit.
   void updateSpilledBytesAndCheckLimit(uint64_t bytes);
+
+  /// Updates the aggregated trace bytes of this query, and throws if exceeds
+  /// the max query trace bytes limit.
+  void updateTracedBytesAndCheckLimit(uint64_t bytes);
 
   void testingOverrideMemoryPool(std::shared_ptr<memory::MemoryPool> pool) {
     pool_ = std::move(pool);
@@ -149,7 +158,8 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
       cache::AsyncDataCache* cache = cache::AsyncDataCache::getInstance(),
       std::shared_ptr<memory::MemoryPool> pool = nullptr,
       folly::Executor* spillExecutor = nullptr,
-      const std::string& queryId = "");
+      const std::string& queryId = "",
+      std::shared_ptr<filesystems::TokenProvider> tokenProvider = {});
 
   class MemoryReclaimer : public memory::MemoryReclaimer {
    public:
@@ -166,8 +176,9 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
    protected:
     MemoryReclaimer(
         const std::shared_ptr<QueryCtx>& queryCtx,
-        memory::MemoryPool* pool)
-        : queryCtx_(queryCtx), pool_(pool) {
+        memory::MemoryPool* pool,
+        int32_t priority = 0)
+        : memory::MemoryReclaimer(priority), queryCtx_(queryCtx), pool_(pool) {
       VELOX_CHECK_NOT_NULL(pool_);
     }
 
@@ -216,11 +227,13 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
   std::shared_ptr<memory::MemoryPool> pool_;
   QueryConfig queryConfig_;
   std::atomic<uint64_t> numSpilledBytes_{0};
+  std::atomic<uint64_t> numTracedBytes_{0};
 
   mutable std::mutex mutex_;
   // Indicates if this query is under memory arbitration or not.
-  bool underArbitration_{false};
+  std::atomic_bool underArbitration_{false};
   std::vector<ContinuePromise> arbitrationPromises_;
+  std::shared_ptr<filesystems::TokenProvider> fsTokenProvider_;
 };
 
 // Represents the state of one thread of query execution.

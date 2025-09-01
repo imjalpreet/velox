@@ -72,9 +72,13 @@ class DwrfData : public dwio::common::FormatData {
     return flatMapContext_.inMapDecoder ? inMap_->as<uint64_t>() : nullptr;
   }
 
+  const velox::BufferPtr& inMapBuffer() {
+    return inMap_;
+  }
+
   /// Seeks possible flat map in map streams and nulls to the row group
   /// and returns a PositionsProvider for the other streams.
-  dwio::common::PositionProvider seekToRowGroup(uint32_t index) override;
+  dwio::common::PositionProvider seekToRowGroup(int64_t index) override;
 
   int64_t stripeRows() const {
     return stripeRows_;
@@ -149,6 +153,14 @@ class DwrfParams : public dwio::common::FormatParams {
     return streamLabels_;
   }
 
+  const tz::TimeZone* sessionTimezone() const {
+    return stripeStreams_.sessionTimezone();
+  }
+
+  bool adjustTimestampToTimezone() const {
+    return stripeStreams_.adjustTimestampToTimezone();
+  }
+
  private:
   const StreamLabels& streamLabels_;
   StripeStreams& stripeStreams_;
@@ -167,6 +179,31 @@ inline RleVersion convertRleVersion(proto::ColumnEncoding_Kind kind) {
       VELOX_FAIL(
           "Unknown encoding in convertRleVersion: {}",
           static_cast<int64_t>(kind));
+  }
+}
+
+inline RleVersion convertRleVersion(proto::orc::ColumnEncoding_Kind kind) {
+  switch (kind) {
+    case proto::orc::ColumnEncoding_Kind_DIRECT:
+    case proto::orc::ColumnEncoding_Kind_DICTIONARY:
+      return RleVersion_1;
+    case proto::orc::ColumnEncoding_Kind_DIRECT_V2:
+    case proto::orc::ColumnEncoding_Kind_DICTIONARY_V2:
+      return RleVersion_2;
+    default:
+      VELOX_FAIL(
+          "Unknown encoding in convertRleVersion: {}",
+          static_cast<int64_t>(kind));
+  }
+}
+
+inline RleVersion convertRleVersion(
+    const StripeStreams& stripe,
+    const EncodingKey& encodingKey) {
+  if (stripe.format() == DwrfFormat::kDwrf) {
+    return convertRleVersion(stripe.getEncoding(encodingKey).kind());
+  } else {
+    return convertRleVersion(stripe.getEncodingOrc(encodingKey).kind());
   }
 }
 

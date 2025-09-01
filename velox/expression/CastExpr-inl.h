@@ -19,7 +19,6 @@
 #include "velox/common/base/Exceptions.h"
 #include "velox/core/CoreTypeSystem.h"
 #include "velox/expression/StringWriter.h"
-#include "velox/external/date/tz.h"
 #include "velox/type/Type.h"
 #include "velox/vector/SelectivityVector.h"
 
@@ -52,150 +51,6 @@ inline std::exception_ptr makeBadCastException(
 
 } // namespace
 
-namespace detail {
-
-/// Represent the varchar fragment.
-///
-/// For example:
-/// | value | wholeDigits | fractionalDigits | exponent | sign |
-/// | 9999999999.99 | 9999999999 | 99 | nullopt | 1 |
-/// | 15 | 15 |  | nullopt | 1 |
-/// | 1.5 | 1 | 5 | nullopt | 1 |
-/// | -1.5 | 1 | 5 | nullopt | -1 |
-/// | 31.523e-2 | 31 | 523 | -2 | 1 |
-struct DecimalComponents {
-  std::string_view wholeDigits;
-  std::string_view fractionalDigits;
-  std::optional<int32_t> exponent = std::nullopt;
-  int8_t sign = 1;
-};
-
-// Extract a string view of continuous digits.
-std::string_view extractDigits(const char* s, size_t start, size_t size);
-
-/// Parse decimal components, including whole digits, fractional digits,
-/// exponent and sign, from input chars. Returns error status if input chars
-/// do not represent a valid value.
-Status
-parseDecimalComponents(const char* s, size_t size, DecimalComponents& out);
-
-/// Parse huge int from decimal components. The fractional part is scaled up by
-/// required power of 10, and added with the whole part. Returns error status if
-/// overflows.
-Status parseHugeInt(const DecimalComponents& decimalComponents, int128_t& out);
-
-/// Converts string view to decimal value of given precision and scale.
-/// Derives from Arrow function DecimalFromString. Arrow implementation:
-/// https://github.com/apache/arrow/blob/main/cpp/src/arrow/util/decimal.cc#L637.
-///
-/// Firstly, it parses the varchar to DecimalComponents which contains the
-/// message that can represent a decimal value. Secondly, processes the exponent
-/// to get the scale. Thirdly, compute the rescaled value. Returns status for
-/// the outcome of computing.
-template <typename T>
-Status toDecimalValue(
-    const StringView s,
-    int toPrecision,
-    int toScale,
-    T& decimalValue) {
-  DecimalComponents decimalComponents;
-  if (auto status =
-          parseDecimalComponents(s.data(), s.size(), decimalComponents);
-      !status.ok()) {
-    return Status::UserError("Value is not a number. " + status.message());
-  }
-
-  // Count number of significant digits (without leading zeros).
-  const size_t firstNonZero =
-      decimalComponents.wholeDigits.find_first_not_of('0');
-  size_t significantDigits = decimalComponents.fractionalDigits.size();
-  if (firstNonZero != std::string::npos) {
-    significantDigits += decimalComponents.wholeDigits.size() - firstNonZero;
-  }
-  int32_t parsedPrecision = static_cast<int32_t>(significantDigits);
-
-  int32_t parsedScale = 0;
-  bool roundUp = false;
-  const int32_t fractionSize = decimalComponents.fractionalDigits.size();
-  if (!decimalComponents.exponent.has_value()) {
-    if (fractionSize > toScale) {
-      if (decimalComponents.fractionalDigits[toScale] >= '5') {
-        roundUp = true;
-      }
-      parsedScale = toScale;
-      decimalComponents.fractionalDigits =
-          std::string_view(decimalComponents.fractionalDigits.data(), toScale);
-    } else {
-      parsedScale = fractionSize;
-    }
-  } else {
-    const auto exponent = decimalComponents.exponent.value();
-    parsedScale = -exponent + fractionSize;
-    // Truncate the fractionalDigits.
-    if (parsedScale > toScale) {
-      if (-exponent >= toScale) {
-        // The fractional digits could be dropped.
-        if (fractionSize > 0 && decimalComponents.fractionalDigits[0] >= '5') {
-          roundUp = true;
-        }
-        decimalComponents.fractionalDigits = "";
-        parsedScale -= fractionSize;
-      } else {
-        const auto reduceDigits = exponent + toScale;
-        if (fractionSize > reduceDigits &&
-            decimalComponents.fractionalDigits[reduceDigits] >= '5') {
-          roundUp = true;
-        }
-        decimalComponents.fractionalDigits = std::string_view(
-            decimalComponents.fractionalDigits.data(),
-            std::min(reduceDigits, fractionSize));
-        parsedScale -= fractionSize - decimalComponents.fractionalDigits.size();
-      }
-    }
-  }
-
-  int128_t out = 0;
-  if (auto status = parseHugeInt(decimalComponents, out); !status.ok()) {
-    return status;
-  }
-
-  if (roundUp) {
-    bool overflow = __builtin_add_overflow(out, 1, &out);
-    if (UNLIKELY(overflow)) {
-      return Status::UserError("Value too large.");
-    }
-  }
-  out *= decimalComponents.sign;
-
-  if (parsedScale < 0) {
-    /// Force the scale to be zero, to avoid negative scales (due to
-    /// compatibility issues with external systems such as databases).
-    if (-parsedScale + toScale > LongDecimalType::kMaxPrecision) {
-      return Status::UserError("Value too large.");
-    }
-
-    bool overflow = __builtin_mul_overflow(
-        out, DecimalUtil::kPowersOfTen[-parsedScale + toScale], &out);
-    if (UNLIKELY(overflow)) {
-      return Status::UserError("Value too large.");
-    }
-    parsedPrecision -= parsedScale;
-    parsedScale = toScale;
-  }
-  const auto status = DecimalUtil::rescaleWithRoundUp<int128_t, T>(
-      out,
-      std::min((uint8_t)parsedPrecision, LongDecimalType::kMaxPrecision),
-      parsedScale,
-      toPrecision,
-      toScale,
-      decimalValue);
-  if (!status.ok()) {
-    return Status::UserError("Value too large.");
-  }
-  return status;
-}
-} // namespace detail
-
 template <typename Func>
 void CastExpr::applyToSelectedNoThrowLocal(
     EvalCtx& context,
@@ -203,7 +58,7 @@ void CastExpr::applyToSelectedNoThrowLocal(
     VectorPtr& result,
     Func&& func) {
   if (setNullInResultAtError()) {
-    rows.template applyToSelected([&](auto row) INLINE_LAMBDA {
+    rows.applyToSelected([&](auto row) INLINE_LAMBDA {
       try {
         func(row);
       } catch (const VeloxException& e) {
@@ -216,7 +71,7 @@ void CastExpr::applyToSelectedNoThrowLocal(
       }
     });
   } else {
-    rows.template applyToSelected([&](auto row) INLINE_LAMBDA {
+    rows.applyToSelected([&](auto row) INLINE_LAMBDA {
       try {
         func(row);
       } catch (const VeloxException& e) {
@@ -276,6 +131,49 @@ void CastExpr::applyCastKernel(
   try {
     auto inputRowValue = input->valueAt(row);
 
+    if constexpr (
+        (FromKind == TypeKind::TINYINT || FromKind == TypeKind::SMALLINT ||
+         FromKind == TypeKind::INTEGER || FromKind == TypeKind::BIGINT) &&
+        ToKind == TypeKind::TIMESTAMP) {
+      const auto castResult =
+          hooks_->castIntToTimestamp((int64_t)inputRowValue);
+      setResultOrError(castResult, row);
+      return;
+    }
+
+    if constexpr (
+        (FromKind == TypeKind::BOOLEAN) && ToKind == TypeKind::TIMESTAMP) {
+      const auto castResult = hooks_->castBooleanToTimestamp(inputRowValue);
+      setResultOrError(castResult, row);
+      return;
+    }
+
+    if constexpr (
+        (ToKind == TypeKind::TINYINT || ToKind == TypeKind::SMALLINT ||
+         ToKind == TypeKind::INTEGER || ToKind == TypeKind::BIGINT) &&
+        FromKind == TypeKind::TIMESTAMP) {
+      const auto castResult = hooks_->castTimestampToInt(inputRowValue);
+      setResultOrError(castResult, row);
+      return;
+    }
+
+    if constexpr (
+        (FromKind == TypeKind::DOUBLE || FromKind == TypeKind::REAL) &&
+        ToKind == TypeKind::TIMESTAMP) {
+      const auto castResult =
+          hooks_->castDoubleToTimestamp(static_cast<double>(inputRowValue));
+      if (castResult.hasError()) {
+        setError(castResult.error().message());
+      } else {
+        if (castResult.value().has_value()) {
+          result->set(row, castResult.value().value());
+        } else {
+          result->setNull(row, true);
+        }
+      }
+      return;
+    }
+
     // Optimize empty input strings casting by avoiding throwing exceptions.
     if constexpr (
         FromKind == TypeKind::VARCHAR || FromKind == TypeKind::VARBINARY) {
@@ -309,10 +207,11 @@ void CastExpr::applyCastKernel(
           ToKind == TypeKind::INTEGER || ToKind == TypeKind::BIGINT ||
           ToKind == TypeKind::HUGEINT) {
         if constexpr (TPolicy::throwOnUnicode) {
-          VELOX_CHECK(
-              functions::stringCore::isAscii(
-                  inputRowValue.data(), inputRowValue.size()),
-              "Unicode characters are not supported for conversion to integer types");
+          if (!functions::stringCore::isAscii(
+                  inputRowValue.data(), inputRowValue.size())) {
+            VELOX_USER_FAIL(
+                "Unicode characters are not supported for conversion to integer types");
+          }
         }
       }
     }
@@ -329,7 +228,7 @@ void CastExpr::applyCastKernel(
     if constexpr (
         ToKind == TypeKind::VARCHAR || ToKind == TypeKind::VARBINARY) {
       // Write the result output to the output vector
-      auto writer = exec::StringWriter<>(result, row);
+      auto writer = exec::StringWriter(result, row);
       writer.copy_from(output);
       writer.finalize();
     } else {
@@ -455,7 +354,7 @@ void CastExpr::applyVarcharToDecimalCastKernel(
 
   rows.applyToSelected([&](auto row) {
     T decimalValue;
-    const auto status = detail::toDecimalValue<T>(
+    const auto status = DecimalUtil::castFromString<T>(
         hooks_->removeWhiteSpaces(sourceVector->valueAt(row)),
         toPrecisionScale.first,
         toPrecisionScale.second,
@@ -525,11 +424,14 @@ VectorPtr CastExpr::applyDecimalToIntegralCast(
     applyToSelectedNoThrowLocal(context, rows, result, [&](vector_size_t row) {
       auto value = simpleInput->valueAt(row);
       auto integralPart = value / scaleFactor;
-      auto fractionPart = value % scaleFactor;
-      auto sign = value >= 0 ? 1 : -1;
-      bool needsRoundUp =
-          (scaleFactor != 1) && (sign * fractionPart >= (scaleFactor >> 1));
-      integralPart += needsRoundUp ? sign : 0;
+      if (hooks_->getPolicy() != SparkTryCastPolicy) {
+        auto fractionPart = value % scaleFactor;
+        auto sign = value >= 0 ? 1 : -1;
+        bool needsRoundUp =
+            (scaleFactor != 1) && (sign * fractionPart >= (scaleFactor >> 1));
+        integralPart += needsRoundUp ? sign : 0;
+      }
+
       if (integralPart > std::numeric_limits<To>::max() ||
           integralPart < std::numeric_limits<To>::min()) {
         if (setNullInResultAtError()) {
@@ -676,6 +578,12 @@ void CastExpr::applyCastPrimitives(
     case SparkCastPolicy:
       applyToSelectedNoThrowLocal(context, rows, result, [&](int row) {
         applyCastKernel<ToKind, FromKind, util::SparkCastPolicy>(
+            row, context, inputSimpleVector, resultFlatVector);
+      });
+      break;
+    case SparkTryCastPolicy:
+      applyToSelectedNoThrowLocal(context, rows, result, [&](int row) {
+        applyCastKernel<ToKind, FromKind, util::SparkTryCastPolicy>(
             row, context, inputSimpleVector, resultFlatVector);
       });
       break;

@@ -15,6 +15,10 @@
  */
 #pragma once
 
+#include <optional>
+#include <set>
+#include <unordered_map>
+
 #include "velox/exec/fuzzer/ReferenceQueryRunner.h"
 
 namespace facebook::velox::exec::test {
@@ -34,6 +38,9 @@ class DuckQueryRunner : public ReferenceQueryRunner {
   /// TODO Investigate mismatches reported when comparing Varbinary.
   const std::vector<TypePtr>& supportedScalarTypes() const override;
 
+  const std::unordered_map<std::string, DataSpec>&
+  aggregationFunctionDataSpecs() const override;
+
   /// Specify names of aggregate function to exclude from the list of supported
   /// functions. Used to exclude functions that are non-determonistic, have bugs
   /// or whose semantics differ from Velox.
@@ -43,38 +50,16 @@ class DuckQueryRunner : public ReferenceQueryRunner {
   /// Assumes that source of AggregationNode or Window Node is 'tmp' table.
   std::optional<std::string> toSql(const core::PlanNodePtr& plan) override;
 
-  /// Creates 'tmp' table with 'input' data and runs 'sql' query. Returns
-  /// results according to 'resultType' schema.
-  std::multiset<std::vector<velox::variant>> execute(
-      const std::string& sql,
-      const std::vector<RowVectorPtr>& input,
-      const RowTypePtr& resultType) override;
-
-  std::multiset<std::vector<velox::variant>> execute(
-      const std::string& sql,
-      const std::vector<RowVectorPtr>& probeInput,
-      const std::vector<RowVectorPtr>& buildInput,
-      const RowTypePtr& resultType) override;
+  // Converts 'plan' into an SQL query and executes it. Result is returned as a
+  // MaterializedRowMultiset with the ReferenceQueryErrorCode::kSuccess if
+  // successful, or an std::nullopt with a ReferenceQueryErrorCode if the query
+  // fails.
+  std::pair<
+      std::optional<std::multiset<std::vector<velox::variant>>>,
+      ReferenceQueryErrorCode>
+  execute(const core::PlanNodePtr& plan) override;
 
  private:
-  std::optional<std::string> toSql(
-      const std::shared_ptr<const core::AggregationNode>& aggregationNode);
-
-  std::optional<std::string> toSql(
-      const std::shared_ptr<const core::WindowNode>& windowNode);
-
-  std::optional<std::string> toSql(
-      const std::shared_ptr<const core::ProjectNode>& projectNode);
-
-  std::optional<std::string> toSql(
-      const std::shared_ptr<const core::RowNumberNode>& rowNumberNode);
-
-  std::optional<std::string> toSql(
-      const std::shared_ptr<const core::HashJoinNode>& joinNode);
-
-  std::optional<std::string> toSql(
-      const std::shared_ptr<const core::NestedLoopJoinNode>& joinNode);
-
   std::unordered_set<std::string> aggregateFunctionNames_;
 };
 

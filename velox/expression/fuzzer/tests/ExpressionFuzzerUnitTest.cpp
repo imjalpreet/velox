@@ -18,12 +18,18 @@
 
 #include "velox/expression/fuzzer/ExpressionFuzzer.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
+#include "velox/functions/prestosql/types/QDigestRegistration.h"
+#include "velox/functions/prestosql/types/QDigestType.h"
+#include "velox/functions/prestosql/types/TDigestRegistration.h"
+#include "velox/functions/prestosql/types/TDigestType.h"
 
 namespace facebook::velox::fuzzer::test {
 class ExpressionFuzzerUnitTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    registerTDigestType();
+    registerQDigestType();
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   uint32_t countLevelOfNesting(core::TypedExprPtr expression) {
@@ -39,7 +45,7 @@ class ExpressionFuzzerUnitTest : public testing::Test {
     return maxLevelOfNesting;
   }
 
-  TypePtr randomType(std::mt19937& seed) {
+  TypePtr randomType(FuzzerGenerator& seed) {
     static std::vector<TypePtr> kSupportedTypes{
         BOOLEAN(),
         TINYINT(),
@@ -50,7 +56,11 @@ class ExpressionFuzzerUnitTest : public testing::Test {
         DOUBLE(),
         TIMESTAMP(),
         DATE(),
-        INTERVAL_DAY_TIME()};
+        INTERVAL_DAY_TIME(),
+        TDIGEST(DOUBLE()),
+        QDIGEST(DOUBLE()),
+        QDIGEST(BIGINT()),
+        QDIGEST(REAL())};
     auto index = folly::Random::rand32(kSupportedTypes.size(), seed);
     return kSupportedTypes[index];
   }
@@ -70,7 +80,7 @@ auto makeOptionsWithMaxLevelNesting(int32_t value) {
 } // namespace
 TEST_F(ExpressionFuzzerUnitTest, restrictedLevelOfNesting) {
   velox::functions::prestosql::registerAllScalarFunctions();
-  std::mt19937 seed{0};
+  FuzzerGenerator seed{0};
 
   auto testLevelOfNesting = [&](int32_t maxLevelOfNesting) {
     ExpressionFuzzer fuzzer{
@@ -111,7 +121,7 @@ TEST_F(ExpressionFuzzerUnitTest, reproduceExpressionWithSeed) {
   // the same.
   auto generateExpressions = [&]() {
     std::vector<std::string> firstGeneration;
-    std::mt19937 seed{7654321};
+    FuzzerGenerator seed{7654321};
     ExpressionFuzzer fuzzer{
         velox::getFunctionSignatures(),
         1234567,
@@ -135,7 +145,7 @@ TEST_F(ExpressionFuzzerUnitTest, reproduceExpressionWithSeed) {
 
 TEST_F(ExpressionFuzzerUnitTest, exprBank) {
   velox::functions::prestosql::registerAllScalarFunctions();
-  std::mt19937 seed{0};
+  FuzzerGenerator seed{0};
   int32_t maxLevelOfNesting = 10;
   {
     ExpressionFuzzer fuzzer{
@@ -143,7 +153,7 @@ TEST_F(ExpressionFuzzerUnitTest, exprBank) {
         0,
         vectorfuzzer,
         makeOptionsWithMaxLevelNesting(maxLevelOfNesting)};
-    ExpressionFuzzer::ExprBank exprBank(seed, maxLevelOfNesting);
+    ExprBank exprBank(seed, maxLevelOfNesting);
     for (int i = 0; i < 5000; ++i) {
       auto expression = fuzzer.fuzzExpression().expressions[0];
       // Verify that if there is a single expression then it is returned
@@ -171,7 +181,7 @@ TEST_F(ExpressionFuzzerUnitTest, exprBank) {
         0,
         vectorfuzzer,
         makeOptionsWithMaxLevelNesting(maxLevelOfNesting)};
-    ExpressionFuzzer::ExprBank exprBank(seed, maxLevelOfNesting);
+    ExprBank exprBank(seed, maxLevelOfNesting);
     for (int i = 0; i < 1000; ++i) {
       auto expression = fuzzer.fuzzExpression().expressions[0];
       exprBank.insert(expression);

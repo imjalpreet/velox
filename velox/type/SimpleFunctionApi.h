@@ -64,6 +64,20 @@ using S2 = IntegerVariable<6>;
 using S3 = IntegerVariable<7>;
 using S4 = IntegerVariable<8>;
 
+template <size_t id>
+struct EnumVariable {
+  static size_t getId() {
+    return id;
+  }
+
+  static std::string name() {
+    return fmt::format("E{}", id);
+  }
+};
+
+using E1 = EnumVariable<1>;
+using E2 = EnumVariable<2>;
+
 template <typename P, typename S>
 struct ShortDecimal {
  private:
@@ -165,8 +179,12 @@ struct DynamicRow {
 
 // T must be a struct with T::type being a built-in type and T::typeName
 // type name to use in FunctionSignature.
-template <typename T>
+// providesCustomComparison must be set to true to ensure values are wrapped in
+// a view that exposes the custom comparison operations in Simple Functions.
+template <typename T, bool providesCustomComparison_ = false>
 struct CustomType {
+  static constexpr bool providesCustomComparison = providesCustomComparison_;
+
  private:
   CustomType() {}
 };
@@ -176,9 +194,19 @@ struct UnwrapCustomType {
   using type = T;
 };
 
-template <typename T>
-struct UnwrapCustomType<CustomType<T>> {
+template <typename T, bool providesCustomComparison>
+struct UnwrapCustomType<CustomType<T, providesCustomComparison>> {
   using type = typename T::type;
+};
+
+template <typename T>
+struct providesCustomComparison {
+  static constexpr bool value = false;
+};
+
+template <typename T>
+struct providesCustomComparison<CustomType<T, true>> {
+  static constexpr bool value = true;
 };
 
 struct IntervalDayTime {
@@ -205,6 +233,18 @@ struct Varchar {
  private:
   Varchar() {}
 };
+
+// Type to use for inputs and outputs of simple functions with BigintEnum types.
+// E.g. arg_type<BigintEnum<E1>> and out_type<BigintEnum<E1>>.
+template <typename E>
+struct BigintEnumT {
+  using type = int64_t;
+
+  static inline const std::string typeName = "bigint_enum(" + E::name() + ")";
+};
+
+template <typename E>
+using BigintEnum = CustomType<BigintEnumT<E>>;
 
 template <typename T>
 struct Constant {};
@@ -277,8 +317,9 @@ struct CppToType<DynamicRow> : public TypeTraits<TypeKind::ROW> {
   }
 };
 
-template <typename T>
-struct CppToType<CustomType<T>> : public CppToType<typename T::type> {
+template <typename T, bool providesCustomComparison>
+struct CppToType<CustomType<T, providesCustomComparison>>
+    : public CppToType<typename T::type> {
   static auto create() {
     return CppToType<typename T::type>::create();
   }
@@ -317,7 +358,7 @@ struct SimpleTypeTrait<IntervalYearMonth> : public SimpleTypeTrait<int32_t> {
 
 template <typename T, bool comparable, bool orderable>
 struct SimpleTypeTrait<Generic<T, comparable, orderable>> {
-  static constexpr TypeKind typeKind = TypeKind::UNKNOWN;
+  static constexpr TypeKind typeKind = TypeKind::INVALID;
   static constexpr bool isPrimitiveType = false;
   static constexpr bool isFixedWidth = false;
 };
@@ -339,8 +380,8 @@ template <>
 struct SimpleTypeTrait<DynamicRow> : public TypeTraits<TypeKind::ROW> {};
 
 // T is also a simple type that represent the physical type of the custom type.
-template <typename T>
-struct SimpleTypeTrait<CustomType<T>>
+template <typename T, bool providesCustomComparison>
+struct SimpleTypeTrait<CustomType<T, providesCustomComparison>>
     : public SimpleTypeTrait<typename T::type> {
   using physical_t = SimpleTypeTrait<typename T::type>;
   static constexpr TypeKind typeKind = physical_t::typeKind;
@@ -396,8 +437,8 @@ struct MaterializeType<std::shared_ptr<T>> {
   static constexpr bool requiresMaterialization = false;
 };
 
-template <typename T>
-struct MaterializeType<CustomType<T>> {
+template <typename T, bool providesCustomComparison>
+struct MaterializeType<CustomType<T, providesCustomComparison>> {
   using inner_materialize_t = MaterializeType<typename T::type>;
   using nullable_t = typename inner_materialize_t::nullable_t;
   using null_free_t = typename inner_materialize_t::null_free_t;

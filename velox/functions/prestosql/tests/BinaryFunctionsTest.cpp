@@ -257,6 +257,8 @@ TEST_F(BinaryFunctionsTest, HmacSha512) {
   EXPECT_EQ(std::nullopt, hmacSha512(std::nullopt, "velox"));
 }
 
+// Note: this test fails in a FIPS enabled environment because OpenSSL restricts
+// usage of MD5 for hmacs.
 TEST_F(BinaryFunctionsTest, HmacMd5) {
   const auto hmacMd5 = [&](std::optional<std::string> arg,
                            std::optional<std::string> key) {
@@ -300,13 +302,6 @@ TEST_F(BinaryFunctionsTest, xxhash64) {
     return evaluateOnce<std::string>("xxhash64(c0)", VARBINARY(), value);
   };
 
-  const auto toVarbinary = [](const int64_t input) {
-    std::string out;
-    out.resize(sizeof(input));
-    std::memcpy(out.data(), &input, sizeof(input));
-    return out;
-  };
-
   EXPECT_EQ(hexToDec("EF46DB3751D8E999"), xxhash64(""));
   EXPECT_EQ(std::nullopt, xxhash64(std::nullopt));
 
@@ -318,6 +313,20 @@ TEST_F(BinaryFunctionsTest, xxhash64) {
   EXPECT_EQ(hexToDec("A9D4D4132EFF23B6"), xxhash64("1234567890"));
   EXPECT_EQ(
       hexToDec("D73C92CF24E6EC82"), xxhash64("more_than_12_characters_string"));
+}
+
+TEST_F(BinaryFunctionsTest, xxhash64WithSeed) {
+  const auto xxhash64WithSeed = [&](std::optional<std::string> value,
+                                    std::optional<int64_t> seed) {
+    return evaluateOnce<std::string>(
+        "xxhash64(c0, c1)", {VARBINARY(), BIGINT()}, value, seed);
+  };
+
+  EXPECT_EQ(hexToDec("F9D96E0E1165E892"), xxhash64WithSeed("hashme", 0));
+  EXPECT_NE(hexToDec("F9D96EAE1165E892"), xxhash64WithSeed("hashme", 0));
+  EXPECT_NE(hexToDec("F9D96E0E1165E892"), xxhash64WithSeed("hashme", 1));
+  EXPECT_EQ(hexToDec("26C7827D889F6DA3"), xxhash64WithSeed("hello", 0));
+  EXPECT_NE(hexToDec("26C7827D889F6DA3"), xxhash64WithSeed("hello", 1224));
 }
 
 TEST_F(BinaryFunctionsTest, toHex) {
@@ -447,6 +456,12 @@ TEST_F(BinaryFunctionsTest, fromBase64) {
   VELOX_ASSERT_USER_THROW(
       fromBase64("YQ==="),
       "Base64::decode() - invalid input string: string length is not a multiple of 4.");
+  VELOX_ASSERT_USER_THROW(
+      fromBase64("aG;"),
+      "decode() - invalid input string: invalid character ';'");
+  VELOX_ASSERT_USER_THROW(
+      fromBase64("YQ?="),
+      "decode() - invalid input string: invalid character '?'");
 
   // Check encoded strings without padding
   EXPECT_EQ("a", fromBase64("YQ"));
@@ -635,8 +650,10 @@ TEST_F(BinaryFunctionsTest, toIEEE754Bits64) {
   EXPECT_EQ(
       hexToDec("7FF8000000000000"),
       toIEEE754Bits64(std::numeric_limits<double>::quiet_NaN()));
+  // NaNs are normalized when generating output to ensure they are equal as all
+  // NaNs are considered equal
   EXPECT_EQ(
-      hexToDec("7FF4000000000000"),
+      hexToDec("7FF8000000000000"),
       toIEEE754Bits64(std::numeric_limits<double>::signaling_NaN()));
   EXPECT_EQ(
       hexToDec("FFF0000000000000"),
@@ -698,6 +715,11 @@ TEST_F(BinaryFunctionsTest, toIEEE754Bits32) {
   EXPECT_EQ(
       hexToDec("7FC00000"),
       toIEEE754Bits32(std::numeric_limits<float>::quiet_NaN()));
+  // NaNs are normalized when generating output to ensure they are equal as all
+  // NaNs are considered equal
+  EXPECT_EQ(
+      hexToDec("7FC00000"),
+      toIEEE754Bits32(std::numeric_limits<float>::signaling_NaN()));
   EXPECT_EQ(
       hexToDec("7F800000"),
       toIEEE754Bits32(std::numeric_limits<float>::infinity()));
@@ -829,6 +851,19 @@ TEST_F(BinaryFunctionsTest, lpad) {
   VELOX_ASSERT_USER_THROW(
       lpad("2312", -1, "4524"), "pad size must be in the range [0..1048576)");
   VELOX_ASSERT_USER_THROW(lpad("2312", 1, ""), "padString must not be empty");
+}
+
+TEST_F(BinaryFunctionsTest, murmur3_x64_128) {
+  const auto murmur3_x64_128 = [&](std::optional<std::string> arg) {
+    return evaluateOnce<std::string>(
+        "murmur3_x64_128(c0)", VARBINARY(), std::move(arg));
+  };
+
+  EXPECT_EQ(murmur3_x64_128(""), hexToDec("00000000000000000000000000000000"));
+  EXPECT_EQ(
+      murmur3_x64_128("hashme"), hexToDec("93192FE805BE23041C8318F67EC4F2BC"));
+
+  EXPECT_EQ(murmur3_x64_128(std::nullopt), std::nullopt);
 }
 
 } // namespace

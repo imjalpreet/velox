@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/common/base/RuntimeMetrics.h"
+#include "velox/core/Expressions.h"
 #include "velox/expression/VectorFunction.h"
 #include "velox/functions/lib/LambdaFunctionUtil.h"
 
@@ -29,21 +30,19 @@ void checkArraySizes(
   const auto* indices = decodedArray.indices();
   const auto* rawSizes = decodedArray.base()->as<ArrayVector>()->rawSizes();
 
-  static const vector_size_t kMaxArraySize = 10'000;
+  const auto maxArraySize =
+      context.execCtx()->queryCtx()->queryConfig().exprMaxArraySizeInReduce();
 
   rows.applyToSelected([&](auto row) {
     if (decodedArray.isNullAt(row)) {
       return;
     }
     const auto size = rawSizes[indices[row]];
-    try {
-      VELOX_USER_CHECK_LT(
-          size,
-          kMaxArraySize,
-          "reduce lambda function doesn't support arrays with more than {} elements",
-          kMaxArraySize);
-    } catch (VeloxUserError&) {
-      context.setError(row, std::current_exception());
+    // We do not want this error to be suppressed by TRY(), so we simply throw.
+    if (size >= maxArraySize) {
+      VELOX_UNSUPPORTED(
+          "Reduce lambda function doesn't support arrays with more than {} elements",
+          maxArraySize);
     }
   });
 }

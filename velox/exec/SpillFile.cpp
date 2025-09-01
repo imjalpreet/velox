@@ -17,6 +17,7 @@
 #include "velox/exec/SpillFile.h"
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/vector/VectorStream.h"
 
 namespace facebook::velox::exec {
 namespace {
@@ -71,36 +72,55 @@ uint64_t SpillWriteFile::write(std::unique_ptr<folly::IOBuf> iobuf) {
   return writtenBytes;
 }
 
-SpillWriter::SpillWriter(
-    const RowTypePtr& type,
-    const uint32_t numSortKeys,
-    const std::vector<CompareFlags>& sortCompareFlags,
-    common::CompressionKind compressionKind,
-    const std::string& pathPrefix,
-    uint64_t targetFileSize,
+SpillWriterBase::SpillWriterBase(
     uint64_t writeBufferSize,
+    uint64_t targetFileSize,
+    const std::string& pathPrefix,
     const std::string& fileCreateConfig,
     common::UpdateAndCheckSpillLimitCB& updateAndCheckSpillLimitCb,
     memory::MemoryPool* pool,
     folly::Synchronized<common::SpillStats>* stats)
-    : type_(type),
-      numSortKeys_(numSortKeys),
-      sortCompareFlags_(sortCompareFlags),
-      compressionKind_(compressionKind),
-      pathPrefix_(pathPrefix),
-      targetFileSize_(targetFileSize),
-      writeBufferSize_(writeBufferSize),
-      fileCreateConfig_(fileCreateConfig),
+    : pool_(pool),
+      stats_(stats),
       updateAndCheckSpillLimitCb_(updateAndCheckSpillLimitCb),
-      pool_(pool),
-      stats_(stats) {
-  // NOTE: if the associated spilling operator has specified the sort
-  // comparison flags, then it must match the number of sorting keys.
-  VELOX_CHECK(
-      sortCompareFlags_.empty() || sortCompareFlags_.size() == numSortKeys_);
+      fileCreateConfig_(fileCreateConfig),
+      pathPrefix_(pathPrefix),
+      writeBufferSize_(writeBufferSize),
+      targetFileSize_(targetFileSize) {}
+
+SpillFiles SpillWriterBase::finish() {
+  checkNotFinished();
+  SCOPE_EXIT {
+    finished_ = true;
+  };
+  finishFile();
+  return std::move(finishedFiles_);
 }
 
-SpillWriteFile* SpillWriter::ensureFile() {
+void SpillWriterBase::finishFile() {
+  checkNotFinished();
+  flush();
+  closeFile();
+  VELOX_CHECK_NULL(currentFile_);
+}
+
+uint64_t SpillWriterBase::flush() {
+  if (bufferEmpty()) {
+    return 0;
+  }
+
+  auto* file = ensureFile();
+  VELOX_CHECK_NOT_NULL(file);
+  uint64_t writtenBytes{0};
+  uint64_t flushTimeNs{0};
+  uint64_t writeTimeNs{0};
+  flushBuffer(file, writtenBytes, flushTimeNs, writeTimeNs);
+  updateWriteStats(writtenBytes, flushTimeNs, writeTimeNs);
+  updateAndCheckSpillLimitCb_(writtenBytes);
+  return writtenBytes;
+}
+
+SpillWriteFile* SpillWriterBase::ensureFile() {
   if ((currentFile_ != nullptr) && (currentFile_->size() > targetFileSize_)) {
     closeFile();
   }
@@ -113,83 +133,54 @@ SpillWriteFile* SpillWriter::ensureFile() {
   return currentFile_.get();
 }
 
-void SpillWriter::closeFile() {
+void SpillWriterBase::closeFile() {
   if (currentFile_ == nullptr) {
     return;
   }
   currentFile_->finish();
   updateSpilledFileStats(currentFile_->size());
-  finishedFiles_.push_back(SpillFileInfo{
-      .id = currentFile_->id(),
-      .type = type_,
-      .path = currentFile_->path(),
-      .size = currentFile_->size(),
-      .numSortKeys = numSortKeys_,
-      .sortFlags = sortCompareFlags_,
-      .compressionKind = compressionKind_});
+  addFinishedFile(currentFile_.get());
   currentFile_.reset();
 }
 
-size_t SpillWriter::numFinishedFiles() const {
-  return finishedFiles_.size();
-}
-
-uint64_t SpillWriter::flush() {
-  if (batch_ == nullptr) {
-    return 0;
-  }
-
-  auto* file = ensureFile();
-  VELOX_CHECK_NOT_NULL(file);
-
-  IOBufOutputStream out(
-      *pool_, nullptr, std::max<int64_t>(64 * 1024, batch_->size()));
-  uint64_t flushTimeNs{0};
-  {
-    NanosecondTimer timer(&flushTimeNs);
-    batch_->flush(&out);
-  }
-  batch_.reset();
-
-  uint64_t writeTimeNs{0};
-  uint64_t writtenBytes{0};
-  auto iobuf = out.getIOBuf();
-  {
-    NanosecondTimer timer(&writeTimeNs);
-    writtenBytes = file->write(std::move(iobuf));
-  }
-  updateWriteStats(writtenBytes, flushTimeNs, writeTimeNs);
-  updateAndCheckSpillLimitCb_(writtenBytes);
-  return writtenBytes;
-}
-
-uint64_t SpillWriter::write(
-    const RowVectorPtr& rows,
-    const folly::Range<IndexRange*>& indices) {
+uint64_t SpillWriterBase::writeWithBufferControl(
+    const std::function<uint64_t()>& writeCb) {
   checkNotFinished();
 
   uint64_t timeNs{0};
+  uint64_t rowsWritten{0};
   {
     NanosecondTimer timer(&timeNs);
-    if (batch_ == nullptr) {
-      serializer::presto::PrestoVectorSerde::PrestoOptions options = {
-          kDefaultUseLosslessTimestamp, compressionKind_, true /*nullsFirst*/};
-      batch_ = std::make_unique<VectorStreamGroup>(pool_);
-      batch_->createStreamTree(
-          std::static_pointer_cast<const RowType>(rows->type()),
-          1'000,
-          &options);
-    }
-    batch_->append(rows, indices);
+    rowsWritten = writeCb();
   }
-  updateAppendStats(rows->size(), timeNs);
-  if (batch_->size() < writeBufferSize_) {
+  updateAppendStats(rowsWritten, timeNs);
+
+  if (bufferSize() < writeBufferSize_) {
     return 0;
   }
   return flush();
 }
 
-void SpillWriter::updateAppendStats(
+void SpillWriterBase::updateWriteStats(
+    uint64_t spilledBytes,
+    uint64_t flushTimeNs,
+    uint64_t writeTimeNs) {
+  auto statsLocked = stats_->wlock();
+  statsLocked->spilledBytes += spilledBytes;
+  statsLocked->spillFlushTimeNanos += flushTimeNs;
+  statsLocked->spillWriteTimeNanos += writeTimeNs;
+  ++statsLocked->spillWrites;
+  common::updateGlobalSpillWriteStats(spilledBytes, flushTimeNs, writeTimeNs);
+}
+
+void SpillWriterBase::updateSpilledFileStats(uint64_t fileSize) {
+  ++stats_->wlock()->spilledFiles;
+  addThreadLocalRuntimeStat(
+      "spillFileSize", RuntimeCounter(fileSize, RuntimeCounter::Unit::kBytes));
+  common::incrementGlobalSpilledFiles();
+}
+
+void SpillWriterBase::updateAppendStats(
     uint64_t numRows,
     uint64_t serializationTimeNs) {
   auto statsLocked = stats_->wlock();
@@ -198,39 +189,79 @@ void SpillWriter::updateAppendStats(
   common::updateGlobalSpillAppendStats(numRows, serializationTimeNs);
 }
 
-void SpillWriter::updateWriteStats(
-    uint64_t spilledBytes,
-    uint64_t flushTimeNs,
-    uint64_t fileWriteTimeNs) {
-  auto statsLocked = stats_->wlock();
-  statsLocked->spilledBytes += spilledBytes;
-  statsLocked->spillFlushTimeNanos += flushTimeNs;
-  statsLocked->spillWriteTimeNanos += fileWriteTimeNs;
-  ++statsLocked->spillWrites;
-  common::updateGlobalSpillWriteStats(
-      spilledBytes, flushTimeNs, fileWriteTimeNs);
+SpillWriter::SpillWriter(
+    const RowTypePtr& type,
+    const std::vector<SpillSortKey>& sortingKeys,
+    common::CompressionKind compressionKind,
+    const std::string& pathPrefix,
+    uint64_t targetFileSize,
+    uint64_t writeBufferSize,
+    const std::string& fileCreateConfig,
+    common::UpdateAndCheckSpillLimitCB& updateAndCheckSpillLimitCb,
+    memory::MemoryPool* pool,
+    folly::Synchronized<common::SpillStats>* stats)
+    : SpillWriterBase(
+          writeBufferSize,
+          targetFileSize,
+          pathPrefix,
+          fileCreateConfig,
+          updateAndCheckSpillLimitCb,
+          pool,
+          stats),
+      type_(type),
+      sortingKeys_(sortingKeys),
+      compressionKind_(compressionKind),
+      serde_(getNamedVectorSerde(VectorSerde::Kind::kPresto)) {}
+
+void SpillWriter::flushBuffer(
+    SpillWriteFile* file,
+    uint64_t& writtenBytes,
+    uint64_t& flushTimeNs,
+    uint64_t& writeTimeNs) {
+  IOBufOutputStream out(
+      *pool_, nullptr, std::max<int64_t>(64 * 1024, batch_->size()));
+  {
+    NanosecondTimer timer(&flushTimeNs);
+    batch_->flush(&out);
+  }
+  batch_.reset();
+
+  auto iobuf = out.getIOBuf();
+  {
+    NanosecondTimer timer(&writeTimeNs);
+    writtenBytes = file->write(std::move(iobuf));
+  }
 }
 
-void SpillWriter::updateSpilledFileStats(uint64_t fileSize) {
-  ++stats_->wlock()->spilledFiles;
-  addThreadLocalRuntimeStat(
-      "spillFileSize", RuntimeCounter(fileSize, RuntimeCounter::Unit::kBytes));
-  common::incrementGlobalSpilledFiles();
+uint64_t SpillWriter::write(
+    const RowVectorPtr& rows,
+    const folly::Range<IndexRange*>& indices) {
+  return writeWithBufferControl([&]() {
+    if (batch_ == nullptr) {
+      serializer::presto::PrestoVectorSerde::PrestoOptions options = {
+          kDefaultUseLosslessTimestamp,
+          compressionKind_,
+          0.8,
+          /*_nullsFirst=*/true};
+      batch_ = std::make_unique<VectorStreamGroup>(pool_, serde_);
+      batch_->createStreamTree(
+          std::static_pointer_cast<const RowType>(rows->type()),
+          1'000,
+          &options);
+    }
+    batch_->append(rows, indices);
+    return rows->size();
+  });
 }
 
-void SpillWriter::finishFile() {
-  checkNotFinished();
-  flush();
-  closeFile();
-  VELOX_CHECK_NULL(currentFile_);
-}
-
-SpillFiles SpillWriter::finish() {
-  checkNotFinished();
-  auto finishGuard = folly::makeGuard([this]() { finished_ = true; });
-
-  finishFile();
-  return std::move(finishedFiles_);
+void SpillWriter::addFinishedFile(SpillWriteFile* file) {
+  finishedFiles_.push_back(SpillFileInfo{
+      .id = file->id(),
+      .type = type_,
+      .path = file->path(),
+      .size = file->size(),
+      .sortingKeys = sortingKeys_,
+      .compressionKind = compressionKind_});
 }
 
 std::vector<std::string> SpillWriter::testingSpilledFilePaths() const {
@@ -270,8 +301,7 @@ std::unique_ptr<SpillReadFile> SpillReadFile::create(
       fileInfo.size,
       bufferSize,
       fileInfo.type,
-      fileInfo.numSortKeys,
-      fileInfo.sortFlags,
+      fileInfo.sortingKeys,
       fileInfo.compressionKind,
       pool,
       stats));
@@ -283,8 +313,7 @@ SpillReadFile::SpillReadFile(
     uint64_t size,
     uint64_t bufferSize,
     const RowTypePtr& type,
-    uint32_t numSortKeys,
-    const std::vector<CompareFlags>& sortCompareFlags,
+    const std::vector<SpillSortKey>& sortingKeys,
     common::CompressionKind compressionKind,
     memory::MemoryPool* pool,
     folly::Synchronized<common::SpillStats>* stats)
@@ -292,14 +321,15 @@ SpillReadFile::SpillReadFile(
       path_(path),
       size_(size),
       type_(type),
-      numSortKeys_(numSortKeys),
-      sortCompareFlags_(sortCompareFlags),
+      sortingKeys_(sortingKeys),
       compressionKind_(compressionKind),
       readOptions_{
           kDefaultUseLosslessTimestamp,
           compressionKind_,
-          /*nullsFirst=*/true},
+          0.8,
+          /*_nullsFirst=*/true},
       pool_(pool),
+      serde_(getNamedVectorSerde(VectorSerde::Kind::kPresto)),
       stats_(stats) {
   auto fs = filesystems::getFileSystem(path_, nullptr);
   auto file = fs->openFileForRead(path_);
@@ -317,7 +347,7 @@ bool SpillReadFile::nextBatch(RowVectorPtr& rowVector) {
   {
     NanosecondTimer timer{&timeNs};
     VectorStreamGroup::read(
-        input_.get(), pool_, type_, &rowVector, &readOptions_);
+        input_.get(), pool_, type_, serde_, &rowVector, &readOptions_);
   }
   stats_->wlock()->spillDeserializationTimeNanos += timeNs;
   common::updateGlobalSpillDeserializationTimeNs(timeNs);

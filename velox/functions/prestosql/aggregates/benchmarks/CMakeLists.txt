@@ -24,8 +24,9 @@ target_link_libraries(
   velox_vector_fuzzer
   velox_vector_test_lib
   Folly::folly
-  ${FOLLY_BENCHMARK}
-  gflags::gflags)
+  Folly::follybenchmark
+  gflags::gflags
+)
 
 add_executable(velox_aggregates_string_keys_bm TwoStringKeys.cpp)
 
@@ -40,10 +41,11 @@ target_link_libraries(
   velox_vector_fuzzer
   velox_vector_test_lib
   Folly::folly
-  ${FOLLY_BENCHMARK}
-  gflags::gflags)
+  Folly::follybenchmark
+  gflags::gflags
+)
 
-add_executable(velox_aggregates_reduce_agg_bm SimpleAggregates.cpp)
+add_executable(velox_aggregates_reduce_agg_bm ReduceAgg.cpp)
 
 target_link_libraries(
   velox_aggregates_reduce_agg_bm
@@ -56,5 +58,6 @@ target_link_libraries(
   velox_vector_fuzzer
   velox_vector_test_lib
   Folly::folly
-  ${FOLLY_BENCHMARK}
-  gflags::gflags)
+  Folly::follybenchmark
+  gflags::gflags
+)

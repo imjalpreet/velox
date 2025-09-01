@@ -41,6 +41,11 @@ Window::Window(
       stringAllocator_(pool()) {
   auto* spillConfig =
       spillConfig_.has_value() ? &spillConfig_.value() : nullptr;
+  if (spillConfig == nullptr &&
+      operatorCtx_->driverCtx()->queryConfig().windowSpillEnabled()) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->runtimeStats.emplace(kSpillNotSupported, RuntimeMetric(1));
+  }
   if (windowNode->inputsSorted()) {
     if (supportRowsStreaming()) {
       windowBuild_ = std::make_unique<RowsStreamingWindowBuild>(
@@ -51,7 +56,15 @@ Window::Window(
     }
   } else {
     windowBuild_ = std::make_unique<SortWindowBuild>(
-        windowNode, pool(), spillConfig, &nonReclaimableSection_, &spillStats_);
+        windowNode,
+        pool(),
+        common::PrefixSortConfig{
+            driverCtx->queryConfig().prefixSortNormalizedKeyMaxBytes(),
+            driverCtx->queryConfig().prefixSortMinRows(),
+            driverCtx->queryConfig().prefixSortMaxStringPrefixLength()},
+        spillConfig,
+        &nonReclaimableSection_,
+        spillStats_.get());
   }
 }
 
@@ -315,7 +328,7 @@ void updateKRowsOffsetsColumn(
   const int precedingFactor = isKPreceding ? -1 : 1;
   for (auto i = 0; i < numRows; ++i) {
     const auto startValue =
-        (int64_t)(startRow + i) + precedingFactor * offsets[i];
+        static_cast<int64_t>(startRow + i) + precedingFactor * offsets[i];
     if (startValue < INT32_MIN) {
       // Same as the handling of startValue < INT32_MIN in
       // updateKRowsFrameBounds.
@@ -340,8 +353,8 @@ void Window::updateKRowsFrameBounds(
     vector_size_t* rawFrameBounds) {
   if (frameArg.index == kConstantChannel) {
     const auto constantOffset = frameArg.constant.value();
-    const auto startValue =
-        (int64_t)startRow + (isKPreceding ? -constantOffset : constantOffset);
+    const auto startValue = static_cast<int64_t>(startRow) +
+        (isKPreceding ? -constantOffset : constantOffset);
 
     if (isKPreceding) {
       if (startValue < INT32_MIN) {
@@ -363,7 +376,7 @@ void Window::updateKRowsFrameBounds(
     // KFollowing.
     // The start index that overflow happens.
     int32_t overflowStart;
-    if (startValue > (int64_t)INT32_MAX) {
+    if (startValue > static_cast<int64_t>(INT32_MAX)) {
       overflowStart = 0;
     } else {
       overflowStart = INT32_MAX - startValue + 1;
@@ -397,7 +410,8 @@ void Window::updateFrameBounds(
     const vector_size_t numRows,
     const vector_size_t* rawPeerStarts,
     const vector_size_t* rawPeerEnds,
-    vector_size_t* rawFrameBounds) {
+    vector_size_t* rawFrameBounds,
+    SelectivityVector& validFrames) {
   const auto windowType = windowFrame.type;
   const auto boundType =
       isStartBound ? windowFrame.startType : windowFrame.endType;
@@ -435,7 +449,8 @@ void Window::updateFrameBounds(
             startRow,
             numRows,
             rawPeerBuffer,
-            rawFrameBounds);
+            rawFrameBounds,
+            validFrames);
       }
       break;
     }
@@ -451,7 +466,8 @@ void Window::updateFrameBounds(
             startRow,
             numRows,
             rawPeerBuffer,
-            rawFrameBounds);
+            rawFrameBounds,
+            validFrames);
       }
       break;
     }
@@ -474,6 +490,9 @@ void computeValidFrames(
     vector_size_t* rawFrameEnds,
     SelectivityVector& validFrames) {
   for (auto i = 0; i < numRows; ++i) {
+    if (!validFrames.isValid(i)) {
+      continue;
+    }
     const vector_size_t frameStart = rawFrameStarts[i];
     const vector_size_t frameEnd = rawFrameEnds[i];
     // All valid frames require frameStart <= frameEnd to define the frame rows.
@@ -533,7 +552,8 @@ void Window::computePeerAndFrameBuffers(
         numRows,
         rawPeerStarts,
         rawPeerEnds,
-        rawFrameStarts[i]);
+        rawFrameStarts[i],
+        validFrames_[i]);
     updateFrameBounds(
         windowFrame,
         false,
@@ -541,7 +561,8 @@ void Window::computePeerAndFrameBuffers(
         numRows,
         rawPeerStarts,
         rawPeerEnds,
-        rawFrameEnds[i]);
+        rawFrameEnds[i],
+        validFrames_[i]);
     if (windowFrames_[i].start || windowFrames_[i].end) {
       // k preceding and k following bounds can be problematic. They can go over
       // the partition limits or result in empty frames. Fix the frame
@@ -665,6 +686,9 @@ RowVectorPtr Window::getOutput() {
 
   const auto numRowsLeft = numRows_ - numProcessedRows_;
   if (numRowsLeft == 0) {
+    if (windowBuild_ != nullptr) {
+      windowBuild_->release();
+    }
     return nullptr;
   }
 

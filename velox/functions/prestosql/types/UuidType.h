@@ -15,7 +15,6 @@
  */
 #pragma once
 
-#include "velox/expression/CastExpr.h"
 #include "velox/type/SimpleFunctionApi.h"
 #include "velox/type/Type.h"
 
@@ -25,14 +24,13 @@ namespace facebook::velox {
 /// GUID (Globally Unique IDentifier), using the format defined in :rfc:`4122`.
 ///
 /// Example: UUID '12151fd2-7586-11e9-8f9e-2a86e4085a59'
-class UuidType : public HugeintType {
+class UuidType final : public HugeintType {
   UuidType() = default;
 
  public:
-  static const std::shared_ptr<const UuidType>& get() {
-    static const std::shared_ptr<const UuidType> instance{new UuidType()};
-
-    return instance;
+  static std::shared_ptr<const UuidType> get() {
+    VELOX_CONSTEXPR_SINGLETON UuidType kInstance;
+    return {std::shared_ptr<const UuidType>{}, &kInstance};
   }
 
   bool equivalent(const Type& other) const override {
@@ -72,7 +70,5 @@ struct UuidT {
 };
 
 using Uuid = CustomType<UuidT>;
-
-void registerUuidType();
 
 } // namespace facebook::velox

@@ -31,15 +31,23 @@ SelectiveDecimalColumnReader<DataT>::SelectiveDecimalColumnReader(
   } else {
     scale_ = requestedType_->asLongDecimal().scale();
   }
-  version_ = convertRleVersion(stripe.getEncoding(encodingKey).kind());
-  auto data = encodingKey.forKind(proto::Stream_Kind_DATA);
+  version_ = convertRleVersion(stripe, encodingKey);
+  auto data = StripeStreamsUtil::getStreamForKind(
+      stripe,
+      encodingKey,
+      proto::Stream_Kind_DATA,
+      proto::orc::Stream_Kind_DATA);
   valueDecoder_ = createDirectDecoder</*isSigned*/ true>(
       stripe.getStream(data, params.streamLabels().label(), true),
       stripe.getUseVInts(data),
       sizeof(DataT));
 
   // [NOTICE] DWRF's NANO_DATA has the same enum value as ORC's SECONDARY
-  auto secondary = encodingKey.forKind(proto::Stream_Kind_NANO_DATA);
+  auto secondary = StripeStreamsUtil::getStreamForKind(
+      stripe,
+      encodingKey,
+      proto::Stream_Kind_NANO_DATA,
+      proto::orc::Stream_Kind_SECONDARY);
   scaleDecoder_ = createRleDecoder</*isSigned*/ true>(
       stripe.getStream(secondary, params.streamLabels().label(), true),
       version_,
@@ -57,7 +65,7 @@ uint64_t SelectiveDecimalColumnReader<DataT>::skip(uint64_t numValues) {
 }
 
 template <typename DataT>
-void SelectiveDecimalColumnReader<DataT>::seekToRowGroup(uint32_t index) {
+void SelectiveDecimalColumnReader<DataT>::seekToRowGroup(int64_t index) {
   SelectiveColumnReader::seekToRowGroup(index);
   auto positionsProvider = formatData_->seekToRowGroup(index);
   valueDecoder_->seekToRowGroup(positionsProvider);
@@ -108,7 +116,7 @@ void SelectiveDecimalColumnReader<DataT>::readHelper(RowSet rows) {
 
 template <typename DataT>
 void SelectiveDecimalColumnReader<DataT>::read(
-    vector_size_t offset,
+    int64_t offset,
     const RowSet& rows,
     const uint64_t* incomingNulls) {
   VELOX_CHECK(!scanSpec_->filter());

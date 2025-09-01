@@ -16,32 +16,26 @@
 
 #include "velox/connectors/hive/HiveConnector.h"
 
-#include "velox/common/base/Fs.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HiveDataSink.h"
 #include "velox/connectors/hive/HiveDataSource.h"
 #include "velox/connectors/hive/HivePartitionFunction.h"
-#include "velox/dwio/dwrf/RegisterDwrfReader.h"
-#include "velox/dwio/dwrf/RegisterDwrfWriter.h"
-
-#include "velox/connectors/hive/storage_adapters/abfs/RegisterAbfsFileSystem.h" // @manual
-#include "velox/connectors/hive/storage_adapters/gcs/RegisterGCSFileSystem.h" // @manual
-#include "velox/connectors/hive/storage_adapters/hdfs/RegisterHdfsFileSystem.h" // @manual
-#include "velox/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h" // @manual
-#include "velox/dwio/dwrf/reader/DwrfReader.h"
-#include "velox/dwio/dwrf/writer/Writer.h"
-#include "velox/dwio/orc/reader/OrcReader.h"
-#include "velox/dwio/parquet/RegisterParquetReader.h" // @manual
-#include "velox/dwio/parquet/RegisterParquetWriter.h" // @manual
-#include "velox/expression/FieldReference.h"
+#include "velox/connectors/hive/iceberg/IcebergDataSink.h"
 
 #include <boost/lexical_cast.hpp>
 #include <memory>
 
 using namespace facebook::velox::exec;
-using namespace facebook::velox::dwrf;
 
 namespace facebook::velox::connector::hive {
+
+namespace {
+std::vector<std::unique_ptr<HiveConnectorMetadataFactory>>&
+hiveConnectorMetadataFactories() {
+  static std::vector<std::unique_ptr<HiveConnectorMetadataFactory>> factories;
+  return factories;
+}
+} // namespace
 
 HiveConnector::HiveConnector(
     const std::string& id,
@@ -51,7 +45,7 @@ HiveConnector::HiveConnector(
       hiveConfig_(std::make_shared<HiveConfig>(config)),
       fileHandleFactory_(
           hiveConfig_->isFileHandleCacheEnabled()
-              ? std::make_unique<SimpleLRUCache<std::string, FileHandle>>(
+              ? std::make_unique<SimpleLRUCache<FileHandleKey, FileHandle>>(
                     hiveConfig_->numCacheFileHandles())
               : nullptr,
           std::make_unique<FileHandleGenerator>(config)),
@@ -59,19 +53,25 @@ HiveConnector::HiveConnector(
   if (hiveConfig_->isFileHandleCacheEnabled()) {
     LOG(INFO) << "Hive connector " << connectorId()
               << " created with maximum of "
-              << hiveConfig_->numCacheFileHandles() << " cached file handles.";
+              << hiveConfig_->numCacheFileHandles()
+              << " cached file handles with expiration of "
+              << hiveConfig_->fileHandleExpirationDurationMs() << "ms.";
   } else {
     LOG(INFO) << "Hive connector " << connectorId()
               << " created with file handle cache disabled";
+  }
+  for (auto& factory : hiveConnectorMetadataFactories()) {
+    metadata_ = factory->create(this);
+    if (metadata_ != nullptr) {
+      break;
+    }
   }
 }
 
 std::unique_ptr<DataSource> HiveConnector::createDataSource(
     const RowTypePtr& outputType,
-    const std::shared_ptr<ConnectorTableHandle>& tableHandle,
-    const std::unordered_map<
-        std::string,
-        std::shared_ptr<connector::ColumnHandle>>& columnHandles,
+    const ConnectorTableHandlePtr& tableHandle,
+    const std::unordered_map<std::string, ColumnHandlePtr>& columnHandles,
     ConnectorQueryCtx* connectorQueryCtx) {
   return std::make_unique<HiveDataSource>(
       outputType,
@@ -85,23 +85,37 @@ std::unique_ptr<DataSource> HiveConnector::createDataSource(
 
 std::unique_ptr<DataSink> HiveConnector::createDataSink(
     RowTypePtr inputType,
-    std::shared_ptr<ConnectorInsertTableHandle> connectorInsertTableHandle,
+    ConnectorInsertTableHandlePtr connectorInsertTableHandle,
     ConnectorQueryCtx* connectorQueryCtx,
     CommitStrategy commitStrategy) {
-  auto hiveInsertHandle = std::dynamic_pointer_cast<HiveInsertTableHandle>(
-      connectorInsertTableHandle);
-  VELOX_CHECK_NOT_NULL(
-      hiveInsertHandle, "Hive connector expecting hive write handle!");
-  return std::make_unique<HiveDataSink>(
-      inputType,
-      hiveInsertHandle,
-      connectorQueryCtx,
-      commitStrategy,
-      hiveConfig_);
+  if (auto icebergInsertHandle =
+          std::dynamic_pointer_cast<const iceberg::IcebergInsertTableHandle>(
+              connectorInsertTableHandle)) {
+    return std::make_unique<iceberg::IcebergDataSink>(
+        inputType,
+        icebergInsertHandle,
+        connectorQueryCtx,
+        commitStrategy,
+        hiveConfig_);
+  } else {
+    auto hiveInsertHandle =
+        std::dynamic_pointer_cast<const HiveInsertTableHandle>(
+            connectorInsertTableHandle);
+
+    VELOX_CHECK_NOT_NULL(
+        hiveInsertHandle, "Hive connector expecting hive write handle!");
+    return std::make_unique<HiveDataSink>(
+        inputType,
+        hiveInsertHandle,
+        connectorQueryCtx,
+        commitStrategy,
+        hiveConfig_);
+  }
 }
 
 std::unique_ptr<core::PartitionFunction> HivePartitionFunctionSpec::create(
-    int numPartitions) const {
+    int numPartitions,
+    bool localExchange) const {
   std::vector<int> bucketToPartitions;
   if (bucketToPartition_.empty()) {
     // NOTE: if hive partition function spec doesn't specify bucket to partition
@@ -111,6 +125,14 @@ std::unique_ptr<core::PartitionFunction> HivePartitionFunctionSpec::create(
     for (int bucket = 0; bucket < numBuckets_; ++bucket) {
       bucketToPartitions[bucket] = bucket % numPartitions;
     }
+    if (localExchange) {
+      // Shuffle the map from bucket to partition for local exchange so we don't
+      // use the same map for remote shuffle.
+      std::shuffle(
+          bucketToPartitions.begin(),
+          bucketToPartitions.end(),
+          std::mt19937{0});
+    }
   }
   return std::make_unique<velox::connector::hive::HivePartitionFunction>(
       numBuckets_,
@@ -118,24 +140,6 @@ std::unique_ptr<core::PartitionFunction> HivePartitionFunctionSpec::create(
                                  : bucketToPartition_,
       channels_,
       constValues_);
-}
-
-void HiveConnectorFactory::initialize() {
-  [[maybe_unused]] static bool once = []() {
-    dwio::common::registerFileSinks();
-    dwrf::registerDwrfReaderFactory();
-    dwrf::registerDwrfWriterFactory();
-    orc::registerOrcReaderFactory();
-
-    parquet::registerParquetReaderFactory();
-    parquet::registerParquetWriterFactory();
-
-    filesystems::registerS3FileSystem();
-    filesystems::registerHdfsFileSystem();
-    filesystems::registerGCSFileSystem();
-    filesystems::abfs::registerAbfsFileSystem();
-    return true;
-  }();
 }
 
 std::string HivePartitionFunctionSpec::toString() const {
@@ -201,7 +205,10 @@ void registerHivePartitionFunctionSerDe() {
       "HivePartitionFunctionSpec", HivePartitionFunctionSpec::deserialize);
 }
 
-VELOX_REGISTER_CONNECTOR_FACTORY(std::make_shared<HiveConnectorFactory>())
-VELOX_REGISTER_CONNECTOR_FACTORY(
-    std::make_shared<HiveHadoop2ConnectorFactory>())
+bool registerHiveConnectorMetadataFactory(
+    std::unique_ptr<HiveConnectorMetadataFactory> factory) {
+  hiveConnectorMetadataFactories().push_back(std::move(factory));
+  return true;
+}
+
 } // namespace facebook::velox::connector::hive

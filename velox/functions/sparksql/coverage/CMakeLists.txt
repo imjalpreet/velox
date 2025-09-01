@@ -19,4 +19,6 @@ target_link_libraries(
   velox_function_registry
   velox_functions_spark_aggregates
   velox_functions_spark_window
-  velox_coverage_util)
+  velox_row_fast
+  velox_coverage_util
+)

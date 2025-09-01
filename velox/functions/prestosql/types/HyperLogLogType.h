@@ -17,19 +17,16 @@
 
 #include "velox/type/SimpleFunctionApi.h"
 #include "velox/type/Type.h"
-#include "velox/vector/VectorTypeUtils.h"
 
 namespace facebook::velox {
 
-class HyperLogLogType : public VarbinaryType {
+class HyperLogLogType final : public VarbinaryType {
   HyperLogLogType() = default;
 
  public:
-  static const std::shared_ptr<const HyperLogLogType>& get() {
-    static const std::shared_ptr<const HyperLogLogType> instance =
-        std::shared_ptr<HyperLogLogType>(new HyperLogLogType());
-
-    return instance;
+  static std::shared_ptr<const HyperLogLogType> get() {
+    VELOX_CONSTEXPR_SINGLETON HyperLogLogType kInstance;
+    return {std::shared_ptr<const HyperLogLogType>{}, &kInstance};
   }
 
   bool equivalent(const Type& other) const override {
@@ -51,6 +48,10 @@ class HyperLogLogType : public VarbinaryType {
     obj["type"] = name();
     return obj;
   }
+
+  bool isOrderable() const override {
+    return false;
+  }
 };
 
 inline bool isHyperLogLogType(const TypePtr& type) {
@@ -70,19 +71,5 @@ struct HyperLogLogT {
 };
 
 using HyperLogLog = CustomType<HyperLogLogT>;
-
-class HyperLogLogTypeFactories : public CustomTypeFactories {
- public:
-  TypePtr getType() const override {
-    return HYPERLOGLOG();
-  }
-
-  // HyperLogLog should be treated as Varbinary during type castings.
-  exec::CastOperatorPtr getCastOperator() const override {
-    return nullptr;
-  }
-};
-
-void registerHyperLogLogType();
 
 } // namespace facebook::velox

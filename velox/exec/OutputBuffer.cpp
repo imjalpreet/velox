@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/exec/OutputBuffer.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Task.h"
 
@@ -470,11 +471,12 @@ bool OutputBuffer::enqueue(
         enqueuePartitionedOutputLocked(
             destination, std::move(data), dataAvailableCallbacks);
         break;
-      default:
-        VELOX_UNREACHABLE(PartitionedOutputNode::kindString(kind_));
     }
 
     if (bufferedBytes_ >= maxSize_ && future) {
+      common::testutil::TestValue::adjust(
+          "facebook::velox::exec::OutputBuffer::enqueue", this);
+
       promises_.emplace_back("OutputBuffer::enqueue");
       *future = promises_.back().getSemiFuture();
       blocked = true;
@@ -597,6 +599,9 @@ void OutputBuffer::checkIfDone(bool oneDriverFinished) {
           finished.push_back(buffer->getAndClearNotify());
         }
       }
+
+      common::testutil::TestValue::adjust(
+          "facebook::velox::exec::OutputBuffer::checkIfDone", this);
     }
   }
 
@@ -649,7 +654,7 @@ void OutputBuffer::updateAfterAcknowledgeLocked(
   uint64_t freedBytes{0};
   int freedPages{0};
   for (const auto& free : freed) {
-    if (free.unique()) {
+    if (free.use_count() == 1) {
       ++freedPages;
       freedBytes += free->size();
     }
@@ -777,7 +782,7 @@ std::string OutputBuffer::toStringLocked() const {
 }
 
 double OutputBuffer::getUtilization() const {
-  return bufferedBytes_ / (double)maxSize_;
+  return bufferedBytes_ / static_cast<double>(maxSize_);
 }
 
 bool OutputBuffer::isOverutilized() const {

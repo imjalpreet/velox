@@ -31,6 +31,10 @@ constexpr const int32_t kMinsPerHour{60};
 constexpr const int32_t kSecsPerMinute{60};
 constexpr const int64_t kMsecsPerSec{1000};
 
+constexpr const int64_t kMillisPerSecond{1000};
+constexpr const int64_t kMillisPerMinute{kMillisPerSecond * kSecsPerMinute};
+constexpr const int64_t kMillisPerHour{kMillisPerMinute * kMinsPerHour};
+
 constexpr const int64_t kMicrosPerMsec{1000};
 constexpr const int64_t kMicrosPerSec{kMicrosPerMsec * kMsecsPerSec};
 constexpr const int64_t kMicrosPerMinute{kMicrosPerSec * kSecsPerMinute};
@@ -94,22 +98,21 @@ int32_t getMaxDayOfMonth(int32_t year, int32_t month);
 
 /// Computes the last day of month since unix epoch (1970-01-01).
 /// Returns UserError status if the date is invalid.
-Status lastDayOfMonthSinceEpochFromDate(const std::tm& dateTime, int64_t& out);
+Expected<int64_t> lastDayOfMonthSinceEpochFromDate(const std::tm& dateTime);
 
 /// Date conversions.
 
 /// Computes the (signed) number of days since unix epoch (1970-01-01).
 /// Returns UserError status if the date is invalid.
-Status
-daysSinceEpochFromDate(int32_t year, int32_t month, int32_t day, int64_t& out);
+Expected<int64_t>
+daysSinceEpochFromDate(int32_t year, int32_t month, int32_t day);
 
 /// Computes the (signed) number of days since unix epoch (1970-01-01).
 /// Returns UserError status if the date is invalid.
-Status daysSinceEpochFromWeekDate(
+Expected<int64_t> daysSinceEpochFromWeekDate(
     int32_t weekYear,
     int32_t weekOfYear,
-    int32_t dayOfWeek,
-    int64_t& out);
+    int32_t dayOfWeek);
 
 /// Computes the signed number of days since the Unix epoch (1970-01-01). To
 /// align with Spark's SimpleDateFormat behavior, this function offers two
@@ -145,8 +148,7 @@ Expected<int64_t> daysSinceEpochFromWeekOfMonthDate(
 
 /// Computes the (signed) number of days since unix epoch (1970-01-01).
 /// Returns UserError status if the date is invalid.
-Status
-daysSinceEpochFromDayOfYear(int32_t year, int32_t dayOfYear, int64_t& out);
+Expected<int64_t> daysSinceEpochFromDayOfYear(int32_t year, int32_t dayOfYear);
 
 /// Cast string to date. Supported date formats vary, depending on input
 /// ParseMode. Refer to ParseMode enum for further info.
@@ -227,6 +229,18 @@ inline Expected<Timestamp> fromTimestampString(
   return fromTimestampString(str.data(), str.size(), parseMode);
 }
 
+struct ParsedTimestampWithTimeZone {
+  Timestamp timestamp;
+  const tz::TimeZone* timeZone;
+  std::optional<int64_t> offsetMillis;
+
+  // For ease of testing purposes.
+  bool operator==(const ParsedTimestampWithTimeZone& other) const {
+    return timestamp == other.timestamp && timeZone == other.timeZone &&
+        offsetMillis == other.offsetMillis;
+  }
+};
+
 /// Parses a timestamp string using specified TimestampParseMode.
 ///
 /// This is a timezone-aware version of the function above
@@ -239,25 +253,33 @@ inline Expected<Timestamp> fromTimestampString(
 /// "America/Los_Angeles", or a timezone offset, like "+06:00" or "-09:30". The
 /// white space between the hour definition and timestamp is optional.
 ///
-/// `nullptr` means no timezone information was found. Returns Unexpected with
-/// UserError status in case of parsing errors.
-Expected<std::pair<Timestamp, const tz::TimeZone*>>
-fromTimestampWithTimezoneString(
+/// `nullptr` means the timezone was not recognized as a valid time zone or
+/// was not present. In this case offsetMillis may be set with the milliseconds
+/// timezone offset if an offset was found but was not a valid timezone.
+///
+/// Returns Unexpected with UserError status in case of parsing errors.
+Expected<ParsedTimestampWithTimeZone> fromTimestampWithTimezoneString(
     const char* buf,
     size_t len,
     TimestampParseMode parseMode);
 
-inline Expected<std::pair<Timestamp, const tz::TimeZone*>>
-fromTimestampWithTimezoneString(
+inline Expected<ParsedTimestampWithTimeZone> fromTimestampWithTimezoneString(
     const StringView& str,
     TimestampParseMode parseMode) {
   return fromTimestampWithTimezoneString(str.data(), str.size(), parseMode);
 }
 
+/// Converts ParsedTimestampWithTimeZone to Timestamp according to the
+/// timezone-based adjustment. If no timezone information is available
+/// in the first argument, respects the session timezone if configured.
+Timestamp fromParsedTimestampWithTimeZone(
+    ParsedTimestampWithTimeZone parsed,
+    const tz::TimeZone* sessionTimeZone);
+
 Timestamp fromDatetime(int64_t daysSinceEpoch, int64_t microsSinceMidnight);
 
 /// Returns the number of days since epoch for a given timestamp and optional
 /// time zone.
-int32_t toDate(const Timestamp& timestamp, const tz::TimeZone* timeZone_);
+int32_t toDate(const Timestamp& timestamp, const tz::TimeZone* timeZone);
 
 } // namespace facebook::velox::util

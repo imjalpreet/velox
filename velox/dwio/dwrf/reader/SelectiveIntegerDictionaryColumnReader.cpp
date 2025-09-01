@@ -35,6 +35,8 @@ SelectiveIntegerDictionaryColumnReader::SelectiveIntegerDictionaryColumnReader(
   const EncodingKey encodingKey{
       fileType_->id(), params.flatMapContext().sequence};
   auto& stripe = params.stripeStreams();
+  VELOX_CHECK_EQ(stripe.format(), DwrfFormat::kDwrf);
+
   const auto encoding = stripe.getEncoding(encodingKey);
   scanState_.dictionary.numValues = encoding.dictionarysize();
   rleVersion_ = convertRleVersion(encoding.kind());
@@ -72,7 +74,7 @@ uint64_t SelectiveIntegerDictionaryColumnReader::skip(uint64_t numValues) {
 }
 
 void SelectiveIntegerDictionaryColumnReader::read(
-    vector_size_t offset,
+    int64_t offset,
     const RowSet& rows,
     const uint64_t* incomingNulls) {
   VELOX_WIDTH_DISPATCH(

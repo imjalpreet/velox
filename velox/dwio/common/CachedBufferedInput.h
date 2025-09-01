@@ -44,8 +44,6 @@ struct CacheRequest {
   cache::CachePin pin;
   cache::SsdPin ssdPin;
 
-  bool processed{false};
-
   /// True if this should be coalesced into a CoalescedLoad with other nearby
   /// requests with a similar load probability. This is false for sparsely
   /// accessed large columns where hitting one piece should not load the
@@ -59,22 +57,26 @@ class CachedBufferedInput : public BufferedInput {
   CachedBufferedInput(
       std::shared_ptr<ReadFile> readFile,
       const MetricsLogPtr& metricsLog,
-      uint64_t fileNum,
+      StringIdLease fileNum,
       cache::AsyncDataCache* cache,
       std::shared_ptr<cache::ScanTracker> tracker,
-      uint64_t groupId,
+      StringIdLease groupId,
       std::shared_ptr<IoStatistics> ioStats,
+      std::shared_ptr<filesystems::File::IoStats> fsStats,
       folly::Executor* executor,
       const io::ReaderOptions& readerOptions)
       : BufferedInput(
             std::move(readFile),
             readerOptions.memoryPool(),
-            metricsLog),
+            metricsLog,
+            ioStats.get(),
+            fsStats.get()),
         cache_(cache),
-        fileNum_(fileNum),
+        fileNum_(std::move(fileNum)),
         tracker_(std::move(tracker)),
-        groupId_(groupId),
+        groupId_(std::move(groupId)),
         ioStats_(std::move(ioStats)),
+        fsStats_(std::move(fsStats)),
         executor_(executor),
         fileSize_(input_->getLength()),
         options_(readerOptions) {
@@ -83,19 +85,21 @@ class CachedBufferedInput : public BufferedInput {
 
   CachedBufferedInput(
       std::shared_ptr<ReadFileInputStream> input,
-      uint64_t fileNum,
+      StringIdLease fileNum,
       cache::AsyncDataCache* cache,
       std::shared_ptr<cache::ScanTracker> tracker,
-      uint64_t groupId,
+      StringIdLease groupId,
       std::shared_ptr<IoStatistics> ioStats,
+      std::shared_ptr<filesystems::File::IoStats> fsStats,
       folly::Executor* executor,
       const io::ReaderOptions& readerOptions)
       : BufferedInput(std::move(input), readerOptions.memoryPool()),
         cache_(cache),
-        fileNum_(fileNum),
+        fileNum_(std::move(fileNum)),
         tracker_(std::move(tracker)),
-        groupId_(groupId),
+        groupId_(std::move(groupId)),
         ioStats_(std::move(ioStats)),
+        fsStats_(std::move(fsStats)),
         executor_(executor),
         fileSize_(input_->getLength()),
         options_(readerOptions) {
@@ -136,7 +140,7 @@ class CachedBufferedInput : public BufferedInput {
   void setNumStripes(int32_t numStripes) override {
     auto stats = tracker_->fileGroupStats();
     if (stats) {
-      stats->recordFile(fileNum_, groupId_, numStripes);
+      stats->recordFile(fileNum_.id(), groupId_.id(), numStripes);
     }
   }
 
@@ -148,6 +152,7 @@ class CachedBufferedInput : public BufferedInput {
         tracker_,
         groupId_,
         ioStats_,
+        fsStats_,
         executor_,
         options_);
   }
@@ -171,15 +176,27 @@ class CachedBufferedInput : public BufferedInput {
   }
 
  private:
-  // Sorts requests and makes CoalescedLoads for nearby requests. If 'prefetch'
-  // is true, starts background loading.
-  void makeLoads(std::vector<CacheRequest*> requests, bool prefetch);
+  template <bool kSsd>
+  std::vector<int32_t> groupRequests(
+      const std::vector<CacheRequest*>& requests,
+      bool prefetch) const;
 
   // Makes a CoalescedLoad for 'requests' to be read together, coalescing IO is
   // appropriate. If 'prefetch' is set, schedules the CoalescedLoad on
   // 'executor_'. Links the CoalescedLoad to all CacheInputStreams that it
   // concerns.
   void readRegion(const std::vector<CacheRequest*>& requests, bool prefetch);
+
+  // Read coalesced regions.  Regions are grouped together using `groupEnds'.
+  // For example if there are 5 regions, 1 and 2 are coalesced together and 3,
+  // 4, 5 are coalesced together, we will have {2, 5} in `groupEnds'.
+  void readRegions(
+      const std::vector<CacheRequest*>& requests,
+      bool prefetch,
+      const std::vector<int32_t>& groupEnds);
+
+  template <bool kSsd>
+  void makeLoads(std::vector<CacheRequest*> requests[2]);
 
   // We only support up to 8MB load quantum size on SSD and there is no need for
   // larger SSD read size performance wise.
@@ -193,10 +210,11 @@ class CachedBufferedInput : public BufferedInput {
   }
 
   cache::AsyncDataCache* const cache_;
-  const uint64_t fileNum_;
+  const StringIdLease fileNum_;
   const std::shared_ptr<cache::ScanTracker> tracker_;
-  const uint64_t groupId_;
+  const StringIdLease groupId_;
   const std::shared_ptr<IoStatistics> ioStats_;
+  const std::shared_ptr<filesystems::File::IoStats> fsStats_;
   folly::Executor* const executor_;
   const uint64_t fileSize_;
   const io::ReaderOptions options_;

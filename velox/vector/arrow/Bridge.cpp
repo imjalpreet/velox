@@ -34,6 +34,10 @@ namespace {
 // and one for offsets (2).
 static constexpr size_t kMaxBuffers{3};
 
+void clearNullableFlag(int64_t& flags) {
+  flags = flags & (~ARROW_FLAG_NULLABLE);
+}
+
 // Structure that will hold the buffers needed by ArrowArray. This is opaquely
 // carried by ArrowArray.private_data
 class VeloxToArrowBridgeHolder {
@@ -68,7 +72,7 @@ class VeloxToArrowBridgeHolder {
   }
 
   const void** getArrowBuffers() {
-    return (const void**)&(buffers_[0]);
+    return reinterpret_cast<const void**>(&(buffers_[0]));
   }
 
   // Allocates space for `numChildren` ArrowArray pointers.
@@ -528,14 +532,14 @@ VectorPtr createFlatVector(
     memory::MemoryPool* pool,
     const TypePtr& type,
     BufferPtr nulls,
-    size_t length,
+    vector_size_t length,
     BufferPtr values,
     int64_t nullCount) {
   using T = typename TypeTraits<kind>::NativeType;
   return std::make_shared<FlatVector<T>>(
       pool,
       type,
-      nulls,
+      std::move(nulls),
       length,
       values,
       std::vector<BufferPtr>(),
@@ -560,7 +564,8 @@ VectorPtr createStringFlatVectorFromUtf8View(
       "Expecting three or more buffers as input for string view types.");
 
   // The last C data buffer stores buffer sizes
-  auto* bufferSizes = (uint64_t*)arrowArray.buffers[num_buffers - 1];
+  auto* bufferSizes =
+      reinterpret_cast<const uint64_t*>(arrowArray.buffers[num_buffers - 1]);
   std::vector<BufferPtr> stringViewBuffers(num_buffers - 3);
 
   // Skipping buffer_id = 0 (nulls buffer) and buffer_id = 1 (values buffer)
@@ -572,20 +577,21 @@ VectorPtr createStringFlatVectorFromUtf8View(
   BufferPtr stringViews =
       AlignedBuffer::allocate<StringView>(arrowArray.length, pool);
   auto* rawStringViews = stringViews->asMutable<uint64_t>();
-  auto* rawNulls = nulls->as<uint64_t>();
 
   // Full copy for inline strings (length <= 12). For non-inline strings,
   // convert 16-byte Arrow Utf8View [4-byte length, 4-byte prefix, 4-byte
   // buffer-index, 4-byte buffer-offset] to 16-byte Velox StringView [4-byte
   // length, 4-byte prefix, 8-byte buffer-ptr]
   for (int32_t idx_64 = 0; idx_64 < arrowArray.length; ++idx_64) {
-    auto* view = (uint32_t*)(&((uint64_t*)arrowArray.buffers[1])[2 * idx_64]);
-    rawStringViews[2 * idx_64] = *(uint64_t*)view;
+    auto* view = reinterpret_cast<const uint32_t*>(&(
+        reinterpret_cast<const uint64_t*>(arrowArray.buffers[1]))[2 * idx_64]);
+    rawStringViews[2 * idx_64] = *reinterpret_cast<const uint64_t*>(view);
     if (view[0] > 12)
       rawStringViews[2 * idx_64 + 1] =
-          (uint64_t)arrowArray.buffers[2 + view[2]] + view[3];
+          reinterpret_cast<uint64_t>(arrowArray.buffers[2 + view[2]]) + view[3];
     else
-      rawStringViews[2 * idx_64 + 1] = *(uint64_t*)&view[2];
+      rawStringViews[2 * idx_64 + 1] =
+          *reinterpret_cast<const uint64_t*>(&view[2]);
   }
 
   return std::make_shared<FlatVector<StringView>>(
@@ -605,7 +611,7 @@ VectorPtr createStringFlatVector(
     memory::MemoryPool* pool,
     const TypePtr& type,
     BufferPtr nulls,
-    size_t length,
+    vector_size_t length,
     const TOffset* offsets,
     const char* values,
     int64_t nullCount,
@@ -628,7 +634,7 @@ VectorPtr createStringFlatVector(
   return std::make_shared<FlatVector<StringView>>(
       pool,
       type,
-      nulls,
+      std::move(nulls),
       length,
       stringViews,
       std::move(stringViewBuffers),
@@ -774,18 +780,19 @@ void exportViews(
       stringBufferVec.begin(),
       stringBufferVec.end(),
       [&out](const auto& lhs, const auto& rhs) {
-        return ((uint64_t*)&out.buffers[2])[lhs] <
-            ((uint64_t*)&out.buffers[2])[rhs];
+        return reinterpret_cast<uint64_t*>(&out.buffers[2])[lhs] <
+            reinterpret_cast<uint64_t*>(&out.buffers[2])[rhs];
       });
 
-  auto utf8Views = (uint64_t*)out.buffers[1];
+  auto utf8Views = reinterpret_cast<const uint64_t*>(out.buffers[1]);
   int32_t bufferIdxCache = 0;
   uint64_t bufferAddrCache = 0;
 
   rows.apply([&](vector_size_t i) {
-    auto view = (uint32_t*)&utf8Views[2 * i];
+    auto view = const_cast<uint32_t*>(
+        reinterpret_cast<const uint32_t*>(&utf8Views[2 * i]));
     if (!vec.isNullAt(i) && view[0] > 12) {
-      uint64_t currAddr = *(uint64_t*)&view[2];
+      const uint64_t currAddr = *reinterpret_cast<uint64_t*>(&view[2]);
       // 2. Search for correct index with the buffer-pointer as key. Cache the
       // found buffer's address and index in bufferAddrCache and bufferIdxCache
       // respectively
@@ -797,9 +804,9 @@ void exportViews(
             stringBufferVec.end(),
             currAddr,
             [&out](const auto& lhs, const auto& rhs) {
-              return lhs < ((uint64_t*)&out.buffers[2])[rhs];
+              return lhs < (reinterpret_cast<uint64_t*>(&out.buffers[2]))[rhs];
             }));
-        bufferAddrCache = ((uint64_t*)&out.buffers[2])[*it];
+        bufferAddrCache = (reinterpret_cast<uint64_t*>(&out.buffers[2]))[*it];
         bufferIdxCache = *it;
       }
       view[2] = bufferIdxCache;
@@ -1429,6 +1436,11 @@ void exportToArrow(
         0, newArrowSchema("i", "run_ends"), arrowSchema);
     bridgeHolder->setChildAtIndex(1, std::move(valuesChild), arrowSchema);
   } else {
+    if (vec->encoding() == VectorEncoding::Simple::CONSTANT &&
+        options.flattenConstant) {
+      VELOX_CHECK(
+          vec->isScalar(), "Flattening is only supported for scalar types.");
+    }
     arrowSchema.format =
         exportArrowFormatStr(type, options, bridgeHolder->formatBuffer);
     arrowSchema.dictionary = nullptr;
@@ -1447,6 +1459,10 @@ void exportToArrow(
           maps.getNullCount());
       exportToArrow(rows, *child, options);
       child->name = "entries";
+      // Map data should be a non-nullable struct type.
+      clearNullableFlag(child->flags);
+      // Map data key type should be non-nullable.
+      clearNullableFlag(child->children[0]->flags);
       bridgeHolder->setChildAtIndex(0, std::move(child), arrowSchema);
 
     } else if (type->kind() == TypeKind::ARRAY) {
@@ -1821,7 +1837,7 @@ VectorPtr createTimestampVector(
     TimestampUnit unit,
     BufferPtr nulls,
     const int64_t* input,
-    size_t length,
+    vector_size_t length,
     int64_t nullCount) {
   BufferPtr timestamps = AlignedBuffer::allocate<Timestamp>(length, pool);
   auto* rawTimestamps = timestamps->asMutable<Timestamp>();
@@ -1833,7 +1849,7 @@ VectorPtr createTimestampVector(
   return std::make_shared<FlatVector<Timestamp>>(
       pool,
       type,
-      nulls,
+      std::move(nulls),
       length,
       timestamps,
       std::vector<BufferPtr>(),
@@ -1847,7 +1863,7 @@ VectorPtr createShortDecimalVector(
     const TypePtr& type,
     BufferPtr nulls,
     const int128_t* input,
-    size_t length,
+    vector_size_t length,
     int64_t nullCount) {
   auto values = AlignedBuffer::allocate<int64_t>(length, pool);
   auto rawValues = values->asMutable<int64_t>();
@@ -1856,7 +1872,37 @@ VectorPtr createShortDecimalVector(
   }
 
   return createFlatVector<TypeKind::BIGINT>(
-      pool, type, nulls, length, values, nullCount);
+      pool, type, std::move(nulls), length, values, nullCount);
+}
+
+// Arrow uses two uint64_t values to represent a 128-bit decimal value. The
+// memory allocated by Arrow might not be 16-byte aligned, so we need to copy
+// the values to a new buffer to ensure 16-byte alignment.
+VectorPtr createLongDecimalVector(
+    memory::MemoryPool* pool,
+    const TypePtr& type,
+    BufferPtr nulls,
+    const int128_t* input,
+    vector_size_t length,
+    int64_t nullCount,
+    WrapInBufferViewFunc wrapInBufferView) {
+  if ((reinterpret_cast<uintptr_t>(input) & 0xf) == 0) {
+    // If the input is already 16-byte aligned, copy is not needed.
+    return createFlatVector<TypeKind::HUGEINT>(
+        pool,
+        type,
+        std::move(nulls),
+        length,
+        wrapInBufferView(input, length * type->cppSizeInBytes()),
+        nullCount);
+  }
+
+  auto values = AlignedBuffer::allocate<int128_t>(length, pool);
+  auto rawValues = values->asMutable<int128_t>();
+  memcpy(rawValues, input, length * sizeof(int128_t));
+
+  return createFlatVector<TypeKind::HUGEINT>(
+      pool, type, std::move(nulls), length, values, nullCount);
 }
 
 bool isREE(const ArrowSchema& arrowSchema) {
@@ -1953,6 +1999,15 @@ VectorPtr importFromArrowImpl(
         static_cast<const int128_t*>(arrowArray.buffers[1]),
         arrowArray.length,
         arrowArray.null_count);
+  } else if (type->isLongDecimal()) {
+    return createLongDecimalVector(
+        pool,
+        type,
+        nulls,
+        static_cast<const int128_t*>(arrowArray.buffers[1]),
+        arrowArray.length,
+        arrowArray.null_count,
+        wrapInBufferView);
   } else if (type->isRow()) {
     // Row/structs.
     return createRowVector(

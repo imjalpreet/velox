@@ -52,7 +52,6 @@ FileInputStream::~FileInputStream() {
 
 void FileInputStream::readNextRange() {
   VELOX_CHECK(current_ == nullptr || current_->availableBytes() == 0);
-  ranges_.clear();
   current_ = nullptr;
 
   int32_t readBytes{0};
@@ -72,14 +71,13 @@ void FileInputStream::readNextRange() {
       readBytes = readSize();
       VELOX_CHECK_LT(
           0, readBytes, "Read past end of FileInputStream {}", fileSize_);
-      NanosecondTimer timer{&readTimeNs};
+      NanosecondTimer timer_2{&readTimeNs};
       file_->pread(fileOffset_, readBytes, buffer()->asMutable<char>());
     }
   }
 
-  ranges_.resize(1);
-  ranges_[0] = {buffer()->asMutable<uint8_t>(), readBytes, 0};
-  current_ = ranges_.data();
+  range_ = {buffer()->asMutable<uint8_t>(), readBytes, 0};
+  current_ = &range_;
   fileOffset_ += readBytes;
 
   updateStats(readBytes, readTimeNs);
@@ -185,7 +183,7 @@ void FileInputStream::readBytes(uint8_t* bytes, int32_t size) {
   }
 }
 
-std::string_view FileInputStream::nextView(int32_t size) {
+std::string_view FileInputStream::nextView(int64_t size) {
   VELOX_CHECK_GE(size, 0, "Attempting to view negative number of bytes");
   if (remainingSize() == 0) {
     return std::string_view(nullptr, 0);

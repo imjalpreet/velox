@@ -29,7 +29,8 @@ PartitionIdGenerator::PartitionIdGenerator(
     uint32_t maxPartitions,
     memory::MemoryPool* pool,
     bool partitionPathAsLowerCase)
-    : partitionChannels_(std::move(partitionChannels)),
+    : pool_(pool),
+      partitionChannels_(std::move(partitionChannels)),
       maxPartitions_(maxPartitions),
       partitionPathAsLowerCase_(partitionPathAsLowerCase) {
   VELOX_USER_CHECK(
@@ -96,9 +97,11 @@ void PartitionIdGenerator::run(
   }
 }
 
-std::string PartitionIdGenerator::partitionName(uint64_t partitionId) const {
+std::string PartitionIdGenerator::partitionName(
+    uint64_t partitionId,
+    const std::string& nullValueName) const {
   return FileUtils::makePartName(
-      extractPartitionKeyValues(partitionValues_, partitionId),
+      extractPartitionKeyValues(partitionValues_, partitionId, nullValueName),
       partitionPathAsLowerCase_);
 }
 
@@ -154,7 +157,7 @@ void PartitionIdGenerator::updateValueToPartitionIdMapping() {
 
   partitionIds_.clear();
 
-  raw_vector<uint64_t> newValueIds(numPartitions);
+  raw_vector<uint64_t> newValueIds(numPartitions, pool_);
   SelectivityVector rows(numPartitions);
   for (auto i = 0; i < hashers_.size(); ++i) {
     auto& hasher = hashers_[i];

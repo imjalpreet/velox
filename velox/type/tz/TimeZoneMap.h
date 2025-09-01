@@ -18,8 +18,9 @@
 
 #include <chrono>
 #include <string>
+#include <vector>
 
-namespace facebook::velox::date {
+namespace facebook::velox::tzdb {
 class time_zone;
 }
 
@@ -28,13 +29,13 @@ namespace facebook::velox::tz {
 /// This library provides time zone management primitives. It maintains an
 /// internal static database which is contructed lazily based on the first
 /// access, based on TimeZoneDatabase.cpp and the local tzdata installed in your
-/// system (through velox/external/date).
+/// system (through velox/external/tzdata).
 ///
 /// It provides functions for one to lookup TimeZone pointers based on time zone
 /// name or ID, and to performance timestamp conversion across time zones.
 ///
 /// This library provides a layer of functionality on top of
-/// velox/external/date, so do not use the external library directly for
+/// velox/external/tzdata, so do not use the external library directly for
 /// time zone routines.
 
 class TimeZone;
@@ -63,6 +64,9 @@ int16_t getTimeZoneID(std::string_view timeZone, bool failOnError = true);
 /// [-14:00, +14:00] range.
 int16_t getTimeZoneID(int32_t offsetMinutes);
 
+/// Returns all valid time zone IDs.
+std::vector<int16_t> getTimeZoneIDs();
+
 // Validates that the time point can be safely used by the external date
 // library.
 template <typename T>
@@ -88,7 +92,7 @@ class TimeZone {
   TimeZone(
       std::string_view timeZoneName,
       int16_t timeZoneID,
-      const date::time_zone* tz)
+      const tzdb::time_zone* tz)
       : tz_(tz),
         offset_(0),
         timeZoneName_(timeZoneName),
@@ -108,7 +112,12 @@ class TimeZone {
   TimeZone(const TimeZone&) = delete;
   TimeZone& operator=(const TimeZone&) = delete;
 
+  friend std::ostream& operator<<(std::ostream& os, const TimeZone& timezone) {
+    return os << timezone.name();
+  }
+
   using seconds = std::chrono::seconds;
+  using milliseconds = std::chrono::milliseconds;
 
   /// Converts a local time (the time as perceived in the user time zone
   /// represented by this object) to a system time (the corresponding time in
@@ -116,8 +125,8 @@ class TimeZone {
   ///
   /// Conversions from local time to GMT are non-linear and may be ambiguous
   /// during day light savings transitions, or non existent. By default (kFail),
-  /// `to_sys()` will throw `date::ambiguous_local_time` and
-  /// `date::nonexistent_local_time` in these cases.
+  /// `to_sys()` will throw `tzdb::ambiguous_local_time` and
+  /// `tzdb::nonexistent_local_time` in these cases.
   ///
   /// You can overwrite the behavior in ambiguous conversions by setting the
   /// TChoose flag, but it will still throws in case of nonexistent conversions.
@@ -128,12 +137,23 @@ class TimeZone {
   };
 
   seconds to_sys(seconds timestamp, TChoose choose = TChoose::kFail) const;
+  milliseconds to_sys(milliseconds timestamp, TChoose choose = TChoose::kFail)
+      const;
 
   /// Do the opposite conversion. Taking a system time (the time as perceived in
   /// GMT), convert to the same instant in time as observed in the user local
   /// time represented by this object). Note that this conversion is not
   /// susceptible to the error above.
   seconds to_local(seconds timestamp) const;
+  milliseconds to_local(milliseconds timestamp) const;
+
+  /// If a local time is nonexistent, i.e. refers to a time that exists in the
+  /// gap during a time zone conversion, this returns the time adjusted by
+  /// the difference between the two time zones, so that it lies in the later
+  /// time zone.
+  ///
+  /// If the local time exists then the same time is returned.
+  seconds correct_nonexistent_time(seconds timestamp) const;
 
   const std::string& name() const {
     return timeZoneName_;
@@ -143,12 +163,28 @@ class TimeZone {
     return timeZoneID_;
   }
 
-  const date::time_zone* tz() const {
+  const tzdb::time_zone* tz() const {
     return tz_;
   }
 
+  /// Returns the short name (abbreviation) of the time zone for the given
+  /// timestamp. Note that the timestamp is needed for time zones that support
+  /// daylight savings time as the short name will change depending on the date
+  /// (e.g. PST/PDT).
+  std::string getShortName(
+      milliseconds timestamp,
+      TChoose choose = TChoose::kFail) const;
+
+  /// Returns the long name of the time zone for the given timestamp, e.g.
+  /// Pacific Standard Time.  Note that the timestamp is needed for time zones
+  /// that support daylight savings time as the long name will change depending
+  /// on the date (e.g. Pacific Standard Time vs Pacific Daylight Time).
+  std::string getLongName(
+      milliseconds timestamp,
+      TChoose choose = TChoose::kFail) const;
+
  private:
-  const date::time_zone* tz_{nullptr};
+  const tzdb::time_zone* tz_{nullptr};
   const std::chrono::minutes offset_{0};
   const std::string timeZoneName_;
   const int16_t timeZoneID_;

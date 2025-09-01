@@ -96,28 +96,12 @@ class PrefixSortIterator {
     return (prefix_ - other.prefix_) / other.entrySize_;
   }
 
-  FOLLY_ALWAYS_INLINE bool operator<(const PrefixSortIterator& other) const {
-    return prefix_ < other.prefix_;
-  }
-
-  FOLLY_ALWAYS_INLINE bool operator>(const PrefixSortIterator& other) const {
-    return prefix_ > other.prefix_;
-  }
-
-  FOLLY_ALWAYS_INLINE bool operator>=(const PrefixSortIterator& other) const {
-    return prefix_ >= other.prefix_;
-  }
-
-  FOLLY_ALWAYS_INLINE bool operator<=(const PrefixSortIterator& other) const {
-    return prefix_ <= other.prefix_;
-  }
-
   FOLLY_ALWAYS_INLINE bool operator==(const PrefixSortIterator& other) const {
     return prefix_ == other.prefix_;
   }
 
-  FOLLY_ALWAYS_INLINE bool operator!=(const PrefixSortIterator& other) const {
-    return prefix_ != other.prefix_;
+  FOLLY_ALWAYS_INLINE auto operator<=>(const PrefixSortIterator& other) const {
+    return prefix_ <=> other.prefix_;
   }
 
  private:
@@ -252,7 +236,7 @@ class PrefixSortRunner {
       const detail::PrefixSortIterator& start,
       const detail::PrefixSortIterator& end,
       TCompare compare) const {
-    VELOX_CHECK(end >= start, "Invalid sort range.")
+    VELOX_CHECK(end >= start, "Invalid sort range.");
     const uint64_t len = end - start;
 
     // Insertion sort on smallest arrays

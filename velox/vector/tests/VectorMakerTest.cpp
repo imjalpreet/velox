@@ -17,17 +17,19 @@
 #include <gtest/gtest.h>
 
 #include "velox/common/base/VeloxException.h"
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/common/testutil/OptionalEmpty.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
-using namespace facebook::velox;
-using facebook::velox::test::VectorMaker;
+namespace facebook::velox::test {
+namespace {
 
 class VectorMakerTest : public ::testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   std::shared_ptr<memory::MemoryPool> pool_{
@@ -479,13 +481,13 @@ TEST_F(VectorMakerTest, nestedArrayVectorFromJson) {
       {{2, 3, 4}},
       {{std::nullopt, 7}},
       {{1, 3, 7, 9}},
-      {{}},
+      common::testutil::optionalEmpty,
       {{std::nullopt}},
       {{1, 2, std::nullopt}},
-      {{}},
+      common::testutil::optionalEmpty,
       std::nullopt,
       {{1, 2, 3}},
-      {{}},
+      common::testutil::optionalEmpty,
       {{4, 5}},
   });
 
@@ -596,7 +598,9 @@ TEST_F(VectorMakerTest, arrayOfRowVectorFromTuples) {
   auto expected = maker_.arrayVector(offsets, elements);
 
   ASSERT_EQ(expected->size(), arrayVector->size());
-  ASSERT_EQ(*expected->type(), *arrayVector->type());
+  // check equivalent because arrayVector's row type doesn't have name for each
+  // column ('', '' ..) whereas expected's row type have names ('c0', 'c1' ..)
+  ASSERT_TRUE((*expected->type()).equivalent((*arrayVector->type())));
   for (auto i = 0; i < expected->size(); i++) {
     ASSERT_TRUE(expected->equalValueAt(arrayVector.get(), i, i));
   }
@@ -687,16 +691,6 @@ TEST_F(VectorMakerTest, mapVectorUsingKeyValueVectorsUnevenKeysValues) {
   // Create map vector with uneven keys and values, should fail.
   auto values = maker_.flatVector<int64_t>({7, 8, 9});
   EXPECT_THROW(maker_.mapVector({0, 2, 4}, keys, values), VeloxRuntimeError);
-}
-
-TEST_F(VectorMakerTest, mapVectorUsingKeyValueVectorsNullsInvalidIndices) {
-  auto keys = maker_.flatVector<int32_t>({0, 1, 2, 3, 4, 5});
-  auto values = maker_.flatVector<int64_t>({6, 7, 8, 9, 10, 11});
-
-  // The middle map is NULL, but according to the offsets it has size 2, this
-  // should fail.
-  EXPECT_THROW(
-      maker_.mapVector({0, 2, 4}, keys, values, {1}), VeloxRuntimeError);
 }
 
 TEST_F(VectorMakerTest, mapVectorStringString) {
@@ -808,6 +802,79 @@ TEST_F(VectorMakerTest, mapVectorFromJson) {
 
     EXPECT_TRUE(values->isNullAt(index));
   }
+}
+
+TEST_F(VectorMakerTest, flatMapVector) {
+  // Empty.
+  auto flatMapVector = maker_.flatMapVector<int64_t, float>({});
+  EXPECT_EQ(flatMapVector->size(), 0);
+  EXPECT_EQ(*MAP(BIGINT(), REAL()), *flatMapVector->type());
+  EXPECT_NE(flatMapVector->distinctKeys(), nullptr);
+  EXPECT_EQ(flatMapVector->distinctKeys()->size(), 0);
+  EXPECT_EQ(flatMapVector->numDistinctKeys(), 0);
+  EXPECT_TRUE(flatMapVector->mapValues().empty());
+  EXPECT_FALSE(flatMapVector->mayHaveNulls());
+
+  VELOX_ASSERT_THROW(flatMapVector->sizeAt(0), "");
+  VELOX_ASSERT_THROW(
+      flatMapVector->mapValuesAt(0),
+      "(0 vs. 0) Trying to access non-existing key channel in FlatMapVector.");
+
+  // With some data.
+  flatMapVector = maker_.flatMapVector<std::string, std::string>({
+      {{"a", "1"}, {"b", "2"}},
+      {{"a", "This is a test"}, {"b", "This is another test"}, {"c", "test"}},
+      {{"b", "5"}, {"d", "last"}},
+  });
+
+  EXPECT_EQ(flatMapVector->size(), 3);
+  EXPECT_EQ(*MAP(VARCHAR(), VARCHAR()), *flatMapVector->type());
+  EXPECT_FALSE(flatMapVector->mayHaveNulls());
+
+  auto distinctKeys = flatMapVector->distinctKeys();
+  EXPECT_NE(distinctKeys, nullptr);
+  EXPECT_EQ(distinctKeys->size(), 4);
+  EXPECT_EQ(flatMapVector->numDistinctKeys(), 4);
+
+  EXPECT_EQ(flatMapVector->sizeAt(0), 2);
+  EXPECT_EQ(flatMapVector->sizeAt(1), 3);
+  EXPECT_EQ(flatMapVector->sizeAt(2), 2);
+
+  auto firstKey = flatMapVector->mapValuesAt(0)->as<FlatVector<StringView>>();
+  EXPECT_EQ(firstKey->size(), 3);
+  EXPECT_EQ(firstKey->valueAt(0), "1");
+  EXPECT_EQ(firstKey->valueAt(1), "This is a test");
+  EXPECT_TRUE(firstKey->isNullAt(2)); // not in map is also set to null.
+
+  // Nullable.
+  flatMapVector = maker_.flatMapVectorNullable<int64_t, int64_t>({
+      std::nullopt,
+      // empty vector/map.
+      std::vector<std::pair<int64_t, std::optional<int64_t>>>{},
+      {{{42L, std::nullopt}}},
+  });
+
+  EXPECT_EQ(flatMapVector->size(), 3);
+  EXPECT_EQ(*MAP(BIGINT(), BIGINT()), *flatMapVector->type());
+  EXPECT_TRUE(flatMapVector->mayHaveNulls());
+
+  // Top-level nulls.
+  EXPECT_TRUE(flatMapVector->isNullAt(0));
+  EXPECT_FALSE(flatMapVector->isNullAt(1));
+  EXPECT_FALSE(flatMapVector->isNullAt(2));
+
+  // Check sizes of maps for each row.
+  EXPECT_EQ(flatMapVector->sizeAt(0), 0);
+  EXPECT_EQ(flatMapVector->sizeAt(1), 0);
+  EXPECT_EQ(flatMapVector->sizeAt(2), 1);
+
+  // Check values for projected key 42.
+  auto projectedKey = flatMapVector->projectKey((int64_t)42);
+  EXPECT_NE(projectedKey, nullptr);
+
+  EXPECT_TRUE(projectedKey->isNullAt(0)); // not in map.
+  EXPECT_TRUE(projectedKey->isNullAt(1)); // not in map.
+  EXPECT_TRUE(projectedKey->isNullAt(2)); // actual null.
 }
 
 TEST_F(VectorMakerTest, biasVector) {
@@ -1028,3 +1095,6 @@ TEST_F(VectorMakerTest, isSorted) {
           ->isSorted()
           .value());
 }
+
+} // namespace
+} // namespace facebook::velox::test

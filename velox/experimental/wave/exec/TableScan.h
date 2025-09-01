@@ -30,7 +30,8 @@ class TableScan : public WaveSourceOperator {
   TableScan(
       CompileState& state,
       int32_t operatorId,
-      const core::TableScanNode& tableScanNode)
+      const core::TableScanNode& tableScanNode,
+      DefinesMap defines)
       : WaveSourceOperator(
             state,
             tableScanNode.outputType(),
@@ -47,10 +48,11 @@ class TableScan : public WaveSourceOperator {
         readBatchSize_(driverCtx_->task->queryCtx()
                            ->queryConfig()
                            .preferredOutputBatchRows()) {
+    defines_ = std::move(defines);
     connector_ = connector::getConnector(tableHandle_->connectorId());
   }
 
-  AdvanceResult canAdvance(WaveStream& stream) override;
+  std::vector<AdvanceResult> canAdvance(WaveStream& stream) override;
 
   void schedule(WaveStream& stream, int32_t maxRows = 0) override;
 
@@ -58,18 +60,10 @@ class TableScan : public WaveSourceOperator {
     return true;
   }
 
-  exec::BlockingReason isBlocked(ContinueFuture* future) override;
+  exec::BlockingReason isBlocked(WaveStream& /*stream*/, ContinueFuture* future)
+      override;
 
   bool isFinished() const override;
-
-  bool canAddDynamicFilter() const override {
-    return true;
-  }
-
-  void addDynamicFilter(
-      const core::PlanNodeId& producer,
-      column_index_t outputChannel,
-      const std::shared_ptr<common::Filter>& filter) override;
 
   static uint64_t ioWaitNanos() {
     return ioWaitNanos_;
@@ -106,22 +100,16 @@ class TableScan : public WaveSourceOperator {
   // Process-wide IO wait time.
   static std::atomic<uint64_t> ioWaitNanos_;
 
-  const std::shared_ptr<connector::ConnectorTableHandle> tableHandle_;
-  const std::
-      unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
-          columnHandles_;
+  const connector::ConnectorTableHandlePtr tableHandle_;
+  const connector::ColumnHandleMap columnHandles_;
   exec::DriverCtx* const driverCtx_;
   memory::MemoryPool* const connectorPool_;
   ContinueFuture blockingFuture_{ContinueFuture::makeEmpty()};
   exec::BlockingReason blockingReason_;
-  int64_t currentSplitWeight_{0};
   bool needNewSplit_ = true;
   std::shared_ptr<connector::Connector> connector_;
   std::shared_ptr<connector::ConnectorQueryCtx> connectorQueryCtx_;
   bool noMoreSplits_ = false;
-  // Dynamic filters to add to the data source when it gets created.
-  std::unordered_map<column_index_t, std::shared_ptr<common::Filter>>
-      pendingDynamicFilters_;
 
   std::shared_ptr<connector::DataSource> dataSource_;
 
@@ -146,13 +134,6 @@ class TableScan : public WaveSourceOperator {
   int32_t numReadyPreloadedSplits_{0};
 
   vector_size_t readBatchSize_;
-  vector_size_t maxReadBatchSize_;
-
-  // Exits getOutput() method after this many milliseconds.
-  // Zero means 'no limit'.
-  size_t getOutputTimeLimitMs_{0};
-
-  double maxFilteringRatio_{0};
 
   // String shown in ExceptionContext inside DataSource and LazyVector loading.
   std::string debugString_;

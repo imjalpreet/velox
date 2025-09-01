@@ -31,8 +31,12 @@ SelectiveTimestampColumnReader::SelectiveTimestampColumnReader(
           params.stripeStreams().rowReaderOptions().timestampPrecision()) {
   EncodingKey encodingKey{fileType_->id(), params.flatMapContext().sequence};
   auto& stripe = params.stripeStreams();
-  version_ = convertRleVersion(stripe.getEncoding(encodingKey).kind());
-  auto data = encodingKey.forKind(proto::Stream_Kind_DATA);
+  version_ = convertRleVersion(stripe, encodingKey);
+  auto data = StripeStreamsUtil::getStreamForKind(
+      stripe,
+      encodingKey,
+      proto::Stream_Kind_DATA,
+      proto::orc::Stream_Kind_DATA);
   bool vints = stripe.getUseVInts(data);
   seconds_ = createRleDecoder</*isSigned=*/true>(
       stripe.getStream(data, params.streamLabels().label(), true),
@@ -40,7 +44,11 @@ SelectiveTimestampColumnReader::SelectiveTimestampColumnReader(
       *memoryPool_,
       vints,
       LONG_BYTE_SIZE);
-  auto nanoData = encodingKey.forKind(proto::Stream_Kind_NANO_DATA);
+  auto nanoData = StripeStreamsUtil::getStreamForKind(
+      stripe,
+      encodingKey,
+      proto::Stream_Kind_NANO_DATA,
+      proto::orc::Stream_Kind_SECONDARY);
   bool nanoVInts = stripe.getUseVInts(nanoData);
   nano_ = createRleDecoder</*isSigned=*/false>(
       stripe.getStream(nanoData, params.streamLabels().label(), true),
@@ -57,7 +65,7 @@ uint64_t SelectiveTimestampColumnReader::skip(uint64_t numValues) {
   return numValues;
 }
 
-void SelectiveTimestampColumnReader::seekToRowGroup(uint32_t index) {
+void SelectiveTimestampColumnReader::seekToRowGroup(int64_t index) {
   SelectiveColumnReader::seekToRowGroup(index);
   auto positionsProvider = formatData_->seekToRowGroup(index);
   seconds_->seekToRowGroup(positionsProvider);
@@ -67,7 +75,7 @@ void SelectiveTimestampColumnReader::seekToRowGroup(uint32_t index) {
 }
 
 void SelectiveTimestampColumnReader::read(
-    vector_size_t offset,
+    int64_t offset,
     const RowSet& rows,
     const uint64_t* incomingNulls) {
   prepareRead<int64_t>(offset, rows, incomingNulls);
@@ -92,7 +100,7 @@ void SelectiveTimestampColumnReader::read(
 
 template <bool isDense>
 void SelectiveTimestampColumnReader::readHelper(
-    common::Filter* filter,
+    const common::Filter* filter,
     const RowSet& rows) {
   ExtractToReader extractValues(this);
   common::AlwaysTrue alwaysTrue;

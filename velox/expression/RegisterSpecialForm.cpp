@@ -20,6 +20,7 @@
 #include "velox/expression/CastExpr.h"
 #include "velox/expression/CoalesceExpr.h"
 #include "velox/expression/ConjunctExpr.h"
+#include "velox/expression/ExprConstants.h"
 #include "velox/expression/FunctionCallToSpecialForm.h"
 #include "velox/expression/RowConstructor.h"
 #include "velox/expression/SpecialFormRegistry.h"
@@ -29,21 +30,23 @@
 namespace facebook::velox::exec {
 void registerFunctionCallToSpecialForms() {
   registerFunctionCallToSpecialForm(
-      "and", std::make_unique<ConjunctCallToSpecialForm>(true /* isAnd */));
+      expression::kAnd,
+      std::make_unique<ConjunctCallToSpecialForm>(true /* isAnd */));
   registerFunctionCallToSpecialForm(
-      "cast", std::make_unique<CastCallToSpecialForm>());
+      expression::kCast, std::make_unique<CastCallToSpecialForm>());
   registerFunctionCallToSpecialForm(
-      "try_cast", std::make_unique<TryCastCallToSpecialForm>());
+      expression::kTryCast, std::make_unique<TryCastCallToSpecialForm>());
   registerFunctionCallToSpecialForm(
-      "coalesce", std::make_unique<CoalesceCallToSpecialForm>());
+      expression::kCoalesce, std::make_unique<CoalesceCallToSpecialForm>());
   registerFunctionCallToSpecialForm(
-      "if", std::make_unique<IfCallToSpecialForm>());
+      expression::kIf, std::make_unique<IfCallToSpecialForm>());
   registerFunctionCallToSpecialForm(
-      "or", std::make_unique<ConjunctCallToSpecialForm>(false /* isAnd */));
+      expression::kOr,
+      std::make_unique<ConjunctCallToSpecialForm>(false /* isAnd */));
   registerFunctionCallToSpecialForm(
-      "switch", std::make_unique<SwitchCallToSpecialForm>());
+      expression::kSwitch, std::make_unique<SwitchCallToSpecialForm>());
   registerFunctionCallToSpecialForm(
-      "try", std::make_unique<TryCallToSpecialForm>());
+      expression::kTry, std::make_unique<TryCallToSpecialForm>());
   registerFunctionCallToSpecialForm(
       RowConstructorCallToSpecialForm::kRowConstructor,
       std::make_unique<RowConstructorCallToSpecialForm>());

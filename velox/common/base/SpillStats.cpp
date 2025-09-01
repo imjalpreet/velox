@@ -44,6 +44,7 @@ SpillStats::SpillStats(
     uint64_t _spilledFiles,
     uint64_t _spillFillTimeNanos,
     uint64_t _spillSortTimeNanos,
+    uint64_t _spillExtractVectorTimeNanos,
     uint64_t _spillSerializationTimeNanos,
     uint64_t _spillWrites,
     uint64_t _spillFlushTimeNanos,
@@ -61,6 +62,7 @@ SpillStats::SpillStats(
       spilledFiles(_spilledFiles),
       spillFillTimeNanos(_spillFillTimeNanos),
       spillSortTimeNanos(_spillSortTimeNanos),
+      spillExtractVectorTimeNanos(_spillExtractVectorTimeNanos),
       spillSerializationTimeNanos(_spillSerializationTimeNanos),
       spillWrites(_spillWrites),
       spillFlushTimeNanos(_spillFlushTimeNanos),
@@ -80,6 +82,7 @@ SpillStats& SpillStats::operator+=(const SpillStats& other) {
   spilledFiles += other.spilledFiles;
   spillFillTimeNanos += other.spillFillTimeNanos;
   spillSortTimeNanos += other.spillSortTimeNanos;
+  spillExtractVectorTimeNanos += other.spillExtractVectorTimeNanos;
   spillSerializationTimeNanos += other.spillSerializationTimeNanos;
   spillWrites += other.spillWrites;
   spillFlushTimeNanos += other.spillFlushTimeNanos;
@@ -102,6 +105,10 @@ SpillStats SpillStats::operator-(const SpillStats& other) const {
   result.spilledFiles = spilledFiles - other.spilledFiles;
   result.spillFillTimeNanos = spillFillTimeNanos - other.spillFillTimeNanos;
   result.spillSortTimeNanos = spillSortTimeNanos - other.spillSortTimeNanos;
+  result.spillExtractVectorTimeNanos =
+      spillExtractVectorTimeNanos - other.spillExtractVectorTimeNanos;
+  result.spillDeserializationTimeNanos =
+      spillExtractVectorTimeNanos - other.spillExtractVectorTimeNanos;
   result.spillSerializationTimeNanos =
       spillSerializationTimeNanos - other.spillSerializationTimeNanos;
   result.spillWrites = spillWrites - other.spillWrites;
@@ -117,95 +124,6 @@ SpillStats SpillStats::operator-(const SpillStats& other) const {
   return result;
 }
 
-bool SpillStats::operator<(const SpillStats& other) const {
-  uint32_t gtCount{0};
-  uint32_t ltCount{0};
-#define UPDATE_COUNTER(counter)           \
-  do {                                    \
-    if (counter < other.counter) {        \
-      ++ltCount;                          \
-    } else if (counter > other.counter) { \
-      ++gtCount;                          \
-    }                                     \
-  } while (0);
-
-  UPDATE_COUNTER(spillRuns);
-  UPDATE_COUNTER(spilledInputBytes);
-  UPDATE_COUNTER(spilledBytes);
-  UPDATE_COUNTER(spilledRows);
-  UPDATE_COUNTER(spilledPartitions);
-  UPDATE_COUNTER(spilledFiles);
-  UPDATE_COUNTER(spillFillTimeNanos);
-  UPDATE_COUNTER(spillSortTimeNanos);
-  UPDATE_COUNTER(spillSerializationTimeNanos);
-  UPDATE_COUNTER(spillWrites);
-  UPDATE_COUNTER(spillFlushTimeNanos);
-  UPDATE_COUNTER(spillWriteTimeNanos);
-  UPDATE_COUNTER(spillMaxLevelExceededCount);
-  UPDATE_COUNTER(spillReadBytes);
-  UPDATE_COUNTER(spillReads);
-  UPDATE_COUNTER(spillReadTimeNanos);
-  UPDATE_COUNTER(spillDeserializationTimeNanos);
-#undef UPDATE_COUNTER
-  VELOX_CHECK(
-      !((gtCount > 0) && (ltCount > 0)),
-      "gtCount {} ltCount {}",
-      gtCount,
-      ltCount);
-  return ltCount > 0;
-}
-
-bool SpillStats::operator>(const SpillStats& other) const {
-  return !(*this < other) && (*this != other);
-}
-
-bool SpillStats::operator>=(const SpillStats& other) const {
-  return !(*this < other);
-}
-
-bool SpillStats::operator<=(const SpillStats& other) const {
-  return !(*this > other);
-}
-
-bool SpillStats::operator==(const SpillStats& other) const {
-  return std::tie(
-             spillRuns,
-             spilledInputBytes,
-             spilledBytes,
-             spilledRows,
-             spilledPartitions,
-             spilledFiles,
-             spillFillTimeNanos,
-             spillSortTimeNanos,
-             spillSerializationTimeNanos,
-             spillWrites,
-             spillFlushTimeNanos,
-             spillWriteTimeNanos,
-             spillMaxLevelExceededCount,
-             spillReadBytes,
-             spillReads,
-             spillReadTimeNanos,
-             spillDeserializationTimeNanos) ==
-      std::tie(
-             other.spillRuns,
-             other.spilledInputBytes,
-             other.spilledBytes,
-             other.spilledRows,
-             other.spilledPartitions,
-             other.spilledFiles,
-             other.spillFillTimeNanos,
-             other.spillSortTimeNanos,
-             other.spillSerializationTimeNanos,
-             other.spillWrites,
-             other.spillFlushTimeNanos,
-             other.spillWriteTimeNanos,
-             spillMaxLevelExceededCount,
-             spillReadBytes,
-             spillReads,
-             spillReadTimeNanos,
-             spillDeserializationTimeNanos);
-}
-
 void SpillStats::reset() {
   spillRuns = 0;
   spilledInputBytes = 0;
@@ -215,6 +133,7 @@ void SpillStats::reset() {
   spilledFiles = 0;
   spillFillTimeNanos = 0;
   spillSortTimeNanos = 0;
+  spillExtractVectorTimeNanos = 0;
   spillSerializationTimeNanos = 0;
   spillWrites = 0;
   spillFlushTimeNanos = 0;
@@ -230,7 +149,7 @@ std::string SpillStats::toString() const {
   return fmt::format(
       "spillRuns[{}] spilledInputBytes[{}] spilledBytes[{}] spilledRows[{}] "
       "spilledPartitions[{}] spilledFiles[{}] spillFillTimeNanos[{}] "
-      "spillSortTimeNanos[{}] spillSerializationTimeNanos[{}] spillWrites[{}] "
+      "spillSortTimeNanos[{}] spillExtractVectorTime[{}] spillSerializationTimeNanos[{}] spillWrites[{}] "
       "spillFlushTimeNanos[{}] spillWriteTimeNanos[{}] maxSpillExceededLimitCount[{}] "
       "spillReadBytes[{}] spillReads[{}] spillReadTimeNanos[{}] "
       "spillReadDeserializationTimeNanos[{}]",
@@ -242,6 +161,7 @@ std::string SpillStats::toString() const {
       spilledFiles,
       succinctNanos(spillFillTimeNanos),
       succinctNanos(spillSortTimeNanos),
+      succinctNanos(spillExtractVectorTimeNanos),
       succinctNanos(spillSerializationTimeNanos),
       spillWrites,
       succinctNanos(spillFlushTimeNanos),
@@ -281,6 +201,12 @@ void updateGlobalSpillFillTime(uint64_t timeNs) {
 void updateGlobalSpillSortTime(uint64_t timeNs) {
   RECORD_HISTOGRAM_METRIC_VALUE(kMetricSpillSortTimeMs, timeNs / 1'000'000);
   localSpillStats().wlock()->spillSortTimeNanos += timeNs;
+}
+
+void updateGlobalSpillExtractVectorTime(uint64_t timeNs) {
+  RECORD_HISTOGRAM_METRIC_VALUE(
+      kMetricSpillExtractVectorTimeMs, timeNs / 1'000'000);
+  localSpillStats().wlock()->spillExtractVectorTimeNanos += timeNs;
 }
 
 void updateGlobalSpillWriteStats(

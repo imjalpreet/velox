@@ -15,11 +15,11 @@
  */
 #include "gtest/gtest.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/core/Expressions.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/FieldReference.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/functions/prestosql/types/JsonType.h"
-#include "velox/parse/Expressions.h"
 #include "velox/parse/ExpressionsParser.h"
 #include "velox/parse/TypeResolver.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
@@ -32,7 +32,7 @@ class ExprCompilerTest : public testing::Test,
   static void SetUpTestCase() {
     parse::registerTypeResolver();
     functions::prestosql::registerAllScalarFunctions();
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -268,9 +268,7 @@ TEST_F(ExprCompilerTest, functionSignatureNotRegistered) {
 
   VELOX_ASSERT_THROW(
       compile(expression),
-      "Scalar function concat not registered with arguments: (BIGINT, BIGINT). "
-      "Found function registered with the following signatures:\n"
-      "((varchar,varchar...) -> varchar)");
+      "Scalar function concat not registered with arguments: (BIGINT, BIGINT)");
 }
 
 TEST_F(ExprCompilerTest, constantFromFlatVector) {

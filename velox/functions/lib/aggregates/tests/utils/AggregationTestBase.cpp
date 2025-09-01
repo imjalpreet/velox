@@ -21,8 +21,10 @@
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
+#include "velox/dwio/dwrf/RegisterDwrfReader.h"
 #include "velox/dwio/dwrf/writer/Writer.h"
 #include "velox/exec/AggregateCompanionSignatures.h"
+#include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/Spill.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
@@ -30,9 +32,8 @@
 #include "velox/expression/Expr.h"
 #include "velox/expression/SignatureBinder.h"
 
-using facebook::velox::exec::Spiller;
+using facebook::velox::exec::CursorParameters;
 using facebook::velox::exec::test::AssertQueryBuilder;
-using facebook::velox::exec::test::CursorParameters;
 using facebook::velox::exec::test::PlanBuilder;
 using facebook::velox::test::VectorMaker;
 
@@ -67,6 +68,8 @@ std::vector<RowVectorPtr> AggregationTestBase::makeVectors(
 void AggregationTestBase::SetUp() {
   OperatorTestBase::SetUp();
   filesystems::registerLocalFileSystem();
+  connector::registerConnectorFactory(
+      std::make_shared<connector::hive::HiveConnectorFactory>());
   auto hiveConnector =
       connector::getConnectorFactory(
           connector::hive::HiveConnectorFactory::kHiveConnectorName)
@@ -75,10 +78,14 @@ void AggregationTestBase::SetUp() {
               std::make_shared<config::ConfigBase>(
                   std::unordered_map<std::string, std::string>()));
   connector::registerConnector(hiveConnector);
+  dwrf::registerDwrfReaderFactory();
 }
 
 void AggregationTestBase::TearDown() {
+  dwrf::unregisterDwrfReaderFactory();
   connector::unregisterConnector(kHiveConnectorId);
+  connector::unregisterConnectorFactory(
+      connector::hive::HiveConnectorFactory::kHiveConnectorName);
   OperatorTestBase::TearDown();
 }
 
@@ -242,7 +249,7 @@ std::tuple<std::string, std::string, std::string> getCompanionAggregates(
 
   // Construct the extract expression. Rename the result of the extract
   // expression to be the same as the original aggregation result, so that
-  // post-aggregation proejctions, if exist, can apply with no change.
+  // post-aggregation projections, if exist, can apply with no change.
   std::string extractExpression;
   if (companionFunctions.extract.size() == 1) {
     extractExpression = fmt::format(
@@ -380,7 +387,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
   auto groupingKeysWithPartialKey = groupingKeys;
   groupingKeysWithPartialKey.push_back("k0");
 
-  std::vector<std::string> paritialAggregates;
+  std::vector<std::string> partialAggregates;
   std::vector<std::string> mergeAggregates;
   std::vector<std::string> extractExpressions;
   extractExpressions.insert(
@@ -392,14 +399,14 @@ void AggregationTestBase::testAggregationsWithCompanion(
         exec::getCompanionFunctionSignatures(functionNames[i]);
     VELOX_CHECK(companionSignatures.has_value());
 
-    const auto& [paritialAggregate, mergeAggregate, extractAggregate] =
+    const auto& [partialAggregate, mergeAggregate, extractAggregate] =
         getCompanionAggregates(
             i,
             *companionSignatures,
             functionNames[i],
             aggregateArgs[i],
             aggregatesArgTypes[i]);
-    paritialAggregates.push_back(paritialAggregate);
+    partialAggregates.push_back(partialAggregate);
     mergeAggregates.push_back(mergeAggregate);
     extractExpressions.push_back(extractAggregate);
   }
@@ -409,7 +416,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
     PlanBuilder builder(pool());
     builder.values(dataWithExtraGroupingKey);
     preAggregationProcessing(builder);
-    builder.partialAggregation(groupingKeysWithPartialKey, paritialAggregates)
+    builder.partialAggregation(groupingKeysWithPartialKey, partialAggregates)
         .finalAggregation()
         .partialAggregation(groupingKeys, mergeAggregates)
         .finalAggregation()
@@ -435,7 +442,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
     core::PlanNodeId partialNodeId;
     core::PlanNodeId finalNodeId;
     builder.localPartitionRoundRobinRow()
-        .partialAggregation(groupingKeysWithPartialKey, paritialAggregates)
+        .partialAggregation(groupingKeysWithPartialKey, partialAggregates)
         .capturePlanNodeId(partialNodeId)
         .localPartition(groupingKeysWithPartialKey)
         .finalAggregation()
@@ -491,7 +498,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
     PlanBuilder builder(pool());
     builder.values(dataWithExtraGroupingKey);
     preAggregationProcessing(builder);
-    builder.singleAggregation(groupingKeysWithPartialKey, paritialAggregates)
+    builder.singleAggregation(groupingKeysWithPartialKey, partialAggregates)
         .singleAggregation(groupingKeys, mergeAggregates)
         .project(extractExpressions);
 
@@ -509,7 +516,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
     PlanBuilder builder(pool());
     builder.values(dataWithExtraGroupingKey);
     preAggregationProcessing(builder);
-    builder.partialAggregation(groupingKeysWithPartialKey, paritialAggregates)
+    builder.partialAggregation(groupingKeysWithPartialKey, partialAggregates)
         .intermediateAggregation()
         .finalAggregation()
         .partialAggregation(groupingKeys, mergeAggregates)
@@ -531,7 +538,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
     PlanBuilder builder(pool());
     builder.values(dataWithExtraGroupingKey);
     preAggregationProcessing(builder);
-    builder.partialAggregation(groupingKeysWithPartialKey, paritialAggregates)
+    builder.partialAggregation(groupingKeysWithPartialKey, partialAggregates)
         .localPartition(groupingKeysWithPartialKey)
         .finalAggregation()
         .partialAggregation(groupingKeys, mergeAggregates)
@@ -554,7 +561,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
     PlanBuilder builder(pool());
     builder.values(dataWithExtraGroupingKey);
     preAggregationProcessing(builder);
-    builder.partialAggregation(groupingKeysWithPartialKey, paritialAggregates)
+    builder.partialAggregation(groupingKeysWithPartialKey, partialAggregates)
         .localPartition(groupingKeysWithPartialKey)
         .intermediateAggregation()
         .localPartition(groupingKeysWithPartialKey)
@@ -587,7 +594,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
       SCOPED_TRACE("Streaming partial");
       auto partialResult = validateStreamingInTestAggregations(
           [&](auto& builder) { builder.values(dataWithExtraGroupingKey); },
-          paritialAggregates,
+          partialAggregates,
           config);
 
       validateStreamingInTestAggregations(
@@ -1194,30 +1201,6 @@ void AggregationTestBase::testAggregations(
   }
 }
 
-namespace {
-std::pair<TypePtr, TypePtr> getResultTypes(
-    const std::string& name,
-    const std::vector<TypePtr>& rawInputTypes) {
-  auto signatures = exec::getAggregateFunctionSignatures(name);
-  if (!signatures.has_value()) {
-    VELOX_FAIL("Aggregate {} not registered", name);
-  }
-  for (auto& signature : signatures.value()) {
-    exec::SignatureBinder binder(*signature, rawInputTypes);
-    if (binder.tryBind()) {
-      auto intermediateType =
-          binder.tryResolveType(signature->intermediateType());
-      VELOX_CHECK(
-          intermediateType, "failed to resolve intermediate type for {}", name);
-      auto finalType = binder.tryResolveType(signature->returnType());
-      VELOX_CHECK(finalType, "failed to resolve final type for {}", name);
-      return {intermediateType, finalType};
-    }
-  }
-  VELOX_FAIL("Could not infer intermediate type for aggregate {}", name);
-}
-} // namespace
-
 VectorPtr AggregationTestBase::testStreaming(
     const std::string& functionName,
     bool testGlobal,
@@ -1246,7 +1229,8 @@ std::unique_ptr<exec::Aggregate> createAggregateFunction(
     const std::vector<TypePtr>& inputTypes,
     HashStringAllocator& allocator,
     const std::unordered_map<std::string, std::string>& config) {
-  auto [intermediateType, finalType] = getResultTypes(functionName, inputTypes);
+  auto [finalType, intermediateType] =
+      exec::resolveAggregateFunction(functionName, inputTypes);
   core::QueryConfig queryConfig({config});
   auto func = exec::Aggregate::create(
       functionName,
@@ -1256,10 +1240,6 @@ std::unique_ptr<exec::Aggregate> createAggregateFunction(
       queryConfig);
   func->setAllocator(&allocator);
   func->setOffsets(kOffset, 0, 1, 0, 2, kRowSizeOffset);
-
-  VELOX_CHECK(intermediateType->equivalent(
-      *func->intermediateType(functionName, inputTypes)));
-  VELOX_CHECK(finalType->equivalent(*func->resultType()));
 
   return func;
 }
@@ -1316,10 +1296,11 @@ void AggregationTestBase::testIncrementalAggregation(
     func->addSingleGroupRawInput(
         group.data(), SelectivityVector(inputSize), input, false);
 
+    auto [finalType, intermediateType] =
+        exec::resolveAggregateFunction(functionName, aggregate.rawInputTypes);
+
     // Extract intermediate result from the same accumulator twice and expect
     // results to be the same.
-    auto intermediateType =
-        func->intermediateType(functionName, aggregate.rawInputTypes);
     auto intermediateResult1 = BaseVector::create(intermediateType, 1, pool());
     auto intermediateResult2 = BaseVector::create(intermediateType, 1, pool());
     func->extractAccumulators(groups.data(), 1, &intermediateResult1);
@@ -1372,7 +1353,10 @@ VectorPtr AggregationTestBase::testStreaming(
     func->addRawInput(
         groups.data(), SelectivityVector(rawInput1Size), rawInput1, false);
   }
-  auto intermediateType = func->intermediateType(functionName, rawInputTypes);
+
+  auto [finalType, intermediateType] =
+      exec::resolveAggregateFunction(functionName, rawInputTypes);
+
   auto intermediate = BaseVector::create(intermediateType, 1, pool());
   func->extractAccumulators(groups.data(), 1, &intermediate);
   // Destroy accumulators to avoid memory leak.

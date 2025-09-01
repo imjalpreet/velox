@@ -31,7 +31,6 @@
 #include "velox/dwio/dwrf/reader/DwrfReader.h"
 #include "velox/dwio/dwrf/writer/Writer.h"
 #include "velox/type/Type.h"
-#include "velox/vector/DictionaryVector.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
 
 using namespace ::testing;
@@ -136,6 +135,11 @@ class TestStripeStreams : public StripeStreamsBase {
     DWIO_RAISE("encoding not found");
   }
 
+  const proto::orc::ColumnEncoding& getEncodingOrc(
+      const EncodingKey& ek) const override {
+    DWIO_RAISE("encoding not found");
+  }
+
   uint32_t visitStreamsOfNode(
       uint32_t node,
       std::function<void(const StreamInformation&)> visitor) const override {
@@ -152,6 +156,14 @@ class TestStripeStreams : public StripeStreamsBase {
 
   const ColumnSelector& getColumnSelector() const override {
     return selector_;
+  }
+
+  const tz::TimeZone* sessionTimezone() const override {
+    return context_.sessionTimezone();
+  }
+
+  bool adjustTimestampToTimezone() const override {
+    return context_.adjustTimestampToTimezone();
   }
 
   const RowReaderOptions& rowReaderOptions() const override {
@@ -195,9 +207,21 @@ constexpr uint32_t ITERATIONS = 100'000;
 template <typename T>
 VectorPtr populateBatch(
     std::vector<std::optional<T>> const& data,
-    MemoryPool* pool) {
+    MemoryPool* pool,
+    const TypePtr& type = CppToType<T>::create()) {
   BufferPtr values = AlignedBuffer::allocate<T>(data.size(), pool);
   auto valuesPtr = values->asMutableRange<T>();
+
+  const size_t nulloptCount =
+      std::count(data.begin(), data.end(), std::nullopt);
+  if (nulloptCount == 0) {
+    size_t index = 0;
+    for (auto val : data) {
+      valuesPtr[index++] = val.value();
+    }
+    return std::make_shared<FlatVector<T>>(
+        pool, type, nullptr, data.size(), values, std::vector<BufferPtr>{});
+  }
 
   BufferPtr nulls = allocateNulls(data.size(), pool);
   auto* nullsPtr = nulls->asMutable<uint64_t>();
@@ -215,12 +239,7 @@ VectorPtr populateBatch(
   }
 
   auto batch = std::make_shared<FlatVector<T>>(
-      pool,
-      CppToType<T>::create(),
-      nulls,
-      data.size(),
-      values,
-      std::vector<BufferPtr>{});
+      pool, type, nulls, data.size(), values, std::vector<BufferPtr>{});
   batch->setNullCount(nullCount);
   return batch;
 }
@@ -270,8 +289,14 @@ void verifyBatch(
     const uint32_t seed) {
   auto size = data.size();
   ASSERT_EQ(out->size(), size) << "Batch size mismatch with seed " << seed;
-  ASSERT_EQ(nullCount, out->getNullCount())
-      << "nullCount mismatch with seed " << seed;
+  if (nullCount == std::nullopt) {
+    const auto outNullCount = out->getNullCount();
+    ASSERT_TRUE(outNullCount == std::nullopt || outNullCount == 0)
+        << "nullCount mismatch with seed " << seed;
+  } else {
+    ASSERT_EQ(nullCount, out->getNullCount())
+        << "nullCount mismatch with seed " << seed;
+  }
 
   auto outFv = std::dynamic_pointer_cast<FlatVector<T>>(out);
   size_t index = 0;
@@ -306,7 +331,8 @@ template <typename T>
 void testDataTypeWriter(
     const TypePtr& type,
     std::vector<std::optional<T>>& data,
-    const uint32_t sequence = 0) {
+    const uint32_t sequence = 0,
+    DwrfFormat format = DwrfFormat::kDwrf) {
   // Generate a seed and randomly shuffle the data
   uint32_t seed = Random::rand32();
   std::shuffle(data.begin(), data.end(), std::default_random_engine(seed));
@@ -319,9 +345,10 @@ void testDataTypeWriter(
   auto dataTypeWithId = TypeWithId::create(type, 1);
 
   // write
-  auto writer = BaseColumnWriter::create(context, *dataTypeWithId, sequence);
+  auto writer = BaseColumnWriter::create(
+      context, *dataTypeWithId, sequence, nullptr, format);
   auto size = data.size();
-  auto batch = populateBatch(data, pool.get());
+  auto batch = populateBatch(data, pool.get(), type);
   const size_t stripeCount = 2;
   const size_t strideCount = 3;
 
@@ -371,7 +398,7 @@ void testDataTypeWriter(
 class ColumnWriterTest : public Test {
  public:
   static void SetUpTestCase() {
-    MemoryManager::testingSetInstance({});
+    MemoryManager::testingSetInstance(MemoryManager::Options{});
   }
 
  protected:
@@ -435,6 +462,43 @@ TEST_F(ColumnWriterTest, TestNullBooleanWriter) {
     data.emplace_back();
   }
   testDataTypeWriter(BOOLEAN(), data);
+}
+
+TEST_F(ColumnWriterTest, testDecimalWriter) {
+  const auto format = DwrfFormat::kOrc;
+  auto genShortDecimals = [&](bool hasNull) {
+    std::vector<std::optional<int64_t>> shortDecimals;
+    for (auto i = 0; i < ITERATIONS; ++i) {
+      if (!hasNull || i % 15) {
+        shortDecimals.emplace_back(i);
+      } else {
+        shortDecimals.emplace_back(std::nullopt);
+      }
+    }
+    return shortDecimals;
+  };
+
+  auto shortValues = genShortDecimals(false);
+  testDataTypeWriter(DECIMAL(10, 2), shortValues, /*sequence=*/0, format);
+  shortValues = genShortDecimals(true);
+  testDataTypeWriter(DECIMAL(10, 2), shortValues, /*sequence=*/0, format);
+
+  auto genLongDecimals = [&](bool hasNull) {
+    std::vector<std::optional<int128_t>> longDecimals;
+    for (auto i = 0; i < ITERATIONS; ++i) {
+      if (!hasNull || i % 15) {
+        longDecimals.emplace_back(HugeInt::build(123 * i, 456 * i + 789));
+      } else {
+        longDecimals.emplace_back(std::nullopt);
+      }
+    }
+    return longDecimals;
+  };
+
+  auto longValues = genLongDecimals(false);
+  testDataTypeWriter(DECIMAL(38, 4), longValues, /*sequence=*/0, format);
+  longValues = genLongDecimals(true);
+  testDataTypeWriter(DECIMAL(38, 4), longValues, /*sequence=*/0, format);
 }
 
 TEST_F(ColumnWriterTest, TestTimestampEpochWriter) {
@@ -739,6 +803,30 @@ void printRow(const std::string& title, const VectorPtr& batch) {
   }
 }
 
+void printFlatMap(const std::string& title, const VectorPtr& batch) {
+  auto mv = std::dynamic_pointer_cast<FlatMapVector>(batch);
+  if (!mv) {
+    VLOG(3) << "To be implemented for encoded vector";
+    return;
+  }
+
+  VLOG(3) << "*******" << title << "*******";
+  VLOG(3) << "Size: " << mv->size() << ", Null count: " << getNullCountStr(*mv);
+
+  VLOG(3) << "Keys:";
+  for (int i = 0; i < mv->numDistinctKeys(); i++) {
+    VLOG(3) << "  Key:[" << i << "] " << mv->distinctKeys()->toString(i);
+    const auto& inMaps = mv->inMaps();
+    for (int j = 0; j < mv->size(); j++) {
+      if (inMaps[i] == nullptr ||
+          bits::isBitSet(inMaps[i]->as<uint64_t>(), j)) {
+        VLOG(3) << "    Value:[" << j << "] "
+                << mv->mapValues()[i]->toString(j);
+      }
+    }
+  }
+}
+
 VectorPtr
 wrapInDictionary(const VectorPtr& batch, size_t stride, MemoryPool& pool) {
   VectorPtr ret = batch;
@@ -781,10 +869,8 @@ wrapInDictionary(const VectorPtr& batch, size_t stride, MemoryPool& pool) {
   return ret;
 }
 
-VectorPtr wrapInDictionaryRow(const VectorPtr& batch, MemoryPool& pool) {
-  auto row = batch->as<RowVector>();
-
-  auto size = row->size();
+VectorPtr wrapInDictionary(const VectorPtr& batch, MemoryPool& pool) {
+  auto size = batch->size();
   auto indices = AlignedBuffer::allocate<vector_size_t>(size, &pool);
   auto rawIndices = indices->asMutable<vector_size_t>();
   for (auto i = 0; i < size; i++) {
@@ -872,48 +958,72 @@ void mapToStruct(
   }
 }
 
-template <typename TKEY, typename TVALUE, bool useStruct = false>
+enum class MapWriterInputType { kMap, kStruct, kFlatMap };
+
+template <typename TKEY, typename TVALUE>
 void testMapWriter(
     MemoryPool& pool,
     const std::vector<VectorPtr>& batches,
     bool useFlatMap,
+    MapWriterInputType inputType,
     bool disableDictionaryEncoding,
     bool testEncoded,
     bool printMaps = true) {
   const auto rowType = CppToType<Row<Map<TKEY, TVALUE>>>::create();
   const auto dataType = rowType->childAt(0);
-  const auto rowTypeWithId = TypeWithId::create(rowType);
+  const std::shared_ptr<const TypeWithId> rowTypeWithId =
+      TypeWithId::create(rowType);
   const auto dataTypeWithId = rowTypeWithId->childAt(0);
   const auto writerSchema = TypeWithId::create(rowType);
   const auto writerDataTypeWithId = writerSchema->childAt(0);
 
   VLOG(2) << "Testing map writer " << dataType->toString() << " using "
           << (useFlatMap ? "Flat Map" : "Regular Map")
-          << (useFlatMap && useStruct ? " - Struct" : "");
+          << (useFlatMap && inputType == MapWriterInputType::kStruct
+                  ? " - Struct"
+                  : "")
+          << (useFlatMap && inputType == MapWriterInputType::kFlatMap
+                  ? " - FlatMap"
+                  : "");
 
   const auto config = std::make_shared<Config>();
   auto* pBatches = &batches;
-  std::vector<VectorPtr> structs;
+  std::vector<VectorPtr> transformedInput;
   std::unordered_map<uint32_t, std::vector<std::string>> structReaderContext;
   if (useFlatMap) {
-    if constexpr (useStruct) {
-      structs = batches;
-      pBatches = &structs;
-      std::vector<TKEY> uniqueKeys;
-      ASSERT_NO_FATAL_FAILURE(getUniqueKeys<TKEY>(uniqueKeys, batches));
-      ASSERT_NO_FATAL_FAILURE(
-          (mapToStruct<TKEY, TVALUE>(pool, structs, uniqueKeys)));
+    if (inputType == MapWriterInputType::kStruct) {
+      if constexpr (!CppToType<TVALUE>::isPrimitiveType) {
+      } else {
+        transformedInput = batches;
+        pBatches = &transformedInput;
+        std::vector<TKEY> uniqueKeys;
+        ASSERT_NO_FATAL_FAILURE(getUniqueKeys<TKEY>(uniqueKeys, batches));
+        ASSERT_NO_FATAL_FAILURE(
+            (mapToStruct<TKEY, TVALUE>(pool, transformedInput, uniqueKeys)));
 
-      std::vector<std::string> uniqueKeysString;
-      uniqueKeysString.reserve(uniqueKeys.size());
-      std::transform(
-          uniqueKeys.cbegin(),
-          uniqueKeys.cend(),
-          std::back_inserter(uniqueKeysString),
-          [](const auto& e) { return folly::to<std::string>(e); });
-      ASSERT_EQ(writerDataTypeWithId->column(), 0);
-      config->set(Config::MAP_FLAT_COLS_STRUCT_KEYS, {uniqueKeysString});
-      structReaderContext[writerDataTypeWithId->id()] = uniqueKeysString;
+        std::vector<std::string> uniqueKeysString;
+        uniqueKeysString.reserve(uniqueKeys.size());
+        std::transform(
+            uniqueKeys.cbegin(),
+            uniqueKeys.cend(),
+            std::back_inserter(uniqueKeysString),
+            [](const auto& e) { return folly::to<std::string>(e); });
+        ASSERT_EQ(writerDataTypeWithId->column(), 0);
+        config->set(Config::MAP_FLAT_COLS_STRUCT_KEYS, {uniqueKeysString});
+        structReaderContext[writerDataTypeWithId->id()] = uniqueKeysString;
+      }
+    } else if (inputType == MapWriterInputType::kFlatMap) {
+      transformedInput = batches;
+      pBatches = &transformedInput;
+      VectorMaker maker(&pool);
+
+      for (size_t i = 0; i < transformedInput.size(); i++) {
+        auto mapBatch =
+            std::dynamic_pointer_cast<MapVector>(transformedInput[i]);
+        ASSERT_TRUE(mapBatch);
+
+        transformedInput[i] = maker.flatMapVector<TKEY>(mapBatch);
+      }
     }
 
     config->set(Config::FLATTEN_MAP, true);
@@ -933,10 +1043,12 @@ void testMapWriter(
 
   // Each batch represents an input for a separate stripe
   for (auto batch : *pBatches) {
-    auto isStruct = useFlatMap && useStruct;
+    auto isStruct = useFlatMap && inputType == MapWriterInputType::kStruct;
     if (printMaps) {
       if (isStruct) {
         printRow("Input", batch);
+      } else if (inputType == MapWriterInputType::kFlatMap) {
+        printFlatMap("Input", batch);
       } else {
         printMap<TKEY, TVALUE>("Input", batch);
       }
@@ -949,8 +1061,8 @@ void testMapWriter(
     for (auto strideI = 0; strideI < strideCount; ++strideI) {
       auto toWrite = batch;
       if (testEncoded) {
-        if (isStruct) {
-          toWrite = wrapInDictionaryRow(toWrite, pool);
+        if (inputType != MapWriterInputType::kMap) {
+          toWrite = wrapInDictionary(toWrite, pool);
         } else {
           toWrite = wrapInDictionary(toWrite, strideI, pool);
         }
@@ -982,6 +1094,8 @@ void testMapWriter(
         if (printMaps) {
           if (isStruct) {
             printRow("Result", batch);
+          } else if (inputType == MapWriterInputType::kFlatMap) {
+            printFlatMap("Result", out);
           } else {
             printMap<TKEY, TVALUE>("Result", out);
           }
@@ -1090,7 +1204,7 @@ void testMapWriterRow(
     // Write map/row
     auto toWrite = batch;
     if (testEncoded) {
-      toWrite = wrapInDictionaryRow(toWrite, pool);
+      toWrite = wrapInDictionary(toWrite, pool);
     }
     writer->write(toWrite, common::Ranges::of(0, toWrite->size()));
     writer->createIndexEntry();
@@ -1188,25 +1302,38 @@ TEST_F(ColumnWriterTest, TestMapWriterNestedRow) {
   testMapWriterRowImpl<Row<int32_t, bool, StringView>>();
 }
 
-template <typename TKEY, typename TVALUE, bool useStruct = false>
+template <typename TKEY, typename TVALUE>
 void testMapWriter(
     MemoryPool& pool,
     const VectorPtr& batch,
     bool useFlatMap,
+    MapWriterInputType inputType = MapWriterInputType::kMap,
     bool printMaps = true) {
-  std::vector<VectorPtr> batches{batch, batch};
-  testMapWriter<TKEY, TVALUE, useStruct>(
-      pool, batches, useFlatMap, true, false, printMaps);
+  testMapWriter<TKEY, TVALUE>(
+      pool, {batch, batch}, useFlatMap, inputType, printMaps);
+}
+
+template <typename TKEY, typename TVALUE>
+void testMapWriter(
+    MemoryPool& pool,
+    const std::vector<VectorPtr>& batches,
+    bool useFlatMap,
+    MapWriterInputType inputType = MapWriterInputType::kMap,
+    bool printMaps = true) {
+  testMapWriter<TKEY, TVALUE>(
+      pool, batches, useFlatMap, inputType, true, false, printMaps);
   if (useFlatMap) {
-    testMapWriter<TKEY, TVALUE, useStruct>(
-        pool, batches, useFlatMap, false, false, printMaps);
-    testMapWriter<TKEY, TVALUE, useStruct>(
-        pool, batches, useFlatMap, true, true, printMaps);
+    testMapWriter<TKEY, TVALUE>(
+        pool, batches, useFlatMap, inputType, false, false, printMaps);
+    testMapWriter<TKEY, TVALUE>(
+        pool, batches, useFlatMap, inputType, true, true, printMaps);
   }
 }
 
-template <typename T, bool useStruct = false>
-void testMapWriterNumericKey(bool useFlatMap) {
+template <typename T>
+void testMapWriterNumericKey(
+    bool useFlatMap,
+    MapWriterInputType inputType = MapWriterInputType::kMap) {
   using b = MapBuilder<T, T>;
 
   auto pool = memory::memoryManager()->addLeafPool();
@@ -1220,14 +1347,19 @@ void testMapWriterNumericKey(bool useFlatMap) {
            typename b::pair{
                std::numeric_limits<T>::min(), std::numeric_limits<T>::min()}}});
 
-  testMapWriter<T, T, useStruct>(*pool, batch, useFlatMap, true);
+  testMapWriter<T, T>(*pool, batch, useFlatMap, inputType, true);
 }
 
-// Workaround to avoid issues with two template arguments when wrapped in gtest
-// EXPECT macros.
+// Workaround to avoid issues with two template arguments when wrapped in
+// gtest EXPECT macros.
 template <typename T>
 void testMapWriterNumericKeyUseStruct(bool useFlatMap) {
-  testMapWriterNumericKey<T, true>(useFlatMap);
+  testMapWriterNumericKey<T>(useFlatMap, MapWriterInputType::kStruct);
+}
+
+template <typename T>
+void testMapWriterNumericKeyUseFlatMap(bool useFlatMap) {
+  testMapWriterNumericKey<T>(useFlatMap, MapWriterInputType::kFlatMap);
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterFloatKey) {
@@ -1243,12 +1375,20 @@ TEST_F(ColumnWriterTest, TestMapWriterFloatKey) {
             /* useFlatMap */ true);
       },
       exception::LoggedException);
+
+  EXPECT_THROW(
+      {
+        testMapWriterNumericKeyUseFlatMap<float>(
+            /* useFlatMap */ true);
+      },
+      exception::LoggedException);
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterInt64Key) {
   testMapWriterNumericKey<int64_t>(/* useFlatMap */ false);
   testMapWriterNumericKey<int64_t>(/* useFlatMap */ true);
   testMapWriterNumericKeyUseStruct<int64_t>(/* useFlatMap */ true);
+  testMapWriterNumericKeyUseFlatMap<int64_t>(/* useFlatMap */ true);
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterDuplicatedInt64Key) {
@@ -1259,30 +1399,30 @@ TEST_F(ColumnWriterTest, TestMapWriterDuplicatedInt64Key) {
   auto batch = b::create(
       *pool, {typename b::row{typename b::pair{5, 3}, typename b::pair{5, 4}}});
 
-  EXPECT_THAT(
-      ([&]() { testMapWriter<T, T>(*pool, batch, /* useFlatMap */ true); }),
-      Throws<
-          facebook::velox::dwio::common::exception::LoggedException>(Property(
-          &facebook::velox::dwio::common::exception::LoggedException::message,
-          HasSubstr("Duplicated key in map: 5"))));
+  VELOX_ASSERT_THROW(
+      (testMapWriter<T, T>(*pool, batch, /* useFlatMap */ true)),
+      "Duplicated key in map: 5");
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterInt32Key) {
   testMapWriterNumericKey<int32_t>(/* useFlatMap */ false);
   testMapWriterNumericKey<int32_t>(/* useFlatMap */ true);
   testMapWriterNumericKeyUseStruct<int32_t>(/* useFlatMap */ true);
+  testMapWriterNumericKeyUseFlatMap<int32_t>(/* useFlatMap */ true);
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterInt16Key) {
   testMapWriterNumericKey<int16_t>(/* useFlatMap */ false);
   testMapWriterNumericKey<int16_t>(/* useFlatMap */ true);
   testMapWriterNumericKeyUseStruct<int16_t>(/* useFlatMap */ true);
+  testMapWriterNumericKeyUseFlatMap<int16_t>(/* useFlatMap */ true);
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterInt8Key) {
   testMapWriterNumericKey<int8_t>(/* useFlatMap */ false);
   testMapWriterNumericKey<int8_t>(/* useFlatMap */ true);
   testMapWriterNumericKeyUseStruct<int8_t>(/* useFlatMap */ true);
+  testMapWriterNumericKeyUseFlatMap<int8_t>(/* useFlatMap */ true);
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterStringKey) {
@@ -1298,8 +1438,103 @@ TEST_F(ColumnWriterTest, TestMapWriterStringKey) {
 
   testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ false);
   testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ true);
-  testMapWriter<keyType, valueType, /* useStruct */ true>(
-      *pool_, batch, /* useFlatMap */ true, true);
+  testMapWriter<keyType, valueType>(
+      *pool_,
+      batch,
+      /* useFlatMap */ true,
+      MapWriterInputType::kStruct,
+      true);
+  testMapWriter<keyType, valueType>(
+      *pool_,
+      batch,
+      /* useFlatMap */ true,
+      MapWriterInputType::kFlatMap,
+      true);
+}
+
+void testFlatMapWriter(
+    const std::vector<RowVectorPtr>& batches,
+    MemoryPool* pool) {
+  const auto rowType =
+      std::dynamic_pointer_cast<const RowType>(batches[0]->type());
+  const auto dataType = rowType->childAt(0);
+  const std::shared_ptr<const TypeWithId> rowTypeWithId =
+      TypeWithId::create(rowType);
+  const auto dataTypeWithId = rowTypeWithId->childAt(0);
+  const auto writerSchema = TypeWithId::create(rowType);
+  const auto writerDataTypeWithId = writerSchema->childAt(0);
+
+  const auto config = std::make_shared<Config>();
+  config->set(Config::FLATTEN_MAP, true);
+  config->set(Config::MAP_FLAT_COLS, {writerDataTypeWithId->column()});
+  config->set(Config::MAP_FLAT_DISABLE_DICT_ENCODING, true);
+
+  WriterContext context{config, memory::memoryManager()->addRootPool()};
+  context.initBuffer();
+  const auto writer = BaseColumnWriter::create(context, *writerDataTypeWithId);
+
+  for (auto batch : batches) {
+    writer->write(batch->childAt(0), common::Ranges::of(0, batch->size()));
+  }
+  writer->createIndexEntry();
+
+  proto::StripeFooter sf;
+  writer->flush([&sf](uint32_t /* unused */) -> proto::ColumnEncoding& {
+    return *sf.add_encoding();
+  });
+
+  // Reading the vector out
+  TestStripeStreams streams(context, sf, rowType, pool);
+  EXPECT_CALL(streams.getMockStrideIndexProvider(), getStrideIndex())
+      .WillRepeatedly(Return(0));
+  auto reqType = rowTypeWithId->childAt(0);
+  memory::AllocationPool allocPool(pool);
+  StreamLabels labels(allocPool);
+  auto reader =
+      ColumnReader::build(reqType, reqType, streams, labels, nullptr, 0);
+  VectorPtr out;
+
+  for (const auto& batch : batches) {
+    reader->next(batch->size(), out);
+    for (int32_t i = 0; i < batch->size(); ++i) {
+      ASSERT_TRUE(batch->childAt(0)->equalValueAt(out.get(), i, i))
+          << "Row mismatch at index " << i;
+    }
+  }
+}
+
+TEST_F(ColumnWriterTest, TestFlatMapKeyNotInAllBatches) {
+  VectorMaker maker(pool_.get());
+  // Test the case where not all keys appear in all batches.
+  const std::vector<RowVectorPtr> batches{
+      maker.rowVector({maker.flatMapVector<StringView, StringView>(
+          {{{"1", "3"}, {"2", "2"}}, {{"2", "5"}, {"3", "8"}}})}),
+      maker.rowVector({maker.flatMapVector<StringView, StringView>(
+          {{{"4", "3"}, {"5", "2"}}, {{"6", "5"}, {"7", "8"}}})}),
+      maker.rowVector({maker.flatMapVector<StringView, StringView>(
+          {{{"1", "3"}, {"2", "2"}}, {{"2", "5"}, {"3", "8"}}})})};
+
+  testFlatMapWriter(batches, pool_.get());
+}
+
+TEST_F(ColumnWriterTest, TesFlatMapDuplicatedKey) {
+  const size_t size = 3;
+  const BufferPtr inMaps = AlignedBuffer::allocate<bool>(size, pool_.get());
+  bits::fillBits(inMaps->asMutable<uint64_t>(), 1, size, pool_.get());
+
+  VectorMaker maker(pool_.get());
+  RowVectorPtr batch = maker.rowVector({std::make_shared<FlatMapVector>(
+      pool_.get(),
+      MAP(VARCHAR(), VARCHAR()),
+      nullptr,
+      3,
+      maker.flatVector({"2", "2"}),
+      std::vector<VectorPtr>{
+          maker.flatVector({"1", "2", "3"}), maker.flatVector({"4", "5", "6"})},
+      std::vector<BufferPtr>{inMaps, inMaps})});
+
+  VELOX_ASSERT_THROW(
+      testFlatMapWriter({batch}, pool_.get()), "Duplicated key in map: 2");
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterDuplicatedStringKey) {
@@ -1312,14 +1547,9 @@ TEST_F(ColumnWriterTest, TestMapWriterDuplicatedStringKey) {
       *pool_,
       {b::row{b::pair{"2", "5"}, b::pair{"2", "8"}}}); // Duplicated key: 2
 
-  EXPECT_THAT(
-      ([&]() {
-        testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ true);
-      }),
-      Throws<
-          facebook::velox::dwio::common::exception::LoggedException>(Property(
-          &facebook::velox::dwio::common::exception::LoggedException::message,
-          HasSubstr("Duplicated key in map: 2"))));
+  VELOX_ASSERT_THROW(
+      (testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ true)),
+      "Duplicated key in map: 2");
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterDifferentNumericKeyValue) {
@@ -1372,14 +1602,15 @@ TEST_F(ColumnWriterTest, TestMapWriterMixedBatchTypeHandling) {
   // Test type cast assertion in the direct encoding case.
   // TODO(T91654228): Check and throw for non-homogeneous batch types
   // when dictionary encoding is enabled.
-  EXPECT_THROW(
+  VELOX_ASSERT_THROW(
       (testMapWriter<keyType, valueType>(
           *pool_,
           batches,
           /* useFlatMap */ true,
+          MapWriterInputType::kMap,
           true,
           false)),
-      exception::LoggedException);
+      "");
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterBinaryKey) {
@@ -1395,8 +1626,18 @@ TEST_F(ColumnWriterTest, TestMapWriterBinaryKey) {
 
   testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ false);
   testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ true);
-  testMapWriter<keyType, valueType, /* useStruct */ true>(
-      *pool_, batch, /* useFlatMap */ true, true);
+  testMapWriter<keyType, valueType>(
+      *pool_,
+      batch,
+      /* useFlatMap */ true,
+      MapWriterInputType::kStruct,
+      true);
+  testMapWriter<keyType, valueType>(
+      *pool_,
+      batch,
+      /* useFlatMap */ true,
+      MapWriterInputType::kFlatMap,
+      true);
 }
 
 template <typename keyType, typename valueType>
@@ -1446,12 +1687,14 @@ TEST_F(ColumnWriterTest, TestMapWriterDifferentStripeBatches) {
       *pool_,
       batches,
       /* useFlatMap */ false,
+      MapWriterInputType::kMap,
       false,
       false);
   testMapWriter<keyType, valueType>(
       *pool_,
       batches,
       /* useFlatMap */ true,
+      MapWriterInputType::kMap,
       false,
       false);
 }
@@ -1581,12 +1824,10 @@ TEST_F(ColumnWriterTest, TestMapWriterUnalignedKeyValueCount) {
       sizes,
       keys,
       values);
-  ASSERT_THROW(
-      (testMapWriter<int64_t, int64_t>(*pool_, batch, false)),
-      exception::LoggedException);
-  ASSERT_THROW(
-      (testMapWriter<int64_t, int64_t>(*pool_, batch, true)),
-      exception::LoggedException);
+  VELOX_ASSERT_THROW(
+      (testMapWriter<int64_t, int64_t>(*pool_, batch, false)), "");
+  VELOX_ASSERT_THROW(
+      (testMapWriter<int64_t, int64_t>(*pool_, batch, true)), "");
 }
 
 TEST_F(ColumnWriterTest, TestStructKeysConfigSerializationDeserialization) {
@@ -1873,7 +2114,6 @@ int64_t generateRangeWithCustomLimits(
   // Generate the range such that we have similar amounts of values generated
   // for each exponent.
   double center = size % 2 ? -0.5 : interval / 2 - 0.5;
-  double value = center + (i - size / 2) * interval;
   // Return a guard-railed value with the numeric limits.
   // NOTE: There can be a more compact way to write this if we cast i and size
   // to signed types, but it's not worth the effort enforcing the assumptions.

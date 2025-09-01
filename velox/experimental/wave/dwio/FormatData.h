@@ -206,6 +206,7 @@ enum class ColumnAction { kNulls = 1, kLengths = 2, kFilter = 4, kValues = 8 };
 struct ColumnOp {
   static constexpr int32_t kNoPrerequisite = -1;
   static constexpr int32_t kNoOperand = -1;
+  static constexpr int32_t kAnyLevel = -1;
 
   // Is the op completed after this? If so, any dependent action can be
   // queued as soon as this is set.
@@ -221,6 +222,14 @@ struct ColumnOp {
   ColumnReader* reader{nullptr};
   // Vector completed by arrival of this. nullptr if no vector.
   WaveVector* waveVector{nullptr};
+
+  // True if the column contains multiple uncontiguous chunks.
+  bool hasMultiChunks{false};
+
+  // Set by ReadStream to coordinate the decoding of multiple streams. The
+  // FormatData should decode the current layer of encoding iff decodeLevel is
+  // equal to the current layer or kAnyLevel.
+  int32_t decodeLevel{kAnyLevel};
 
   // Host side result size. 0 for unconditional decoding. Can be buffer size for
   // passing rows, length/offset array etc.
@@ -278,6 +287,15 @@ class FormatData {
   /// column is in terms of the column, not in terms of top level rows.
   virtual void newBatch(int32_t startRow) = 0;
 
+  /// Returns the maximum level of encoding of all chunks of 'this'.
+  virtual int32_t maxDecodeLevel() const {
+    return maxDecodeLevel_;
+  }
+
+  virtual bool hasMultiChunks() const {
+    return false;
+  }
+
   /// Schedules operations for preparing the encoded data to be
   /// consumed in 'numBlocks' parallel blocks of 'blockSize' rows. For
   /// example, for a column of 11M nullable varints, this with 1024
@@ -291,6 +309,7 @@ class FormatData {
   /// access capable, e.g. non-null bit packings. this is a also a
   /// no-op if there are less than 'blockSize' rows left.
   virtual void griddize(
+      ColumnOp& op,
       int32_t blockSize,
       int32_t numBlocks,
       ResultStaging& deviceStaging,
@@ -321,6 +340,15 @@ class FormatData {
       WaveTypeKind columnKind,
       int32_t blockIdx);
 
+  std::unique_ptr<GpuDecode> makeAlphabetStep(
+      ColumnOp& op,
+      ResultStaging& deviceStaging,
+      SplitStaging& splitStaging,
+      ReadStream& stream,
+      WaveTypeKind columnKind,
+      int32_t blockIdx,
+      int32_t numRows);
+
   // Staging id for nulls.
   int32_t nullsStagingId_{SplitStaging::kNoStaging};
   // Id for nulls buffer. The nulls buffer has no address at time of scheduling
@@ -334,6 +362,8 @@ class FormatData {
 
   ColumnGridInfo grid_;
   bool griddized_{false};
+
+  int32_t maxDecodeLevel_{0};
 };
 
 class FormatParams {
@@ -363,7 +393,6 @@ class FormatParams {
  private:
   memory::MemoryPool& pool_;
   dwio::common::ColumnReaderStatistics& stats_;
-  int32_t currentRow_{0};
 };
 
 }; // namespace facebook::velox::wave

@@ -22,57 +22,17 @@
 
 #include "velox/common/time/CpuWallTimer.h"
 #include "velox/core/ExpressionEvaluator.h"
-#include "velox/core/Expressions.h"
-#include "velox/expression/DecodedArgs.h"
 #include "velox/expression/EvalCtx.h"
+#include "velox/expression/ExprStats.h"
 #include "velox/expression/VectorFunction.h"
 #include "velox/type/Subfield.h"
 #include "velox/vector/SimpleVector.h"
-
-/// GFlag used to enable saving input vector and expression SQL on disk in case
-/// of any (user or system) error during expression evaluation. The value
-/// specifies a path to a directory where the vectors will be saved. That
-/// directory must exist and be writable.
-DECLARE_string(velox_save_input_on_expression_any_failure_path);
-
-/// GFlag used to enable saving input vector and expression SQL on disk in case
-/// of a system error during expression evaluation. The value specifies a path
-/// to a directory where the vectors will be saved. That directory must exist
-/// and be writable. This flag is ignored if
-/// velox_save_input_on_expression_any_failure_path flag is set.
-DECLARE_string(velox_save_input_on_expression_system_failure_path);
 
 namespace facebook::velox::exec {
 
 class ExprSet;
 class FieldReference;
 class VectorFunction;
-
-struct ExprStats {
-  /// Requires QueryConfig.exprTrackCpuUsage() to be 'true'.
-  CpuWallTiming timing;
-
-  /// Number of processed rows.
-  uint64_t numProcessedRows{0};
-
-  /// Number of processed vectors / batches. Allows to compute average batch
-  /// size.
-  uint64_t numProcessedVectors{0};
-
-  void add(const ExprStats& other) {
-    timing.add(other.timing);
-    numProcessedRows += other.numProcessedRows;
-    numProcessedVectors += other.numProcessedVectors;
-  }
-
-  std::string toString() const {
-    return fmt::format(
-        "timing: {}, numProcessedRows: {}, numProcessedVectors: {}",
-        timing.toString(),
-        numProcessedRows,
-        numProcessedVectors);
-  }
-};
 
 /// Maintains a set of rows for evaluation and removes rows with
 /// nulls or errors as needed. Helps to avoid copying SelectivityVector in cases
@@ -144,6 +104,21 @@ class MutableRemainingRows {
   LocalSelectivityVector mutableRowsHolder_;
 };
 
+enum class SpecialFormKind : int32_t {
+  kFieldAccess = 0,
+  kConstant = 1,
+  kCast = 2,
+  kCoalesce = 3,
+  kSwitch = 4,
+  kLambda = 5,
+  kTry = 6,
+  kAnd = 7,
+  kOr = 8,
+  kCustom = 999,
+};
+
+VELOX_DECLARE_ENUM_NAME(SpecialFormKind);
+
 // An executable expression.
 class Expr {
  public:
@@ -151,14 +126,14 @@ class Expr {
       TypePtr type,
       std::vector<std::shared_ptr<Expr>>&& inputs,
       std::string name,
-      bool specialForm,
+      std::optional<SpecialFormKind> specialFormKind,
       bool supportsFlatNoNullsFastPath,
       bool trackCpuUsage)
       : type_(std::move(type)),
         inputs_(std::move(inputs)),
         name_(std::move(name)),
         vectorFunction_(nullptr),
-        specialForm_{specialForm},
+        specialFormKind_{specialFormKind},
         supportsFlatNoNullsFastPath_{supportsFlatNoNullsFastPath},
         trackCpuUsage_{trackCpuUsage} {}
 
@@ -234,6 +209,12 @@ class Expr {
     evalSpecialForm(rows, context, result);
   }
 
+  // Return true if the current function is deterministic, regardless of the
+  // determinism of its inputs. Return false otherwise. Note that this is
+  // different from deterministic_ that represents the determinism of the
+  // current expression including its inputs.
+  bool isCurrentFunctionDeterministic() const;
+
   // Compute the following properties: deterministic_, propagatesNulls_,
   // distinctFields_, multiplyReferencedFields_, hasConditionals_ and
   // sameAsParentDistinctFields_.
@@ -252,11 +233,19 @@ class Expr {
 
   void clearMemo() {
     baseOfDictionaryRepeats_ = 0;
-    baseOfDictionary_.reset();
-    baseOfDictionaryWeakPtr_.reset();
     baseOfDictionaryRawPtr_ = nullptr;
+    baseOfDictionaryWeakPtr_.reset();
+    baseOfDictionary_.reset();
     dictionaryCache_ = nullptr;
     cachedDictionaryIndices_ = nullptr;
+  }
+
+  virtual void clearCache() {
+    sharedSubexprResults_.clear();
+    clearMemo();
+    for (auto& input : inputs_) {
+      input->clearCache();
+    }
   }
 
   const TypePtr& type() const {
@@ -272,7 +261,51 @@ class Expr {
   }
 
   bool isSpecialForm() const {
-    return specialForm_;
+    return specialFormKind_.has_value();
+  }
+
+  SpecialFormKind specialFormKind() const {
+    return specialFormKind_.value();
+  }
+
+  bool isFieldAccess() const {
+    return specialFormKind_ == SpecialFormKind::kFieldAccess;
+  }
+
+  bool isConstant() const {
+    return specialFormKind_ == SpecialFormKind::kConstant;
+  }
+
+  bool isCast() const {
+    return specialFormKind_ == SpecialFormKind::kCast;
+  }
+
+  bool isCoalesce() const {
+    return specialFormKind_ == SpecialFormKind::kCoalesce;
+  }
+
+  bool isSwitch() const {
+    return specialFormKind_ == SpecialFormKind::kSwitch;
+  }
+
+  bool isLambda() const {
+    return specialFormKind_ == SpecialFormKind::kLambda;
+  }
+
+  bool isTry() const {
+    return specialFormKind_ == SpecialFormKind::kTry;
+  }
+
+  bool isAnd() const {
+    return specialFormKind_ == SpecialFormKind::kAnd;
+  }
+
+  bool isOr() const {
+    return specialFormKind_ == SpecialFormKind::kOr;
+  }
+
+  bool isCustom() const {
+    return specialFormKind_ == SpecialFormKind::kCustom;
   }
 
   virtual bool isConditional() const {
@@ -287,7 +320,7 @@ class Expr {
     return deterministic_;
   }
 
-  virtual bool isConstant() const;
+  virtual bool isConstantExpr() const;
 
   bool supportsFlatNoNullsFastPath() const {
     return supportsFlatNoNullsFastPath_;
@@ -387,7 +420,7 @@ class Expr {
     return vectorFunctionMetadata_;
   }
 
-  auto& inputValues() {
+  std::vector<VectorPtr>& inputValues() {
     return inputValues_;
   }
 
@@ -576,7 +609,7 @@ class Expr {
   const std::string name_;
   const std::shared_ptr<VectorFunction> vectorFunction_;
   const VectorFunctionMetadata vectorFunctionMetadata_;
-  const bool specialForm_;
+  const std::optional<SpecialFormKind> specialFormKind_;
   const bool supportsFlatNoNullsFastPath_;
   const bool trackCpuUsage_;
 
@@ -589,11 +622,11 @@ class Expr {
   // The distinct references to input columns in 'inputs_'
   // subtrees. Empty if this is the same as 'distinctFields_' of
   // parent Expr.
-  std::vector<FieldReference * FOLLY_NONNULL> distinctFields_;
+  std::vector<FieldReference*> distinctFields_;
 
   // Fields referenced by multiple inputs, which is subset of distinctFields_.
   // Used to determine pre-loading of lazy vectors at current expr.
-  std::unordered_set<FieldReference * FOLLY_NONNULL> multiplyReferencedFields_;
+  std::unordered_set<FieldReference*> multiplyReferencedFields_;
 
   // True if a null in any of 'distinctFields_' causes 'this' to be
   // null for the row.
@@ -687,8 +720,7 @@ class Expr {
 };
 
 /// Generate a selectivity vector of a single row.
-SelectivityVector* FOLLY_NONNULL
-singleRow(LocalSelectivityVector& holder, vector_size_t row);
+SelectivityVector* singleRow(LocalSelectivityVector& holder, vector_size_t row);
 
 using ExprPtr = std::shared_ptr<Expr>;
 
@@ -707,7 +739,8 @@ class ExprSet {
   explicit ExprSet(
       const std::vector<core::TypedExprPtr>& source,
       core::ExecCtx* execCtx,
-      bool enableConstantFolding = true);
+      bool enableConstantFolding = true,
+      bool lazyDereference = false);
 
   virtual ~ExprSet();
 
@@ -730,6 +763,11 @@ class ExprSet {
 
   void clear();
 
+  /// Clears the internally cached buffers used for shared sub-expressions and
+  /// dictionary memoization which are allocated through memory pool. This is
+  /// used by memory arbitration to reclaim memory.
+  void clearCache();
+
   core::ExecCtx* execCtx() const {
     return execCtx_;
   }
@@ -748,6 +786,10 @@ class ExprSet {
 
   const std::vector<FieldReference*>& distinctFields() const {
     return distinctFields_;
+  }
+
+  bool lazyDereference() const {
+    return lazyDereference_;
   }
 
   // Flags a shared subexpression which needs to be reset (e.g. previously
@@ -770,8 +812,9 @@ class ExprSet {
   /// name. If a function or a special form occurs in the expression
   /// multiple times, the statistics will be aggregated across all calls.
   /// Statistics will be missing for functions and special forms that didn't get
-  /// evaluated.
-  std::unordered_map<std::string, exec::ExprStats> stats() const;
+  /// evaluated. If 'excludeSpecialForm' is true, special forms are excluded.
+  std::unordered_map<std::string, exec::ExprStats> stats(
+      bool excludeSpecialForm = false) const;
 
  protected:
   void clearSharedSubexprs();
@@ -779,10 +822,10 @@ class ExprSet {
   std::vector<std::shared_ptr<Expr>> exprs_;
 
   // The distinct references to input columns among all expressions in ExprSet.
-  std::vector<FieldReference * FOLLY_NONNULL> distinctFields_;
+  std::vector<FieldReference*> distinctFields_;
 
   // Fields referenced by multiple expressions in ExprSet.
-  std::unordered_set<FieldReference * FOLLY_NONNULL> multiplyReferencedFields_;
+  std::unordered_set<FieldReference*> multiplyReferencedFields_;
 
   // Distinct Exprs reachable from 'exprs_' for which reset() needs to
   // be called at the start of eval().
@@ -791,6 +834,7 @@ class ExprSet {
   // Exprs which retain memoized state, e.g. from running over dictionaries.
   std::unordered_set<Expr*> memoizingExprs_;
   core::ExecCtx* const execCtx_;
+  const bool lazyDereference_;
 };
 
 class ExprSetSimplified : public ExprSet {
@@ -823,7 +867,22 @@ class ExprSetSimplified : public ExprSet {
 // account and instantiates the correct ExprSet class.
 std::unique_ptr<ExprSet> makeExprSetFromFlag(
     std::vector<core::TypedExprPtr>&& source,
-    core::ExecCtx* execCtx);
+    core::ExecCtx* execCtx,
+    bool lazyDereference = false);
+
+/// Evaluates a deterministic expression that doesn't depend on any inputs and
+/// returns the result as single-row vector. Returns nullptr if the expression
+/// is non-deterministic or has dependencies.
+///
+/// By default, propagates failures that occur during evaluation of the
+/// expression. For example, evaluating 5 / 0 throws "division by zero". If
+/// 'suppressEvaluationFailures' is true, these failures are swallowed and the
+/// caller receives a nullptr result.
+VectorPtr tryEvaluateConstantExpression(
+    const core::TypedExprPtr& expr,
+    memory::MemoryPool* pool,
+    const std::shared_ptr<core::QueryCtx>& queryCtx,
+    bool suppressEvaluationFailures = false);
 
 /// Returns a string representation of the expression trees annotated with
 /// runtime statistics. Expected to be called after calling ExprSet::eval one or
@@ -886,11 +945,22 @@ class SimpleExpressionEvaluator : public core::ExpressionEvaluator {
         std::vector<core::TypedExprPtr>{expression}, ensureExecCtx());
   }
 
+  std::unique_ptr<ExprSet> compile(
+      const std::vector<core::TypedExprPtr>& expressions) override {
+    return std::make_unique<ExprSet>(expressions, ensureExecCtx());
+  }
+
   void evaluate(
       ExprSet* exprSet,
       const SelectivityVector& rows,
       const RowVector& input,
       VectorPtr& result) override;
+
+  void evaluate(
+      exec::ExprSet* exprSet,
+      const SelectivityVector& rows,
+      const RowVector& input,
+      std::vector<VectorPtr>& results) override;
 
   memory::MemoryPool* pool() override {
     return pool_;

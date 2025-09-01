@@ -35,6 +35,8 @@ using memory::MemoryPool;
 
 namespace {
 
+constexpr int kGzipCodec = 16;
+
 class ZstdCompressor : public Compressor {
  public:
   explicit ZstdCompressor(int32_t level) : Compressor{level} {}
@@ -57,7 +59,7 @@ ZstdCompressor::compress(const void* src, void* dest, uint64_t length) {
 
 class ZlibCompressor : public Compressor {
  public:
-  explicit ZlibCompressor(int32_t level);
+  explicit ZlibCompressor(int32_t level, int32_t windowBits, bool isGzip);
 
   ~ZlibCompressor() override;
 
@@ -68,13 +70,17 @@ class ZlibCompressor : public Compressor {
   z_stream stream_;
 };
 
-ZlibCompressor::ZlibCompressor(int32_t level)
+ZlibCompressor::ZlibCompressor(int32_t level, int32_t windowBits, bool isGzip)
     : Compressor{level}, isCompressCalled_{false} {
   stream_.zalloc = Z_NULL;
   stream_.zfree = Z_NULL;
   stream_.opaque = Z_NULL;
+  if (isGzip) {
+    windowBits = (windowBits < 0 ? -windowBits : windowBits) | kGzipCodec;
+  }
   DWIO_ENSURE_EQ(
-      deflateInit2(&stream_, level_, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY),
+      deflateInit2(
+          &stream_, level_, Z_DEFLATED, windowBits, 8, Z_DEFAULT_STRATEGY),
       Z_OK,
       "Error while calling deflateInit2() for zlib.");
 }
@@ -150,9 +156,9 @@ ZlibDecompressor::ZlibDecompressor(
   zstream_.next_out = Z_NULL;
   zstream_.avail_out = folly::to<uInt>(blockSize);
   int zlibWindowBits = windowBits;
-  constexpr int GZIP_DETECT_CODE = 32;
   if (isGzip) {
-    zlibWindowBits = zlibWindowBits | GZIP_DETECT_CODE;
+    zlibWindowBits =
+        (zlibWindowBits < 0 ? -zlibWindowBits : zlibWindowBits) | kGzipCodec;
   }
   const auto result = inflateInit2(&zstream_, zlibWindowBits);
   DWIO_ENSURE_EQ(
@@ -245,8 +251,8 @@ uint64_t LzoAndLz4DecompressorCommon::decompress(
     DWIO_ENSURE_GE(
         compressedSize,
         dwio::common::INT_BYTE_SIZE,
-        "{} decompression failed, input len is too small: {}",
-        kind_,
+        ::facebook::velox::common::compressionKindToString(kind_),
+        " decompression failed, input len is too small: ",
         compressedSize);
 
     uint32_t decompressedBlockSize =
@@ -258,11 +264,11 @@ uint64_t LzoAndLz4DecompressorCommon::decompress(
     DWIO_ENSURE_GE(
         remainingOutputSize,
         decompressedBlockSize,
-        "{} decompression failed, remainingOutputSize is less than "
-        "decompressedBlockSize, remainingOutputSize: {}, "
-        "decompressedBlockSize: {}",
-        kind_,
+        ::facebook::velox::common::compressionKindToString(kind_),
+        " decompression failed, remainingOutputSize is less than "
+        "decompressedBlockSize, remainingOutputSize: ",
         remainingOutputSize,
+        ", decompressedBlockSize: ",
         decompressedBlockSize);
 
     if (compressedSize <= 0) {
@@ -274,8 +280,8 @@ uint64_t LzoAndLz4DecompressorCommon::decompress(
       DWIO_ENSURE_GE(
           compressedSize,
           dwio::common::INT_BYTE_SIZE,
-          "{} decompression failed, input len is too small: {}",
-          kind_,
+          ::facebook::velox::common::compressionKindToString(kind_),
+          " decompression failed, input len is too small: ",
           compressedSize);
       // Read the length of the next lz4/lzo compressed block.
       uint32_t compressedBlockSize =
@@ -286,14 +292,14 @@ uint64_t LzoAndLz4DecompressorCommon::decompress(
       if (compressedBlockSize == 0) {
         continue;
       }
-
       DWIO_ENSURE_LE(
           compressedBlockSize,
           compressedSize,
-          "{} decompression failed, compressedBlockSize is greater than compressedSize, "
-          "compressedBlockSize: {}, compressedSize: {}",
-          kind_,
+          ::facebook::velox::common::compressionKindToString(kind_),
+          " decompression failed, compressedBlockSize is greater than "
+          "compressedSize, compressedBlockSize: ",
           compressedBlockSize,
+          ", compressedSize: ",
           compressedSize);
 
       // Decompress this block.
@@ -307,10 +313,11 @@ uint64_t LzoAndLz4DecompressorCommon::decompress(
       DWIO_ENSURE_LE(
           decompressedSize,
           remainingOutputSize,
-          "{} decompression failed, decompressedSize is not less than or equal to remainingOutputSize, "
-          "decompressedSize: {}, remainingOutputSize: {}",
           ::facebook::velox::common::compressionKindToString(kind_),
+          " decompression failed, decompressedSize is not less than "
+          "or equal to remainingOutputSize, decompressedSize: ",
           decompressedSize,
+          ", remainingOutputSize: ",
           remainingOutputSize);
 
       outPtr += decompressedSize;
@@ -324,10 +331,11 @@ uint64_t LzoAndLz4DecompressorCommon::decompress(
   DWIO_ENSURE_EQ(
       decompressedTotalSize,
       uncompressedSize,
-      "{} decompression failed, decompressedTotalSize is not equal to uncompressedSize, "
-      "decompressedTotalSize: {}, uncompressedSize: {}",
-      kind_,
+      ::facebook::velox::common::compressionKindToString(kind_),
+      " decompression failed, decompressedTotalSize is not equal to "
+      "uncompressedSize, decompressedTotalSize: ",
       decompressedTotalSize,
+      ", uncompressedSize: ",
       uncompressedSize);
 
   return decompressedTotalSize;
@@ -621,7 +629,18 @@ std::unique_ptr<Compressor> createCompressor(
           "Initialized zlib compressor with compression level {}",
           options.format.zlib.compressionLevel);
       return std::make_unique<ZlibCompressor>(
+          options.format.zlib.compressionLevel,
+          options.format.zlib.windowBits,
+          false);
+    }
+    case CompressionKind::CompressionKind_GZIP: {
+      XLOG_FIRST_N(INFO, 1) << fmt::format(
+          "Initialized zlib compressor with compression level {}",
           options.format.zlib.compressionLevel);
+      return std::make_unique<ZlibCompressor>(
+          options.format.zlib.compressionLevel,
+          options.format.zlib.windowBits,
+          true);
     }
     case CompressionKind::CompressionKind_ZSTD: {
       XLOG_FIRST_N(INFO, 1) << fmt::format(

@@ -25,10 +25,17 @@
 #include "velox/functions/prestosql/fuzzer/ApproxDistinctResultVerifier.h"
 #include "velox/functions/prestosql/fuzzer/ApproxPercentileInputGenerator.h"
 #include "velox/functions/prestosql/fuzzer/ApproxPercentileResultVerifier.h"
+#include "velox/functions/prestosql/fuzzer/AverageResultVerifier.h"
 #include "velox/functions/prestosql/fuzzer/MinMaxInputGenerator.h"
+#include "velox/functions/prestosql/fuzzer/NumericHistogramInputGenerator.h"
+#include "velox/functions/prestosql/fuzzer/QDigestAggInputGenerator.h"
+#include "velox/functions/prestosql/fuzzer/QDigestAggResultVerifier.h"
+#include "velox/functions/prestosql/fuzzer/TDigestAggregateInputGenerator.h"
+#include "velox/functions/prestosql/fuzzer/TDigestAggregateResultVerifier.h"
 #include "velox/functions/prestosql/fuzzer/WindowOffsetInputGenerator.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
+#include "velox/vector/fuzzer/VectorFuzzer.h"
 
 DEFINE_int64(
     seed,
@@ -56,6 +63,8 @@ DEFINE_uint32(
     "Timeout in milliseconds for HTTP requests made to reference DB, "
     "such as Presto. Example: --req_timeout_ms=2000");
 
+// Any change made in the file should be reflected in
+// the FB-internal window fuzzer test too.
 namespace facebook::velox::exec::test {
 namespace {
 
@@ -69,10 +78,13 @@ getCustomInputGenerators() {
       {"approx_distinct", std::make_shared<ApproxDistinctInputGenerator>()},
       {"approx_set", std::make_shared<ApproxDistinctInputGenerator>()},
       {"approx_percentile", std::make_shared<ApproxPercentileInputGenerator>()},
+      {"tdigest_agg", std::make_shared<TDigestAggregateInputGenerator>()},
+      {"qdigest_agg", std::make_shared<QDigestAggInputGenerator>()},
       {"lead", std::make_shared<WindowOffsetInputGenerator>(1)},
       {"lag", std::make_shared<WindowOffsetInputGenerator>(1)},
       {"nth_value", std::make_shared<WindowOffsetInputGenerator>(1)},
       {"ntile", std::make_shared<WindowOffsetInputGenerator>(0)},
+      {"numeric_histogram", std::make_shared<NumericHistogramInputGenerator>()},
   };
 }
 
@@ -85,7 +97,8 @@ int main(int argc, char** argv) {
   facebook::velox::aggregate::prestosql::registerInternalAggregateFunctions("");
   facebook::velox::window::prestosql::registerAllWindowFunctions();
   facebook::velox::functions::prestosql::registerAllScalarFunctions();
-  facebook::velox::memory::MemoryManager::initialize({});
+  facebook::velox::memory::MemoryManager::initialize(
+      facebook::velox::memory::MemoryManager::Options{});
 
   ::testing::InitGoogleTest(&argc, argv);
 
@@ -97,7 +110,13 @@ int main(int argc, char** argv) {
   size_t initialSeed = FLAGS_seed == 0 ? std::time(nullptr) : FLAGS_seed;
 
   // List of functions that have known bugs that cause crashes or failures.
-  static const std::unordered_set<std::string> skipFunctions = {
+  std::unordered_set<std::string> skipFunctions = {
+      // https://github.com/prestodb/presto/issues/24936
+      "classification_fall_out",
+      "classification_precision",
+      "classification_recall",
+      "classification_miss_rate",
+      "classification_thresholds",
       // Skip internal functions used only for result verifications.
       "$internal$count_distinct",
       "$internal$array_agg",
@@ -107,11 +126,28 @@ int main(int argc, char** argv) {
       "reduce_agg",
       // array_agg requires a flag controlling whether to ignore nulls.
       "array_agg",
-      // min_by and max_by are fixed recently, requiring Presto-0.286.
-      // https://github.com/prestodb/presto/pull/21793
-      "min_by",
-      "max_by",
+      // Skip non-deterministic functions.
+      "noisy_avg_gaussian",
+      "noisy_count_if_gaussian",
+      "noisy_count_gaussian",
+      "noisy_sum_gaussian",
+      "noisy_approx_set_sfm",
+      "noisy_approx_distinct_sfm",
+      "noisy_approx_set_sfm_from_index_and_zeros",
+      // https://github.com/facebookincubator/velox/issues/13547
+      "merge",
+      // https://github.com/facebookincubator/velox/issues/14423
+      "numeric_histogram",
   };
+
+  if (!FLAGS_presto_url.empty()) {
+    skipFunctions.insert({
+        // min_by and max_by with 3 arguments produces results with different
+        // orders of elements from Presto.
+        "min_by",
+        "max_by",
+    });
+  }
 
   // Functions whose results verification should be skipped. These can be
   // functions that return complex-typed results containing floating-point
@@ -119,6 +155,9 @@ int main(int argc, char** argv) {
   // TODO: allow custom result verifiers.
   using facebook::velox::exec::test::ApproxDistinctResultVerifier;
   using facebook::velox::exec::test::ApproxPercentileResultVerifier;
+  using facebook::velox::exec::test::AverageResultVerifier;
+  using facebook::velox::exec::test::QDigestAggResultVerifier;
+  using facebook::velox::exec::test::TDigestAggregateResultVerifier;
 
   static const std::unordered_map<
       std::string,
@@ -126,10 +165,12 @@ int main(int argc, char** argv) {
       customVerificationFunctions = {
           // Approx functions.
           {"approx_distinct", std::make_shared<ApproxDistinctResultVerifier>()},
-          {"approx_set", nullptr},
+          {"approx_set", std::make_shared<ApproxDistinctResultVerifier>(true)},
           {"approx_percentile",
            std::make_shared<ApproxPercentileResultVerifier>()},
           {"approx_most_frequent", nullptr},
+          {"tdigest_agg", std::make_shared<TDigestAggregateResultVerifier>()},
+          {"qdigest_agg", std::make_shared<QDigestAggResultVerifier>()},
           {"merge", nullptr},
           // Semantically inconsistent functions
           {"skewness", nullptr},
@@ -138,6 +179,7 @@ int main(int argc, char** argv) {
           // https://github.com/facebookincubator/velox/issues/6330
           {"max_data_size_for_stats", nullptr},
           {"sum_data_size_for_stats", nullptr},
+          {"avg", std::make_shared<AverageResultVerifier>()},
       };
 
   static const std::unordered_set<std::string> orderDependentFunctions = {
@@ -165,6 +207,8 @@ int main(int argc, char** argv) {
       "max_by",
       "min_by",
       "multimap_agg",
+      "tdigest_agg",
+      "qdigest_agg",
   };
 
   using Runner = facebook::velox::exec::test::WindowFuzzerRunner;

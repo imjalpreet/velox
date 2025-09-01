@@ -78,7 +78,7 @@ class ParquetData : public dwio::common::FormatData {
   /// Positions 'this' at 'index'th row group. loadRowGroup must be called
   /// first. The returned PositionProvider is empty and should not be used.
   /// Other formats may use it.
-  dwio::common::PositionProvider seekToRowGroup(uint32_t index) override;
+  dwio::common::PositionProvider seekToRowGroup(int64_t index) override;
 
   void filterRowGroups(
       const common::ScanSpec& scanSpec,
@@ -192,6 +192,10 @@ class ParquetData : public dwio::common::FormatData {
     return reader_->isDeltaBinaryPacked();
   }
 
+  bool isDeltaByteArray() const {
+    return reader_->isDeltaByteArray();
+  }
+
   bool parentNullsInLeaves() const override {
     return true;
   }
@@ -202,7 +206,7 @@ class ParquetData : public dwio::common::FormatData {
  private:
   /// True if 'filter' may have hits for the column of 'this' according to the
   /// stats in 'rowGroup'.
-  bool rowGroupMatches(uint32_t rowGroupId, common::Filter* filter);
+  bool rowGroupMatches(uint32_t rowGroupId, const common::Filter* filter);
 
  protected:
   memory::MemoryPool& pool_;

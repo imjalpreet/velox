@@ -17,6 +17,7 @@ add_executable(
   velox_memory_test
   AllocationPoolTest.cpp
   AllocationTest.cpp
+  ArbitrationParticipantTest.cpp
   ByteStreamTest.cpp
   CompactDoubleListTest.cpp
   HashStringAllocatorTest.cpp
@@ -26,8 +27,11 @@ add_executable(
   MemoryManagerTest.cpp
   MemoryPoolTest.cpp
   MockSharedArbitratorTest.cpp
+  RawVectorTest.cpp
+  ScratchTest.cpp
   SharedArbitratorTest.cpp
-  StreamArenaTest.cpp)
+  StreamArenaTest.cpp
+)
 
 target_link_libraries(
   velox_memory_test
@@ -48,19 +52,20 @@ target_link_libraries(
     GTest::gmock
     GTest::gtest
     GTest::gtest_main
-    re2::re2)
+    re2::re2
+)
 
 gtest_add_tests(velox_memory_test "" AUTO)
 
-add_executable(velox_fragmentation_benchmark FragmentationBenchmark.cpp)
+if(VELOX_ENABLE_BENCHMARKS)
+  add_executable(velox_fragmentation_benchmark FragmentationBenchmark.cpp)
 
-target_link_libraries(
-  velox_fragmentation_benchmark
-  PRIVATE velox_memory Folly::folly gflags::gflags glog::glog)
+  target_link_libraries(
+    velox_fragmentation_benchmark
+    PRIVATE velox_memory Folly::folly gflags::gflags glog::glog
+  )
 
-add_executable(velox_concurrent_allocation_benchmark
-               ConcurrentAllocationBenchmark.cpp)
+  add_executable(velox_concurrent_allocation_benchmark ConcurrentAllocationBenchmark.cpp)
 
-target_link_libraries(
-  velox_concurrent_allocation_benchmark
-  PRIVATE velox_memory velox_time)
+  target_link_libraries(velox_concurrent_allocation_benchmark PRIVATE velox_memory velox_time)
+endif()

@@ -482,6 +482,24 @@ TEST_F(AverageAggregationTest, avgDecimal) {
       {makeRowVector(
           {makeFlatVector(std::vector<int64_t>{337}, DECIMAL(3, 2))})});
 
+  // Round-up average when sum overflows the max int128_t limit.
+  testAggregations(
+      {makeRowVector({makeFlatVector<int128_t>(
+          {HugeInt::parse("99999999999999999999999999999999999999"),
+           HugeInt::parse("99999999999999999999999999999999999998"),
+           HugeInt::parse("99999999999999999999999999999999999997"),
+           HugeInt::parse("99999999999999999999999999999999999995"),
+           HugeInt::parse("99999999999999999999999999999999999995"),
+           HugeInt::parse("99999999999999999999999999999999999995")},
+          DECIMAL(38, 7))})},
+      {},
+      {"avg(c0)"},
+      {},
+      {makeRowVector({makeFlatVector(
+          std::vector<int128_t>{
+              HugeInt::parse("99999999999999999999999999999999999997")},
+          DECIMAL(38, 7))})});
+
   // The total sum overflows the max int128_t limit.
   std::vector<int128_t> rawVector;
   for (int i = 0; i < 10; ++i) {
@@ -588,6 +606,23 @@ TEST_F(AverageAggregationTest, avgDecimalWithMultipleRowVectors) {
 
   auto expectedResult = {makeRowVector(
       {makeFlatVector(std::vector<int64_t>{350}, DECIMAL(5, 2))})};
+
+  testAggregations(inputRows, {}, {"avg(c0)"}, expectedResult);
+
+  AggregationTestBase::enableTestIncremental();
+}
+
+TEST_F(AverageAggregationTest, avgIntervalWithMultipleRowVectors) {
+  AggregationTestBase::disableTestIncremental();
+
+  auto inputRows = {
+      makeRowVector({makeFlatVector<int64_t>({100, 200}, INTERVAL_DAY_TIME())}),
+      makeRowVector({makeFlatVector<int64_t>({300, 400}, INTERVAL_DAY_TIME())}),
+      makeRowVector({makeFlatVector<int64_t>({500, 845}, INTERVAL_DAY_TIME())}),
+  };
+
+  auto expectedResult = {makeRowVector(
+      {makeFlatVector(std::vector<int64_t>{391}, INTERVAL_DAY_TIME())})};
 
   testAggregations(inputRows, {}, {"avg(c0)"}, expectedResult);
 

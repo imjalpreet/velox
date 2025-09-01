@@ -15,7 +15,7 @@
  */
 
 #include "velox/functions/lib/Slice.h"
-#include "velox/expression/Expr.h"
+#include "velox/expression/DecodedArgs.h"
 #include "velox/expression/VectorFunction.h"
 
 namespace facebook::velox::functions {
@@ -120,6 +120,11 @@ class SliceFunction : public exec::VectorFunction {
 
     const auto fillResultVectorFunc = [&](vector_size_t row,
                                           vector_size_t adjustedStart) {
+      auto length = decodedLength->valueAt<T>(row);
+      if (length < 0) {
+        VELOX_USER_FAIL(
+            "The value of length argument of slice() function should not be negative");
+      }
       auto arraySize = baseRawSizes[arrayIndices[row]];
       auto index = getIndex(adjustedStart, arraySize);
       if (index != -1) {
@@ -127,9 +132,7 @@ class SliceFunction : public exec::VectorFunction {
         rawOffsets[row] = start;
         rawSizes[row] = adjustLength(
             start,
-            // Indices are always 32-bit integers, template arguments are used
-            // to accommodate more data types.
-            static_cast<vector_size_t>(decodedLength->valueAt<T>(row)),
+            decodedLength->valueAt<T>(row),
             row,
             baseRawSizes,
             baseRawOffsets,
@@ -198,17 +201,13 @@ class SliceFunction : public exec::VectorFunction {
 
   vector_size_t adjustLength(
       vector_size_t start,
-      vector_size_t length,
+      int64_t length,
       vector_size_t row,
       const vector_size_t* rawSizes,
       const vector_size_t* rawOffsets,
       const vector_size_t* indices) const {
-    if (length < 0) {
-      VELOX_USER_FAIL(
-          "The value of length argument of slice() function should not be negative");
-    }
-    auto endIndex = rawOffsets[indices[row]] + rawSizes[indices[row]];
-    return std::min(endIndex - start, length);
+    int64_t endIndex = rawOffsets[indices[row]] + rawSizes[indices[row]];
+    return static_cast<vector_size_t>(std::min(endIndex - start, length));
   }
 };
 

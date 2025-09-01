@@ -18,20 +18,19 @@
 #include <random>
 #include "velox/common/base/SpillConfig.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/memory/tests/SharedArbitratorTestUtil.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/Statistics.h"
-#include "velox/dwio/common/TypeWithId.h"
 #include "velox/dwio/common/encryption/TestProvider.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/dwio/common/tests/utils/MapBuilder.h"
 #include "velox/dwio/dwrf/common/Config.h"
+#include "velox/dwio/dwrf/reader/ColumnReader.h"
 #include "velox/dwio/dwrf/reader/DwrfReader.h"
 #include "velox/dwio/dwrf/test/OrcTest.h"
 #include "velox/dwio/dwrf/test/utils/E2EWriterTestUtil.h"
-#include "velox/dwio/dwrf/writer/Writer.h"
 #include "velox/type/fbhive/HiveTypeParser.h"
-#include "velox/vector/FlatVector.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
 
@@ -54,7 +53,7 @@ class E2EWriterTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
     TestValue::enable();
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   E2EWriterTest() {
@@ -62,7 +61,7 @@ class E2EWriterTest : public testing::Test {
     leafPool_ = rootPool_->addLeafChild("leaf");
   }
 
-  std::unique_ptr<dwrf::DwrfReader> createReader(
+  static std::unique_ptr<dwrf::DwrfReader> createReader(
       const MemorySink& sink,
       const dwio::common::ReaderOptions& opts) {
     std::string_view data(sink.data(), sink.size());
@@ -114,8 +113,8 @@ class E2EWriterTest : public testing::Test {
     for (int32_t i = 0; i < reader->getNumberOfStripes(); ++i) {
       auto stripeMetadata = dwrfRowReader->fetchStripe(i, preload);
       auto& footer = *stripeMetadata->footer;
-      for (int32_t j = 0; j < footer.encoding_size(); ++j) {
-        auto encoding = footer.encoding(j);
+      for (int32_t j = 0; j < footer.columnEncodingSize(); ++j) {
+        auto encoding = footer.columnEncodingDwrf(j);
         if (encoding.kind() ==
             dwrf::proto::ColumnEncoding_Kind::ColumnEncoding_Kind_MAP_FLAT) {
           actualNodeIds.insert(encoding.node());
@@ -576,8 +575,8 @@ TEST_F(E2EWriterTest, PresentStreamIsSuppressedOnFlatMap) {
   for (int i = 0; i < reader->getNumberOfStripes(); ++i) {
     auto stripeMetadata = dwrfRowReader->fetchStripe(i, preload);
     auto& footer = *stripeMetadata->footer;
-    for (int j = 0; j < footer.streams_size(); ++j) {
-      auto stream = footer.streams(j);
+    for (int j = 0; j < footer.streamsSize(); ++j) {
+      auto stream = footer.streamDwrf(j);
       ASSERT_NE(stream.kind(), dwrf::proto::Stream_Kind::Stream_Kind_PRESENT);
     }
   }
@@ -606,7 +605,7 @@ TEST_F(E2EWriterTest, TooManyFlatMapKeys) {
   config->set(dwrf::Config::MAP_FLAT_COLS, {0});
   config->set(dwrf::Config::MAP_FLAT_MAX_KEYS, keyLimit);
 
-  EXPECT_THROW(
+  VELOX_ASSERT_THROW(
       dwrf::E2EWriterTestUtil::testWriter(
           *pool,
           type,
@@ -614,7 +613,7 @@ TEST_F(E2EWriterTest, TooManyFlatMapKeys) {
           1,
           1,
           config),
-      exception::LoggedException);
+      "");
 }
 
 TEST_F(E2EWriterTest, FlatMapBackfill) {
@@ -846,8 +845,7 @@ TEST_F(E2EWriterTest, FlatMapConfigNotMapColumn) {
       "map_val:map<bigint,double>,"
       ">");
 
-  EXPECT_THROW(
-      { testFlatMapConfig(type, {0}, {}); }, exception::LoggedException);
+  VELOX_ASSERT_THROW(testFlatMapConfig(type, {0}, {}), "");
 }
 
 TEST_F(E2EWriterTest, mapStatsSingleStride) {
@@ -982,7 +980,7 @@ TEST_F(E2EWriterTest, OversizeRows) {
       config,
       /*flushPolicyFactory=*/nullptr,
       /*layoutPlannerFactory=*/nullptr,
-      /*memoryBudget=*/std::numeric_limits<int64_t>::max(),
+      /*writerMemoryCap=*/std::numeric_limits<int64_t>::max(),
       false);
 }
 
@@ -1014,7 +1012,7 @@ TEST_F(E2EWriterTest, OversizeBatches) {
       config,
       /*flushPolicyFactory=*/nullptr,
       /*layoutPlannerFactory=*/nullptr,
-      /*memoryBudget=*/std::numeric_limits<int64_t>::max(),
+      /*writerMemoryCap=*/std::numeric_limits<int64_t>::max(),
       false);
 
   // Test splitting multiple huge batches.
@@ -1030,7 +1028,7 @@ TEST_F(E2EWriterTest, OversizeBatches) {
       config,
       /*flushPolicyFactory=*/nullptr,
       /*layoutPlannerFactory=*/nullptr,
-      /*memoryBudget=*/std::numeric_limits<int64_t>::max(),
+      /*writerMemoryCap=*/std::numeric_limits<int64_t>::max(),
       false);
 }
 
@@ -1090,7 +1088,7 @@ TEST_F(E2EWriterTest, OverflowLengthIncrements) {
       config,
       /*flushPolicyFactory=*/nullptr,
       /*layoutPlannerFactory=*/nullptr,
-      /*memoryBudget=*/std::numeric_limits<int64_t>::max(),
+      /*writerMemoryCap=*/std::numeric_limits<int64_t>::max(),
       false);
 }
 
@@ -1229,9 +1227,9 @@ TEST_F(E2EEncryptionTest, EncryptRoot) {
   for (int32_t i = 0; i < reader->getNumberOfStripes(); ++i) {
     auto stripeMetadata = dwrfRowReader->fetchStripe(i, preload);
     auto& sf = *stripeMetadata->footer;
-    ASSERT_EQ(sf.encoding_size(), 0);
-    ASSERT_EQ(sf.streams_size(), 0);
-    ASSERT_EQ(sf.encryptiongroups_size(), 1);
+    ASSERT_EQ(sf.columnEncodingSize(), 0);
+    ASSERT_EQ(sf.streamsSize(), 0);
+    ASSERT_EQ(sf.encryptiongroupsSize(), 1);
   }
 
   validateFileContent(*reader);
@@ -1310,10 +1308,10 @@ TEST_F(E2EEncryptionTest, EncryptSelectedFields) {
   for (int32_t i = 0; i < reader->getNumberOfStripes(); ++i) {
     auto stripeMetadata = dwrfRowReader->fetchStripe(i, preload);
     auto& sf = *stripeMetadata->footer;
-    for (auto& enc : sf.encoding()) {
+    for (const auto& enc : sf.columnEncodingsDwrf()) {
       ASSERT_TRUE(encryptedNodes.find(enc.node()) == encryptedNodes.end());
     }
-    for (auto& stream : sf.streams()) {
+    for (const auto& stream : sf.streamsDwrf()) {
       ASSERT_TRUE(encryptedNodes.find(stream.node()) == encryptedNodes.end());
     }
   }
@@ -1367,8 +1365,7 @@ TEST_F(E2EEncryptionTest, ReadWithoutKey) {
     RowReaderOptions rowReaderOpts;
     rowReaderOpts.select(
         std::make_shared<ColumnSelector>(type, std::vector<uint64_t>{1}));
-    ASSERT_THROW(
-        reader->createRowReader(rowReaderOpts), exception::LoggedException);
+    VELOX_ASSERT_THROW(reader->createRowReader(rowReaderOpts), "");
   }
 }
 
@@ -1624,6 +1621,76 @@ TEST_F(E2EWriterTest, fuzzFlatmap) {
     std::vector<VectorPtr> children;
     for (auto i = 0; i < type->size(); ++i) {
       children.push_back(genMap(type->childAt(i), batchSize));
+    }
+
+    return std::make_shared<RowVector>(
+        pool.get(), type, nullptr, batchSize, std::move(children));
+  };
+
+  auto iterations = 20;
+  auto batches = 20;
+  for (auto i = 0; i < iterations; ++i) {
+    testWriter(*pool, type, batches, gen, config);
+  }
+}
+
+TEST_F(E2EWriterTest, fuzzFlatmapWithFlatmapInput) {
+  auto pool = memory::memoryManager()->addLeafPool();
+  auto type = ROW({
+      {"flatmap1", MAP(INTEGER(), REAL())},
+      {"flatmap2", MAP(VARCHAR(), ARRAY(REAL()))},
+      {"flatmap3", MAP(INTEGER(), MAP(INTEGER(), REAL()))},
+  });
+  auto config = std::make_shared<dwrf::Config>();
+  config->set(dwrf::Config::FLATTEN_MAP, true);
+  config->set(dwrf::Config::MAP_FLAT_COLS, {0, 1, 2});
+  auto seed = folly::Random::rand32();
+  LOG(INFO) << "seed: " << seed;
+  std::mt19937 rng{seed};
+
+  // Small batches creates more edge cases.
+  size_t batchSize = 10;
+  VectorFuzzer fuzzer(
+      {
+          .vectorSize = batchSize,
+          .nullRatio = 0,
+          .stringLength = 20,
+          .stringVariableLength = true,
+          .containerLength = 5,
+          .containerVariableLength = true,
+      },
+      pool.get(),
+      seed);
+
+  auto genFlatMap = [&](auto type) {
+    auto& mapType = type->asMap();
+
+    std::vector<BufferPtr> inMaps;
+    std::vector<VectorPtr> values;
+    for (size_t key = 0; key < batchSize; ++key) {
+      inMaps.push_back(AlignedBuffer::allocate<bool>(batchSize, pool.get(), 0));
+      auto* rawInMaps = inMaps.back()->asMutable<uint64_t>();
+      for (size_t row = 0; row < batchSize; ++row) {
+        bits::setBit(rawInMaps, row, folly::Random::oneIn(2, rng));
+      }
+
+      values.push_back(fuzzer.fuzz(mapType.valueType()));
+    }
+
+    return std::make_shared<FlatMapVector>(
+        pool.get(),
+        type,
+        nullptr,
+        batchSize,
+        createKeys(mapType.keyType(), *pool, rng, batchSize, batchSize),
+        std::move(values),
+        std::move(inMaps));
+  };
+
+  auto gen = [&]() {
+    std::vector<VectorPtr> children(type->size());
+    for (auto i = 0; i < type->size(); ++i) {
+      children[i] = genFlatMap(type->childAt(i));
     }
 
     return std::make_shared<RowVector>(
@@ -1961,7 +2028,6 @@ TEST_F(E2EWriterTest, memoryReclaimAfterClose) {
     VELOX_ASSERT_THROW(writer->flush(), "Writer is not running");
 
     memory::MemoryReclaimer::Stats stats;
-    const auto oldCapacity = writerPool->capacity();
     writerPool->reclaim(1L << 30, 0, stats);
     if (testData.abort || !testData.canReclaim) {
       ASSERT_EQ(stats.numNonReclaimableAttempts, 0);

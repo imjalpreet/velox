@@ -541,13 +541,28 @@ TEST_F(BitUtilTest, getAndClearLastSetBit) {
   EXPECT_EQ(bits, 0);
 }
 
+TEST_F(BitUtilTest, negateBit) {
+  char data[35];
+  for (int32_t i = 0; i < 100; i++) {
+    setBit(data, i, true);
+  }
+  std::vector<uint64_t> indices = {0, 1, 2, 3, 4, 5, 6, 7};
+  for (auto i : indices) {
+    negateBit(data, i);
+    EXPECT_EQ(isBitSet(data, i), false);
+  }
+  for (int32_t i = 8; i < 100; i++) {
+    EXPECT_EQ(isBitSet(data, i), true);
+  }
+}
+
 TEST_F(BitUtilTest, negate) {
   char data[35];
   for (int32_t i = 0; i < 100; i++) {
     setBit(data, i, i % 2 == 0);
   }
 
-  negate(data, 64);
+  negate(reinterpret_cast<uint64_t*>(data), 64);
   for (int32_t i = 0; i < 64; i++) {
     EXPECT_EQ(isBitSet(data, i), i % 2 != 0) << "at " << i;
   }
@@ -555,12 +570,12 @@ TEST_F(BitUtilTest, negate) {
     EXPECT_EQ(isBitSet(data, i), i % 2 == 0) << "at " << i;
   }
 
-  negate(data, 64);
+  negate(reinterpret_cast<uint64_t*>(data), 64);
   for (int32_t i = 0; i < 64; i++) {
     EXPECT_EQ(isBitSet(data, i), i % 2 == 0) << "at " << i;
   }
 
-  negate(data, 72);
+  negate(reinterpret_cast<uint64_t*>(data), 72);
   for (int32_t i = 0; i < 72; i++) {
     EXPECT_EQ(isBitSet(data, i), i % 2 != 0) << "at " << i;
   }
@@ -568,17 +583,17 @@ TEST_F(BitUtilTest, negate) {
     EXPECT_EQ(isBitSet(data, i), i % 2 == 0) << "at " << i;
   }
 
-  negate(data, 72);
+  negate(reinterpret_cast<uint64_t*>(data), 72);
   for (int32_t i = 0; i < 72; i++) {
     EXPECT_EQ(isBitSet(data, i), i % 2 == 0) << "at " << i;
   }
 
-  negate(data, 100);
+  negate(reinterpret_cast<uint64_t*>(data), 100);
   for (int32_t i = 0; i < 100; i++) {
     EXPECT_EQ(isBitSet(data, i), i % 2 != 0) << "at " << i;
   }
 
-  negate(data, 100);
+  negate(reinterpret_cast<uint64_t*>(data), 100);
   for (int32_t i = 0; i < 100; i++) {
     EXPECT_EQ(isBitSet(data, i), i % 2 == 0) << "at " << i;
   }

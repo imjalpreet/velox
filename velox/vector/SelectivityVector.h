@@ -28,8 +28,7 @@
 #include "velox/common/base/Range.h"
 #include "velox/vector/TypeAliases.h"
 
-namespace facebook {
-namespace velox {
+namespace facebook::velox {
 
 // A selectivityVector is used to logically filter / select data in place.
 // The goal here is to be able to pass this vector between filter stages on
@@ -339,9 +338,6 @@ class SelectivityVector {
                  return bits_[index] == other.bits_[index];
                });
   }
-  bool operator!=(const SelectivityVector& other) const {
-    return !(*this == other);
-  }
 
   /// Invokes a function on each selected row. The function must take a single
   /// "row" argument of type vector_size_t and return void.
@@ -365,7 +361,7 @@ class SelectivityVector {
 
     // Intentionally going from zero to avoid surprises debugging if begin() and
     // end() not correct
-    for (size_t i = 0; i < selectivityVector.size(); ++i) {
+    for (size_t i = 0; i < static_cast<size_t>(selectivityVector.size()); ++i) {
       if (selectivityVector.isValid(i)) {
         if (!firstValidEncountered) {
           os << ", ";
@@ -469,5 +465,5 @@ void translateToInnerRows(
     const vector_size_t* indices,
     const uint64_t* nulls,
     SelectivityVector& innerRows);
-} // namespace velox
-} // namespace facebook
+
+} // namespace facebook::velox

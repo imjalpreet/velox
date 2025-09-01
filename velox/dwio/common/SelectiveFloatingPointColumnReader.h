@@ -41,10 +41,8 @@ class SelectiveFloatingPointColumnReader : public SelectiveColumnReader {
   }
 
   template <typename Reader, bool kEncodingHasNulls>
-  void readCommon(
-      vector_size_t offset,
-      const RowSet& rows,
-      const uint64_t* incomingNulls);
+  void
+  readCommon(int64_t offset, const RowSet& rows, const uint64_t* incomingNulls);
 
   void getValues(const RowSet& rows, VectorPtr* result) override {
     getFlatValues<TData, TRequested>(rows, result, requestedType_);
@@ -57,7 +55,7 @@ class SelectiveFloatingPointColumnReader : public SelectiveColumnReader {
       bool isDense,
       typename ExtractValues>
   void readHelper(
-      velox::common::Filter* filter,
+      const velox::common::Filter* filter,
       const RowSet& rows,
       ExtractValues values);
 
@@ -67,7 +65,7 @@ class SelectiveFloatingPointColumnReader : public SelectiveColumnReader {
       bool kEncodingHasNulls,
       typename ExtractValues>
   void processFilter(
-      velox::common::Filter* filter,
+      const velox::common::Filter* filter,
       const RowSet& rows,
       ExtractValues extractValues);
 
@@ -82,13 +80,18 @@ template <
     bool isDense,
     typename ExtractValues>
 void SelectiveFloatingPointColumnReader<TData, TRequested>::readHelper(
-    velox::common::Filter* filter,
+    const velox::common::Filter* filter,
     const RowSet& rows,
     ExtractValues extractValues) {
   reinterpret_cast<Reader*>(this)->readWithVisitor(
       rows,
-      ColumnVisitor<TData, TFilter, ExtractValues, isDense>(
-          *reinterpret_cast<TFilter*>(filter), this, rows, extractValues));
+      ColumnVisitor<
+          TData,
+          TFilter,
+          ExtractValues,
+          isDense,
+          std::is_same_v<TData, TRequested>>(
+          *static_cast<const TFilter*>(filter), this, rows, extractValues));
 }
 
 template <typename TData, typename TRequested>
@@ -98,7 +101,7 @@ template <
     bool kEncodingHasNulls,
     typename ExtractValues>
 void SelectiveFloatingPointColumnReader<TData, TRequested>::processFilter(
-    velox::common::Filter* filter,
+    const velox::common::Filter* filter,
     const RowSet& rows,
     ExtractValues extractValues) {
   if (filter == nullptr) {
@@ -133,8 +136,10 @@ void SelectiveFloatingPointColumnReader<TData, TRequested>::processFilter(
       break;
     case velox::common::FilterKind::kDoubleRange:
     case velox::common::FilterKind::kFloatRange:
-      readHelper<Reader, velox::common::FloatingPointRange<TData>, isDense>(
-          filter, rows, extractValues);
+      readHelper<
+          Reader,
+          velox::common::FloatingPointRange<TRequested>,
+          isDense>(filter, rows, extractValues);
       break;
     default:
       readHelper<Reader, velox::common::Filter, isDense>(
@@ -174,7 +179,7 @@ void SelectiveFloatingPointColumnReader<TData, TRequested>::processValueHook(
 template <typename TData, typename TRequested>
 template <typename Reader, bool kEncodingHasNulls>
 void SelectiveFloatingPointColumnReader<TData, TRequested>::readCommon(
-    vector_size_t offset,
+    int64_t offset,
     const RowSet& rows,
     const uint64_t* incomingNulls) {
   prepareRead<TData>(offset, rows, incomingNulls);

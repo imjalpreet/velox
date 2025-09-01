@@ -14,17 +14,18 @@
  * limitations under the License.
  */
 #pragma once
+
+#include "velox/common/base/SkewedPartitionBalancer.h"
+#include "velox/common/base/TraceConfig.h"
 #include "velox/core/PlanFragment.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/LocalPartition.h"
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/MergeSource.h"
-#include "velox/exec/Split.h"
+#include "velox/exec/ScaledScanController.h"
 #include "velox/exec/TaskStats.h"
 #include "velox/exec/TaskStructs.h"
-#include "velox/exec/trace/QueryMetadataWriter.h"
-#include "velox/exec/trace/QueryTraceConfig.h"
 #include "velox/vector/ComplexVector.h"
 
 namespace facebook::velox::exec {
@@ -33,6 +34,7 @@ class OutputBufferManager;
 
 class HashJoinBridge;
 class NestedLoopJoinBridge;
+class SplitListener;
 
 using ConnectorSplitPreloadFunc =
     std::function<void(const std::shared_ptr<connector::ConnectorSplit>&)>;
@@ -68,6 +70,9 @@ class Task : public std::enable_shared_from_this<Task> {
   /// thread are passed on to a separate consumer.
   /// @param onError Optional callback to receive an exception if task
   /// execution fails.
+  /// @param memoryArbitrationPriority Optional priority on task that, in a
+  /// multi task system, is used for memory arbitration to decide the order of
+  /// reclaiming.
   static std::shared_ptr<Task> create(
       const std::string& taskId,
       core::PlanFragment planFragment,
@@ -75,6 +80,7 @@ class Task : public std::enable_shared_from_this<Task> {
       std::shared_ptr<core::QueryCtx> queryCtx,
       ExecutionMode mode,
       Consumer consumer = nullptr,
+      int32_t memoryArbitrationPriority = 0,
       std::function<void(std::exception_ptr)> onError = nullptr);
 
   static std::shared_ptr<Task> create(
@@ -84,6 +90,7 @@ class Task : public std::enable_shared_from_this<Task> {
       std::shared_ptr<core::QueryCtx> queryCtx,
       ExecutionMode mode,
       ConsumerSupplier consumerSupplier,
+      int32_t memoryArbitrationPriority = 0,
       std::function<void(std::exception_ptr)> onError = nullptr);
 
   /// Convenience function for shortening a Presto taskId. To be used
@@ -102,6 +109,18 @@ class Task : public std::enable_shared_from_this<Task> {
     spillDirectoryCreated_ = alreadyCreated;
   }
 
+  void setCreateSpillDirectoryCb(
+      std::function<std::string()> spillDirectoryCallback) {
+    VELOX_CHECK_NULL(spillDirectoryCallback_);
+    spillDirectoryCallback_ = std::move(spillDirectoryCallback);
+  }
+
+  /// Returns human-friendly representation of the plan augmented with runtime
+  /// statistics. The implementation invokes exec::printPlanWithStats().
+  ///
+  /// @param includeCustomStats If true, prints operator-specific counters.
+  std::string printPlanWithStats(bool includeCustomStats = false) const;
+
   std::string toString() const;
 
   folly::dynamic toJson() const;
@@ -116,6 +135,11 @@ class Task : public std::enable_shared_from_this<Task> {
   /// Returns task ID specified in the constructor.
   const std::string& taskId() const {
     return taskId_;
+  }
+
+  /// Returns plan fragment specified in the constructor.
+  const core::PlanFragment& planFragment() const {
+    return planFragment_;
   }
 
   const int destination() const {
@@ -137,6 +161,11 @@ class Task : public std::enable_shared_from_this<Task> {
     return pool_.get();
   }
 
+  /// Returns query trace config if specified.
+  const std::optional<TraceConfig>& traceConfig() const {
+    return traceConfig_;
+  }
+
   /// Returns ConsumerSupplier passed in the constructor.
   ConsumerSupplier consumerSupplier() const {
     return consumerSupplier_;
@@ -146,12 +175,18 @@ class Task : public std::enable_shared_from_this<Task> {
 
   bool isUngroupedExecution() const;
 
-  /// Returns true if this task has ungrouped execution split under grouped
-  /// execution mode.
+  /// Returns true if the provided 'joinNode' has probe side as grouped
+  /// execution mode and build side as ungrouped execution mode.
   ///
   /// NOTE: calls this function after task has been started as the number of
   /// ungrouped drivers is set during task startup.
-  bool hasMixedExecutionGroup() const;
+  bool hasMixedExecutionGroupJoin(const core::HashJoinNode* joinNode) const;
+
+  /// If 'planNode' is a source node, returns true if all splits for 'planNode'
+  /// are consumed and no more splits are expected. Otherwise, returns true if
+  /// all upstream source nodes' splits of this 'planNode' are consumed, and no
+  /// more splits are expected.
+  bool allSplitsConsumed(const core::PlanNode* planNode) const;
 
   /// Starts executing the plan fragment specified in the constructor. If leaf
   /// nodes require splits (e.g. TableScan, Exchange, etc.), these splits can be
@@ -170,15 +205,19 @@ class Task : public std::enable_shared_from_this<Task> {
   bool supportSerialExecutionMode() const;
 
   /// Single-threaded execution API. Runs the query and returns results one
-  /// batch at a time. Returns nullptr if query evaluation is finished and no
-  /// more data will be produced. Throws an exception if query execution
-  /// failed.
+  /// batch at a time. Returns nullptr if the query is finished or has reached
+  /// to a task barrier.
   ///
-  /// This API is available for query plans that do not use
-  /// PartitionedOutputNode and LocalPartitionNode plan nodes.
+  /// If the query is finished, no more data will be produced. An exception is
+  /// thrown if query execution failed.
+  /// If a task barrier is reached, add new splits with a new barrier request
+  /// and call next() to resume processing.
   ///
-  /// The caller is required to add all the necessary splits, and signal
-  /// no-more-splits before calling 'next' for the first time.
+  /// For non-barrier mode, add all necessary splits and signal no-more-splits
+  /// before calling next() for the first time.
+  ///
+  /// For barrier mode, add a set of splits and request a task barrier before
+  /// calling next(). Repeat this process until the query is finished.
   ///
   /// If no `future` is provided, the operators in the pipeline are not allowed
   /// to block for external events, but can block waiting for data to be
@@ -354,10 +393,6 @@ class Task : public std::enable_shared_from_this<Task> {
     return numFinishedDrivers_;
   }
 
-  const std::vector<std::weak_ptr<Driver>>& testingDriversClosedByTask() const {
-    return driversClosedByTask_;
-  }
-
   /// Internal public methods. These methods are intended to be used by internal
   /// library components (Driver, Operator, etc.) and should not be called by
   /// the library users.
@@ -412,6 +447,12 @@ class Task : public std::enable_shared_from_this<Task> {
       int32_t maxPreloadSplits = 0,
       const ConnectorSplitPreloadFunc& preload = nullptr);
 
+  /// Returns the scaled scan controller for a given table scan node if the
+  /// query has configured.
+  std::shared_ptr<ScaledScanController> getScaledScanControllerLocked(
+      uint32_t splitGroupId,
+      const core::PlanNodeId& planNodeId);
+
   void splitFinished(bool fromTableScan, int64_t splitWeight);
 
   void multipleSplitsFinished(
@@ -423,7 +464,8 @@ class Task : public std::enable_shared_from_this<Task> {
   std::shared_ptr<MergeSource> addLocalMergeSource(
       uint32_t splitGroupId,
       const core::PlanNodeId& planNodeId,
-      const RowTypePtr& rowType);
+      const RowTypePtr& rowType,
+      int queueSize);
 
   /// Returns all MergeSource's for the specified splitGroupId and planNodeId.
   const std::vector<std::shared_ptr<MergeSource>>& getLocalMergeSources(
@@ -440,7 +482,7 @@ class Task : public std::enable_shared_from_this<Task> {
 
   void createLocalExchangeQueuesLocked(
       uint32_t splitGroupId,
-      const core::PlanNodeId& planNodeId,
+      const core::PlanNodePtr& planNode,
       int numPartitions);
 
   void noMoreLocalExchangeProducers(uint32_t splitGroupId);
@@ -452,6 +494,18 @@ class Task : public std::enable_shared_from_this<Task> {
 
   const std::vector<std::shared_ptr<LocalExchangeQueue>>&
   getLocalExchangeQueues(
+      uint32_t splitGroupId,
+      const core::PlanNodeId& planNodeId);
+
+  const std::shared_ptr<LocalExchangeMemoryManager>&
+  getLocalExchangeMemoryManager(
+      uint32_t splitGroupId,
+      const core::PlanNodeId& planNodeId);
+
+  /// Returns the shared skewed partition balancer for scale writer local
+  /// partitioning with the given split group id and plan node id.
+  const std::shared_ptr<common::SkewedPartitionRebalancer>&
+  getScaleWriterPartitionBalancer(
       uint32_t splitGroupId,
       const core::PlanNodeId& planNodeId);
 
@@ -592,6 +646,35 @@ class Task : public std::enable_shared_from_this<Task> {
     return terminateRequested_;
   }
 
+  /// Requests barrier on task execution to drain out all the buffered data
+  /// after finishing processing all the queued source splits. The returned
+  /// future is realized when the drain operation completes. This API is
+  /// supported only with single threaded execution mode and only when all plan
+  /// nodes support barrier processing.
+  ContinueFuture requestBarrier();
+
+  /// Returns true if this task is under barrier processing.
+  bool underBarrier() const {
+    return barrierRequested_;
+  }
+
+  /// Sets to drop the input for the operators instantiated from the specified
+  /// plan node. The function is called when a draining operator needs no more
+  /// input to finish the drain operation. All the upstream operators can simply
+  /// drop their output and output processing to finish the drain quickly.
+  void dropInput(const core::PlanNodeId& planNodeId);
+
+  /// Sets to drop the input for the specified operator.
+  void dropInput(Operator* op);
+
+  /// Invoked once by a driver thread to signal it has finished the barrier
+  /// processing when all its operators have drained their output and the sink
+  /// operator has propagated the drain signal to all its downstream pipelines
+  /// through the connected queues. Upon the last driver thread call, the task
+  /// finishes the current barrier processing and 'barrierFinishPromises_' are
+  /// fulfilled to resume barrier request caller.
+  void finishDriverBarrier();
+
   /// Requests the Task to stop activity.  The returned future is
   /// realized when all running threads have stopped running. Activity
   /// can be resumed with resume() after the future is realized.
@@ -601,13 +684,13 @@ class Task : public std::enable_shared_from_this<Task> {
   /// realized when the last thread stops running for 'this'. This is used to
   /// mark cancellation by the user.
   ContinueFuture requestCancel() {
-    return terminate(kCanceled);
+    return terminate(TaskState::kCanceled);
   }
 
   /// Like requestCancel but sets end state to kAborted. This is for stopping
   /// Tasks due to failures of other parts of the query.
   ContinueFuture requestAbort() {
-    return terminate(kAborted);
+    return terminate(TaskState::kAborted);
   }
 
   void requestYield() {
@@ -634,18 +717,12 @@ class Task : public std::enable_shared_from_this<Task> {
     return driverFactories_[driver->driverCtx()->pipelineId]->numDrivers;
   }
 
-  /// Returns the number of created and deleted tasks since the velox engine
-  /// starts running so far.
-  static uint64_t numCreatedTasks() {
-    return numCreatedTasks_;
-  }
-
-  static uint64_t numDeletedTasks() {
-    return numDeletedTasks_;
-  }
-
   const std::string& spillDirectory() const {
     return spillDirectory_;
+  }
+
+  bool hasCreateSpillDirectoryCb() const {
+    return spillDirectoryCallback_ != nullptr;
   }
 
   /// Returns the spill directory path. Ensures that the spill directory is
@@ -659,6 +736,10 @@ class Task : public std::enable_shared_from_this<Task> {
     return numDriversInPartitionedOutput_ > 0;
   }
 
+  uint32_t concurrentSplitGroups() const {
+    return concurrentSplitGroups_;
+  }
+
   /// Returns the cancellation token to check if this task has been terminated
   /// or not. This helps the Velox integration with query system using folly
   /// cancellation mechanism.
@@ -666,9 +747,22 @@ class Task : public std::enable_shared_from_this<Task> {
     return cancellationSource_.getToken();
   }
 
+  /// Returns the number of created tasks from velox runtime.
+  static size_t numCreatedTasks();
+
+  /// Returns the number of running tasks from velox runtime.
+  static size_t numRunningTasks();
+
+  /// Returns the list of running tasks from velox runtime.
+  static std::vector<std::shared_ptr<Task>> getRunningTasks();
+
   void testingIncrementThreads() {
     std::lock_guard l(mutex_);
     ++numThreads_;
+  }
+
+  const std::vector<std::weak_ptr<Driver>>& testingDriversClosedByTask() const {
+    return driversClosedByTask_;
   }
 
   /// Invoked to run provided 'callback' on each alive driver of the task.
@@ -679,7 +773,28 @@ class Task : public std::enable_shared_from_this<Task> {
     terminate(TaskState::kFinished).wait();
   }
 
+  /// The testing method returns true if any driver is blocked waiting for
+  /// split.
+  bool testingHasDriverWaitForSplit() const;
+
+  /// Returns true if all the splits have finished.
+  bool testingAllSplitsFinished();
+
  private:
+  // Hook of system-wide running task list.
+  struct TaskListEntry {
+    std::weak_ptr<Task> taskPtr;
+    folly::IntrusiveListHook listHook;
+  };
+  using TaskList =
+      folly::IntrusiveList<TaskListEntry, &TaskListEntry::listHook>;
+
+  // Returns the system-wide running task list.
+  FOLLY_EXPORT static TaskList& taskList();
+
+  // Returns the lock that protects the system-wide running task list.
+  FOLLY_EXPORT static folly::SharedMutex& taskListLock();
+
   Task(
       const std::string& taskId,
       core::PlanFragment planFragment,
@@ -687,7 +802,15 @@ class Task : public std::enable_shared_from_this<Task> {
       std::shared_ptr<core::QueryCtx> queryCtx,
       ExecutionMode mode,
       ConsumerSupplier consumerSupplier,
+      int32_t memoryArbitrationPriority = 0,
       std::function<void(std::exception_ptr)> onError = nullptr);
+
+  // Invoked to add this to the system-wide running task list on task creation.
+  void addToTaskList();
+
+  // Invoked to remove this from the system-wide running task list on task
+  // destruction.
+  void removeFromTaskList();
 
   // Consistency check of the task execution to make sure the execution mode
   // stays the same.
@@ -720,12 +843,21 @@ class Task : public std::enable_shared_from_this<Task> {
   // message.
   bool allNodesReceivedNoMoreSplitsMessageLocked() const;
 
+  // Recursive helper for 'allSpilitsConsumed()' method.
+  bool allSplitsConsumedHelper(const core::PlanNode* planNode) const;
+
   // Remove the spill directory, if the Task was creating it for potential
   // spilling.
   void removeSpillDirectoryIfExists();
 
   // Invoked to initialize the memory pool for this task on creation.
   void initTaskPool();
+
+  // Creates a scaled scan controller for a given table scan node.
+  void addScaledScanControllerLocked(
+      uint32_t splitGroupId,
+      const core::PlanNodeId& planNodeId,
+      uint32_t numDrivers);
 
   // Creates new instance of memory pool for a plan node, stores it in the task
   // to ensure lifetime and returns a raw pointer.
@@ -743,7 +875,8 @@ class Task : public std::enable_shared_from_this<Task> {
   // customized instance for hash join plan node, otherwise creates a default
   // memory reclaimer.
   std::unique_ptr<memory::MemoryReclaimer> createNodeReclaimer(
-      bool isHashJoinNode) const;
+      const std::function<std::unique_ptr<memory::MemoryReclaimer>()>&
+          reclaimerFactory) const;
 
   // Creates a memory reclaimer instance for an exchange client if the task
   // memory pool has set memory reclaimer. We don't support to reclaim memory
@@ -777,7 +910,8 @@ class Task : public std::enable_shared_from_this<Task> {
   class MemoryReclaimer : public exec::MemoryReclaimer {
    public:
     static std::unique_ptr<memory::MemoryReclaimer> create(
-        const std::shared_ptr<Task>& task);
+        const std::shared_ptr<Task>& task,
+        int64_t priority = 0);
 
     uint64_t reclaim(
         memory::MemoryPool* pool,
@@ -789,7 +923,8 @@ class Task : public std::enable_shared_from_this<Task> {
         override;
 
    private:
-    explicit MemoryReclaimer(const std::shared_ptr<Task>& task) : task_(task) {
+    MemoryReclaimer(const std::shared_ptr<Task>& task, int64_t priority)
+        : exec::MemoryReclaimer(priority), task_(task) {
       VELOX_CHECK_NOT_NULL(task);
     }
 
@@ -809,22 +944,6 @@ class Task : public std::enable_shared_from_this<Task> {
 
     std::weak_ptr<Task> task_;
   };
-
-  // Counts the number of created tasks which is incremented on each task
-  // creation.
-  static std::atomic<uint64_t> numCreatedTasks_;
-
-  // Counts the number of deleted tasks which is incremented on each task
-  // destruction.
-  static std::atomic<uint64_t> numDeletedTasks_;
-
-  static void taskCreated() {
-    ++numCreatedTasks_;
-  }
-
-  static void taskDeleted() {
-    ++numDeletedTasks_;
-  }
 
   /// Returns true if state is 'running'.
   bool isRunningLocked() const;
@@ -899,17 +1018,19 @@ class Task : public std::enable_shared_from_this<Task> {
   // Notifies listeners that the task is now complete.
   void onTaskCompletion();
 
+  void onAddSplit(const core::PlanNodeId& planNodeId, const exec::Split& split);
+
   // Returns true if all splits are finished processing and there are no more
   // splits coming for the task.
   bool isAllSplitsFinishedLocked();
 
   std::unique_ptr<ContinuePromise> addSplitLocked(
       SplitsState& splitsState,
-      exec::Split&& split);
+      const exec::Split& split);
 
   std::unique_ptr<ContinuePromise> addSplitToStoreLocked(
       SplitsStore& splitsStore,
-      exec::Split&& split);
+      const exec::Split& split);
 
   // Invoked when all the driver threads are off thread. The function returns
   // 'threadFinishPromises_' to fulfill.
@@ -937,6 +1058,24 @@ class Task : public std::enable_shared_from_this<Task> {
 
   ContinueFuture makeFinishFutureLocked(const char* comment);
 
+  // Invoked to start a barrier on the task. Returns a future that is realized
+  // when the barrier processing is complete.
+  ContinueFuture startBarrier(std::string_view comment);
+
+  // Invoked when the last driver has finished the barrier processing. The
+  // function resets the task barrier processing state, and returns the list of
+  // user barrier request 'promises' to resume.
+  void endBarrierLocked(std::vector<ContinuePromise>& promises);
+
+  // Invoked to start a barrier processig on a driver.
+  void startDriverBarriersLocked();
+
+  // Set to drop input for drivers that containing the operator instantiated
+  // from the given plan node.
+  void dropInputLocked(
+      const core::PlanNodeId& planNodeId,
+      std::vector<Driver*>& drivers);
+
   bool isOutputPipeline(int pipelineId) const {
     return driverFactories_[pipelineId]->outputDriver;
   }
@@ -951,7 +1090,8 @@ class Task : public std::enable_shared_from_this<Task> {
   // pipeline.
   void createExchangeClientLocked(
       int32_t pipelineId,
-      const core::PlanNodeId& planNodeId);
+      const core::PlanNodeId& planNodeId,
+      int32_t numberOfConsumers);
 
   // Get a shared reference to the exchange client with the specified exchange
   // plan node 'planNodeId'. The function returns null if there is no client
@@ -972,31 +1112,25 @@ class Task : public std::enable_shared_from_this<Task> {
       int32_t pipelineId) const;
 
   // Builds the query trace config.
-  std::optional<trace::QueryTraceConfig> maybeMakeTraceConfig() const;
+  std::optional<TraceConfig> maybeMakeTraceConfig() const;
 
   // Create a 'QueryMetadtaWriter' to trace the query metadata if the query
   // trace enabled.
-  void maybeInitQueryTrace();
+  void maybeInitTrace();
 
-  // The helper class used to maintain 'numCreatedTasks_' and 'numDeletedTasks_'
-  // on task construction and destruction.
-  class TaskCounter {
-   public:
-    TaskCounter() {
-      Task::taskCreated();
-    }
-    ~TaskCounter() {
-      Task::taskDeleted();
-    }
-  };
-  friend class Task::TaskCounter;
+  std::shared_ptr<Driver> getDriver(uint32_t driverId) const;
 
-  // NOTE: keep 'taskCount_' the first member so that it will be the first
-  // constructed member and the last destructed one. The purpose is to make
-  // 'numCreatedTasks_' and 'numDeletedTasks_' counting more robust to the
-  // timing race condition when used in scenarios such as waiting for all the
-  // tasks to be destructed in test.
-  const TaskCounter taskCounter_;
+  // Invokes to record the start/end time of task output batch processing time
+  // under serial execution mode.
+  void recordBatchStartTime();
+  void recordBatchEndTime();
+
+  void initSplitListeners();
+
+  /// Checks if the task supports barrier processing. Barrier processing is
+  /// supported when the task is under single threaded execution mode and all
+  /// its plan nodes support barrier processing.
+  void ensureBarrierSupport() const;
 
   // Universally unique identifier of the task. Used to identify the task when
   // calling TaskListener.
@@ -1005,14 +1139,32 @@ class Task : public std::enable_shared_from_this<Task> {
   // Application specific task ID specified at construction time. May not be
   // unique or universally unique.
   const std::string taskId_;
-  core::PlanFragment planFragment_;
+
   const int destination_;
-  const std::shared_ptr<core::QueryCtx> queryCtx_;
-  const std::optional<trace::QueryTraceConfig> traceConfig_;
 
   // The execution mode of the task. It is enforced that a task can only be
   // executed in a single mode throughout its lifetime
   const ExecutionMode mode_;
+
+  // In a multi-task system, it is used to make cross task decisions by memory
+  // arbitration to determine which task to reclaim first.
+  const int32_t memoryArbitrationPriority_;
+
+  std::shared_ptr<core::QueryCtx> queryCtx_;
+
+  core::PlanFragment planFragment_;
+
+  // First node in the plan fragment that does not support barrier processing.
+  // Barrier is supported when the task is under single threaded execution mode
+  // and all its plan nodes support barrier processing.
+  const core::PlanNode* firstNodeNotSupportingBarrier_{};
+
+  const std::optional<TraceConfig> traceConfig_;
+
+  inline static std::atomic_uint64_t numCreatedTasks_;
+
+  // Hook in the system wide task list.
+  TaskListEntry taskListEntry_;
 
   // Root MemoryPool for this Task. All member variables that hold references
   // to pool_ must be defined after pool_, childPools_.
@@ -1062,6 +1214,57 @@ class Task : public std::enable_shared_from_this<Task> {
 
   std::vector<std::unique_ptr<DriverFactory>> driverFactories_;
   std::vector<std::shared_ptr<Driver>> drivers_;
+
+  // Tracks the blocking state for each driver under serialized execution mode.
+  class DriverBlockingState {
+   public:
+    explicit DriverBlockingState(Driver* driver) : driver_(driver) {
+      VELOX_CHECK_NOT_NULL(driver_);
+    }
+
+    /// Sets driver future by setting the continuation callback via inline
+    /// executor. 'driverOp' and 'blockingReason' are set if the driver is
+    /// blocked by an operator.
+    void setDriverFuture(
+        ContinueFuture& diverFuture,
+        Operator* driverOp,
+        BlockingReason blockingReason);
+
+    /// Indicates if the associated driver is blocked or not. If blocked,
+    /// 'future' is set which becomes realized when the driver is unblocked.
+    ///
+    /// NOTE: the function throws if the driver has encountered error.
+    bool blocked(ContinueFuture* future);
+
+   private:
+    void clearLocked();
+
+    Driver* const driver_;
+
+    mutable std::mutex mutex_;
+    // Indicates if the associated driver is blocked or not.
+    bool blocked_{false};
+    // Sets the driver future error if not null.
+    std::exception_ptr error_{nullptr};
+    // If not null, set to the current blocking operator which should only be
+    // set if 'blocked_' is true.
+    Operator* op_{nullptr};
+    // Sets to blocking reason 'op_', and cleared when the driver is resumed.
+    BlockingReason blockingReason_{BlockingReason::kNotBlocked};
+    // Sets to the time that driver was blocked, and cleared when the driver is
+    // resumed.
+    uint64_t blockStartUs_{0};
+    // Promises to fulfill when the driver is unblocked.
+    std::vector<std::unique_ptr<ContinuePromise>> promises_;
+  };
+
+  // Tracks the task next batch processing start time under serialized execution
+  // mode.
+  std::optional<uint64_t> batchStartTimeMs_{std::nullopt};
+
+  // Tracks the driver blocking state under serialized execution mode.
+  std::vector<std::unique_ptr<DriverBlockingState>> driverBlockingStates_;
+
   // When Drivers are closed by the Task, there is a chance that race and/or
   // bugs can cause such Drivers to be held forever, in turn holding a pointer
   // to the Task making it a zombie Tasks. This vector is used to keep track of
@@ -1120,7 +1323,7 @@ class Task : public std::enable_shared_from_this<Task> {
   // queued split groups.
   std::queue<uint32_t> queuedSplitGroups_;
 
-  TaskState state_ = TaskState::kRunning;
+  TaskState state_{TaskState::kRunning};
 
   // Stores splits state structure for each plan node. At construction populated
   // with all leaf plan nodes that require splits. Afterwards accessed with
@@ -1156,8 +1359,18 @@ class Task : public std::enable_shared_from_this<Task> {
   // sometimes tested outside 'mutex_' for a value of 0/false,
   // which is safe to access without acquiring 'mutex_'.Thread counts
   // and promises are guarded by 'mutex_'
-  std::atomic<bool> pauseRequested_{false};
-  std::atomic<bool> terminateRequested_{false};
+  std::atomic_bool pauseRequested_{false};
+  std::atomic_bool terminateRequested_{false};
+
+  // If true, indicate this task is under barrier processing.
+  std::atomic_bool barrierRequested_{false};
+  // The start time of the current processing barrier.
+  uint64_t barrierStartUs_{0};
+  // The number of drivers under barrier processing.
+  uint32_t numDriversUnderBarrier_{0};
+  // The promises for the futures returned to callers of requestBarrier().
+  std::vector<ContinuePromise> barrierFinishPromises_;
+
   std::atomic<int32_t> toYield_ = 0;
   int32_t numThreads_ = 0;
   // Microsecond real time when 'this' last went from no threads to
@@ -1173,6 +1386,10 @@ class Task : public std::enable_shared_from_this<Task> {
   std::vector<ContinuePromise> resumePromises_;
   // Base spill directory for this task.
   std::string spillDirectory_;
+  // Spill directory callback for this task. This callback will be used to
+  // create the spill directory for this task. This callback returns
+  // a path that will be into spillDirectory_
+  std::function<std::string()> spillDirectoryCallback_;
 
   // Mutex to ensure only the first caller thread of 'getOrCreateSpillDirectory'
   // creates the directory.
@@ -1186,6 +1403,8 @@ class Task : public std::enable_shared_from_this<Task> {
       preloadingSplits_;
 
   folly::CancellationSource cancellationSource_;
+
+  std::vector<std::unique_ptr<SplitListener>> splitListeners_;
 };
 
 /// Listener invoked on task completion.
@@ -1201,6 +1420,20 @@ class TaskListener {
       TaskState state,
       std::exception_ptr error,
       TaskStats stats) = 0;
+
+  // onTaskCompletion() overload for the case when we pass PlanFragment
+  virtual void onTaskCompletion(
+      const std::string& taskUuid,
+      const std::string& taskId,
+      TaskState state,
+      std::exception_ptr error,
+      const TaskStats& stats,
+      const core::PlanFragment& /*fragment*/,
+      const std::
+          unordered_map<core::PlanNodeId, std::shared_ptr<ExchangeClient>>&
+      /*exchangeClientMap*/) {
+    onTaskCompletion(taskUuid, taskId, state, error, stats);
+  }
 };
 
 /// Register a listener to be invoked on task completion. Returns true if
@@ -1212,6 +1445,50 @@ bool registerTaskListener(std::shared_ptr<TaskListener> listener);
 /// unregistered successfuly, false if listener was not found.
 bool unregisterTaskListener(const std::shared_ptr<TaskListener>& listener);
 
+/// Listener invoked when splits are added to Task.
+class SplitListener {
+ public:
+  SplitListener(const std::string& taskId, const std::string& taskUuid)
+      : taskId_(taskId), taskUuid_(taskUuid) {}
+
+  virtual ~SplitListener() = default;
+
+  // Called when a split is added to a task for a given plan node.
+  virtual void onAddSplit(
+      const core::PlanNodeId& planNodeId,
+      const exec::Split& split) = 0;
+
+  /// Called on task completion. Provides the information about success or
+  /// failure as well as runtime statistics about task execution.
+  virtual void onTaskCompletion() = 0;
+
+ protected:
+  const std::string taskId_;
+  const std::string taskUuid_;
+};
+
+class SplitListenerFactory {
+ public:
+  virtual ~SplitListenerFactory() = default;
+
+  /// Create and return an std::unique_ptr<SplitListener> to be used by a Task
+  /// of the given taskId, taskUuid and config. The Task constructor calls this
+  /// method and holds the SplitListener. The SplitListener is destroyed when
+  /// the Task is destructed. This method can return a nullptr, e.g., if taskId
+  /// doesn't satisfy certain criteria or if config.maxNumSplitsListenedTo() is
+  /// 0. In this situation, the Task doesn't hold this SplitListener.
+  virtual std::unique_ptr<SplitListener> create(
+      const std::string& taskId,
+      const std::string& taskUuid,
+      const core::QueryConfig& config) = 0;
+};
+
+bool registerSplitListenerFactory(
+    const std::shared_ptr<SplitListenerFactory>& factory);
+
+bool unregisterSplitListenerFactory(
+    const std::shared_ptr<SplitListenerFactory>& factory);
+
 std::string executionModeString(Task::ExecutionMode mode);
 
 std::ostream& operator<<(std::ostream& out, Task::ExecutionMode mode);
@@ -1221,9 +1498,8 @@ std::ostream& operator<<(std::ostream& out, Task::ExecutionMode mode);
 template <>
 struct fmt::formatter<facebook::velox::exec::Task::ExecutionMode>
     : formatter<std::string> {
-  auto format(
-      facebook::velox::exec::Task::ExecutionMode m,
-      format_context& ctx) {
+  auto format(facebook::velox::exec::Task::ExecutionMode m, format_context& ctx)
+      const {
     return formatter<std::string>::format(
         facebook::velox::exec::executionModeString(m), ctx);
   }

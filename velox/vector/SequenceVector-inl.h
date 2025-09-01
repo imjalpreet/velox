@@ -18,13 +18,12 @@
 
 #include "velox/vector/BuilderTypeUtils.h"
 
-namespace facebook {
-namespace velox {
+namespace facebook::velox {
 
 template <typename T>
 SequenceVector<T>::SequenceVector(
     velox::memory::MemoryPool* pool,
-    size_t length,
+    vector_size_t length,
     VectorPtr sequenceValues,
     BufferPtr sequenceLengths,
     const SimpleVectorStats<T>& stats,
@@ -196,5 +195,4 @@ static inline vector_size_t offsetOfIndex(
   return *lastIndex;
 }
 
-} // namespace velox
-} // namespace facebook
+} // namespace facebook::velox

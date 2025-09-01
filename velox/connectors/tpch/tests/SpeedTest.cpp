@@ -56,6 +56,8 @@ using std::chrono::system_clock;
 class TpchSpeedTest {
  public:
   TpchSpeedTest() {
+    connector::registerConnectorFactory(
+        std::make_shared<connector::tpch::TpchConnectorFactory>());
     auto tpchConnector =
         connector::getConnectorFactory(
             connector::tpch::TpchConnectorFactory::kTpchConnectorName)
@@ -68,6 +70,8 @@ class TpchSpeedTest {
 
   ~TpchSpeedTest() {
     connector::unregisterConnector(kTpchConnectorId_);
+    connector::unregisterConnectorFactory(
+        connector::tpch::TpchConnectorFactory::kTpchConnectorName);
   }
 
   void run(tpch::Table table, size_t scaleFactor, size_t numSplits) {
@@ -90,11 +94,11 @@ class TpchSpeedTest {
     auto startTime = system_clock::now();
     intervalStart_ = startTime;
 
-    CursorParameters params;
+    exec::CursorParameters params;
     params.planNode = plan;
     params.maxDrivers = FLAGS_max_drivers;
 
-    auto taskCursor = TaskCursor::create(params);
+    auto taskCursor = exec::TaskCursor::create(params);
     taskCursor->start();
 
     auto task = taskCursor->task();
@@ -120,7 +124,7 @@ class TpchSpeedTest {
       task.addSplit(
           scanId,
           exec::Split(std::make_shared<connector::tpch::TpchConnectorSplit>(
-              kTpchConnectorId_, numSplits, i)));
+              kTpchConnectorId_, /*cacheable=*/true, numSplits, i)));
     }
 
     task.noMoreSplits(scanId);

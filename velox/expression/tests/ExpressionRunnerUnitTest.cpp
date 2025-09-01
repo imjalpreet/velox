@@ -36,7 +36,7 @@ class ExpressionRunnerUnitTest : public testing::Test, public VectorTestBase {
 
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   std::shared_ptr<memory::MemoryPool> pool_{
@@ -47,12 +47,11 @@ class ExpressionRunnerUnitTest : public testing::Test, public VectorTestBase {
 
 TEST_F(ExpressionRunnerUnitTest, run) {
   auto inputFile = exec::test::TempFilePath::create();
-  auto sqlFile = exec::test::TempFilePath::create();
+  auto selectivityVectorFile = exec::test::TempFilePath::create();
   auto resultFile = exec::test::TempFilePath::create();
   const auto inputPathStr = inputFile->getPath();
-  const char* inputPath = inputPathStr.data();
   const auto resultPathStr = resultFile->getPath();
-  const char* resultPath = resultPathStr.data();
+  const auto selectivityVectorPathStr = selectivityVectorFile->getPath();
   const int vectorSize = 100;
 
   VectorMaker vectorMaker(pool_.get());
@@ -60,22 +59,28 @@ TEST_F(ExpressionRunnerUnitTest, run) {
       {"c0"}, {vectorMaker.flatVector<StringView>(vectorSize, [](auto) {
         return "abc";
       })});
-  auto resultVector = vectorMaker.flatVector<int64_t>(
-      vectorSize, [](auto row) { return row * 100; });
-  saveVectorToFile(inputVector.get(), inputPath);
-  saveVectorToFile(resultVector.get(), resultPath);
+  SelectivityVector rows(vectorSize);
+  auto resultVector = vectorMaker.rowVector(
+      {"output0"}, {vectorMaker.flatVector<int64_t>(vectorSize, [](auto row) {
+        return row * 100;
+      })});
+  saveVectorToFile(inputVector.get(), inputPathStr.data());
+  saveVectorToFile(resultVector.get(), resultPathStr.data());
+  saveSelectivityVectorToFile(rows, selectivityVectorPathStr.data());
 
   for (bool useSeperatePoolForInput : {true, false}) {
     LOG(INFO) << "Using useSeperatePoolForInput: " << useSeperatePoolForInput;
     EXPECT_NO_THROW(ExpressionRunner::run(
-        inputPath,
+        inputPathStr.data(),
+        selectivityVectorPathStr.data(),
         "length(c0)",
         "",
-        resultPath,
+        resultPathStr.data(),
         "verify",
         0,
         "",
         "",
+        nullptr,
         false,
         useSeperatePoolForInput));
   }
@@ -90,8 +95,7 @@ TEST_F(ExpressionRunnerUnitTest, persistAndReproComplexSql) {
       BaseVector::wrapInConstant(1, 0, arrVector));
 
   ASSERT_EQ(
-      constantExpr->toString(),
-      "4 elements starting at 0 {[0->2] 3, [1->4] 5, [2->0] 1, [3->1] 2}");
+      constantExpr->toString(), "{[0->2] 3, [1->4] 5, [2->0] 1, [3->1] 2}");
 
   auto sqlExpr = exec::ExprSet({constantExpr}, &execCtx_, false).expr(0);
 
@@ -127,9 +131,8 @@ TEST_F(ExpressionRunnerUnitTest, persistAndReproComplexSql) {
   auto reproExprs = ExpressionRunner::parseSql(
       reproSql, nullptr, pool_.get(), reproComplexConstants);
   ASSERT_EQ(reproExprs.size(), 1);
-  // Note that ConstantExpr makes a copy of sharedConstantValue_ to guard
-  // against race conditions, which in effect falttens the array.
-  ASSERT_EQ(reproExprs[0]->toString(), "4 elements starting at 0 {3, 5, 1, 2}");
+  // Restored vector should have the exact same structure as the original one.
+  ASSERT_EQ(reproExprs[0]->toString(), constantExpr->toString());
 }
 
 TEST_F(ExpressionRunnerUnitTest, primitiveConstantsInexpressibleInSql) {

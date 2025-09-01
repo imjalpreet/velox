@@ -17,26 +17,32 @@ velox_add_library(
   ComplexVector.cpp
   ConstantVector.cpp
   DecodedVector.cpp
+  EncodedVectorCopy.cpp
+  FlatMapVector.cpp
   FlatVector.cpp
   LazyVector.cpp
   SelectivityVector.cpp
   SequenceVector.cpp
   SimpleVector.cpp
+  StringVectorBuffer.cpp
   VariantToVector.cpp
   VectorEncoding.cpp
   VectorMap.cpp
   VectorPool.cpp
   VectorPrinter.cpp
   VectorSaver.cpp
-  VectorStream.cpp)
+  VectorStream.cpp
+)
 
 velox_link_libraries(
   velox_vector
   velox_encode
   velox_memory
+  velox_row_fast
   velox_time
   velox_type
-  velox_buffer)
+  velox_buffer
+)
 
 add_subdirectory(arrow)
 add_subdirectory(fuzzer)

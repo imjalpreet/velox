@@ -15,24 +15,45 @@
  */
 
 #include "velox/vector/LazyVector.h"
-#include "velox/common/base/RawVector.h"
 #include "velox/common/base/RuntimeMetrics.h"
+#include "velox/common/memory/RawVector.h"
 #include "velox/common/time/CpuWallTimer.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SelectivityVector.h"
 
 namespace facebook::velox {
-
 namespace {
-void writeIOTiming(const CpuWallTiming& delta) {
-  addThreadLocalRuntimeStat(
-      LazyVector::kWallNanos,
-      RuntimeCounter(delta.wallNanos, RuntimeCounter::Unit::kNanos));
-  addThreadLocalRuntimeStat(
-      LazyVector::kCpuNanos,
-      RuntimeCounter(delta.cpuNanos, RuntimeCounter::Unit::kNanos));
-}
+
+// Convenience class to record cpu and wall time from construction, updating
+// thread local stats at destruction, including input bytes of the vector passed
+// as parameter.
+class LazyIoStatsRecorder {
+ public:
+  LazyIoStatsRecorder(VectorPtr* vector) : vector_(vector) {}
+
+  ~LazyIoStatsRecorder() {
+    auto cpuDelta = timer_.elapsed();
+    addThreadLocalRuntimeStat(
+        LazyVector::kWallNanos,
+        RuntimeCounter(cpuDelta.wallNanos, RuntimeCounter::Unit::kNanos));
+    addThreadLocalRuntimeStat(
+        LazyVector::kCpuNanos,
+        RuntimeCounter(cpuDelta.cpuNanos, RuntimeCounter::Unit::kNanos));
+
+    if (*vector_) {
+      addThreadLocalRuntimeStat(
+          LazyVector::kInputBytes,
+          RuntimeCounter(
+              (*vector_)->estimateFlatSize(), RuntimeCounter::Unit::kBytes));
+    }
+  }
+
+ private:
+  DeltaCpuWallTimeStopWatch timer_;
+  VectorPtr* vector_;
+};
+
 } // namespace
 
 void VectorLoader::load(
@@ -41,7 +62,7 @@ void VectorLoader::load(
     vector_size_t resultSize,
     VectorPtr* result) {
   {
-    DeltaCpuWallTimer timer([&](auto& delta) { writeIOTiming(delta); });
+    LazyIoStatsRecorder recorder(result);
     loadInternal(rows, hook, resultSize, result);
   }
   if (hook) {
@@ -56,7 +77,8 @@ void VectorLoader::load(
     const SelectivityVector& rows,
     ValueHook* hook,
     vector_size_t resultSize,
-    VectorPtr* result) {
+    VectorPtr* result,
+    memory::MemoryPool* pool) {
   if (rows.isAllSelected()) {
     const auto& indices = DecodedVector::consecutiveIndices();
     VELOX_DCHECK(!indices.empty());
@@ -69,7 +91,7 @@ void VectorLoader::load(
       return;
     }
   }
-  std::vector<vector_size_t> positions(rows.countSelected());
+  raw_vector<vector_size_t> positions(rows.countSelected(), pool);
   simd::indicesOfSetBits(
       rows.allBits(), rows.begin(), rows.end(), positions.data());
   load(positions, hook, resultSize, result);
@@ -170,7 +192,7 @@ void LazyVector::ensureLoadedRowsImpl(
 
   if (!baseLazyVector->isLoaded()) {
     // Create rowSet.
-    raw_vector<vector_size_t> rowNumbers;
+    raw_vector<vector_size_t> rowNumbers(baseLazyVector->pool());
     RowSet rowSet;
     if (decoded.isConstantMapping()) {
       rowNumbers.push_back(decoded.index(rows.begin()));
@@ -233,6 +255,7 @@ void LazyVector::validate(const VectorValidateOptions& options) const {
 
 void LazyVector::load(RowSet rows, ValueHook* hook) const {
   VELOX_CHECK(!allLoaded_, "A LazyVector can be loaded at most once");
+  VELOX_CHECK(!hook || supportsHook());
 
   allLoaded_ = true;
   if (rows.empty()) {
@@ -259,7 +282,7 @@ void LazyVector::loadVectorInternal() const {
       vector_ = BaseVector::create(type_, 0, pool_);
     }
     SelectivityVector allRows(BaseVector::length_);
-    loader_->load(allRows, nullptr, size(), &vector_);
+    loader_->load(allRows, nullptr, size(), &vector_, pool_);
     VELOX_CHECK_NOT_NULL(vector_);
     if (vector_->encoding() == VectorEncoding::Simple::LAZY) {
       vector_ = vector_->asUnchecked<LazyVector>()->loadedVectorShared();

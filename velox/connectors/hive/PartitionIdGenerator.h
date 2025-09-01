@@ -52,7 +52,9 @@ class PartitionIdGenerator {
   /// style. It is derived from the partitionValues_ at index partitionId.
   /// Partition keys appear in the order of partition columns in the table
   /// schema.
-  std::string partitionName(uint64_t partitionId) const;
+  std::string partitionName(
+      uint64_t partitionId,
+      const std::string& nullValueName = "") const;
 
  private:
   static constexpr const int32_t kHasherReservePct = 20;
@@ -74,6 +76,8 @@ class PartitionIdGenerator {
       uint64_t partitionId,
       const RowVectorPtr& input,
       vector_size_t row);
+
+  memory::MemoryPool* const pool_;
 
   const std::vector<column_index_t> partitionChannels_;
 

@@ -16,25 +16,16 @@
 
 #include "velox/connectors/hive/HiveConnectorUtil.h"
 
-#include "velox/connectors/hive/FileHandle.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
-#include "velox/connectors/hive/TableHandle.h"
-#include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/CachedBufferedInput.h"
 #include "velox/dwio/common/DirectBufferedInput.h"
-#include "velox/dwio/common/Reader.h"
-#include "velox/dwio/dwrf/common/Config.h"
-#include "velox/dwio/dwrf/writer/Writer.h"
-
-#ifdef VELOX_ENABLE_PARQUET
-#include "velox/dwio/parquet/writer/Writer.h" // @manual
-#endif
-
 #include "velox/expression/Expr.h"
 #include "velox/expression/ExprToSubfieldFilter.h"
-#include "velox/type/TimestampConversion.h"
-#include "velox/type/tz/TimeZoneMap.h"
+
+#include <boost/lexical_cast.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 
 namespace facebook::velox::connector::hive {
 namespace {
@@ -255,15 +246,14 @@ inline uint8_t parseDelimiter(const std::string& delim) {
 
 inline bool isSynthesizedColumn(
     const std::string& name,
-    const std::unordered_map<std::string, std::shared_ptr<HiveColumnHandle>>&
-        infoColumns) {
-  return name == kPath || name == kBucket || infoColumns.count(name) != 0;
+    const std::unordered_map<std::string, HiveColumnHandlePtr>& infoColumns) {
+  return infoColumns.count(name) != 0;
 }
 
-inline bool isRowIndexColumn(
+bool isSpecialColumn(
     const std::string& name,
-    std::shared_ptr<HiveColumnHandle> rowIndexColumn) {
-  return rowIndexColumn != nullptr && rowIndexColumn->name() == name;
+    const std::optional<std::string>& specialName) {
+  return specialName.has_value() && name == *specialName;
 }
 
 } // namespace
@@ -276,7 +266,7 @@ const std::string& getColumnName(const common::Subfield& subfield) {
   return field->name();
 }
 
-void checkColumnNameLowerCase(const std::shared_ptr<const Type>& type) {
+void checkColumnNameLowerCase(const TypePtr& type) {
   switch (type->kind()) {
     case TypeKind::ARRAY:
       checkColumnNameLowerCase(type->asArray().elementType());
@@ -301,9 +291,8 @@ void checkColumnNameLowerCase(const std::shared_ptr<const Type>& type) {
 }
 
 void checkColumnNameLowerCase(
-    const SubfieldFilters& filters,
-    const std::unordered_map<std::string, std::shared_ptr<HiveColumnHandle>>&
-        infoColumns) {
+    const common::SubfieldFilters& filters,
+    const std::unordered_map<std::string, HiveColumnHandlePtr>& infoColumns) {
   for (const auto& filterIt : filters) {
     const auto name = filterIt.first.toString();
     if (isSynthesizedColumn(name, infoColumns)) {
@@ -343,7 +332,11 @@ void processFieldSpec(
     if (type.isMap() && !spec.isConstant()) {
       auto* keys = spec.childByName(common::ScanSpec::kMapKeysFieldName);
       VELOX_CHECK_NOT_NULL(keys);
-      keys->addFilter(common::IsNotNull());
+      if (keys->filter()) {
+        VELOX_CHECK(!keys->filter()->testNull());
+      } else {
+        keys->setFilter(std::make_shared<common::IsNotNull>());
+      }
     }
   });
   if (dataColumns) {
@@ -362,13 +355,12 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
     const RowTypePtr& rowType,
     const folly::F14FastMap<std::string, std::vector<const common::Subfield*>>&
         outputSubfields,
-    const SubfieldFilters& filters,
+    const common::SubfieldFilters& filters,
     const RowTypePtr& dataColumns,
-    const std::unordered_map<std::string, std::shared_ptr<HiveColumnHandle>>&
-        partitionKeys,
-    const std::unordered_map<std::string, std::shared_ptr<HiveColumnHandle>>&
-        infoColumns,
-    const std::shared_ptr<HiveColumnHandle>& rowIndexColumn,
+    const std::unordered_map<std::string, HiveColumnHandlePtr>& partitionKeys,
+    const std::unordered_map<std::string, HiveColumnHandlePtr>& infoColumns,
+    const SpecialColumnNames& specialColumns,
+    bool disableStatsBasedFilterReorder,
     memory::MemoryPool* pool) {
   auto spec = std::make_shared<common::ScanSpec>("root");
   folly::F14FastMap<std::string, std::vector<const common::Subfield*>>
@@ -377,24 +369,35 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
   for (auto& [subfield, _] : filters) {
     if (auto name = subfield.toString();
         !isSynthesizedColumn(name, infoColumns) &&
-        !isRowIndexColumn(name, rowIndexColumn) &&
         partitionKeys.count(name) == 0) {
+      VELOX_CHECK(!isSpecialColumn(name, specialColumns.rowIndex));
+      VELOX_CHECK(!isSpecialColumn(name, specialColumns.rowId));
       filterSubfields[getColumnName(subfield)].push_back(&subfield);
     }
   }
 
-  int numChildren = 0;
   // Process columns that will be projected out.
   for (int i = 0; i < rowType->size(); ++i) {
     auto& name = rowType->nameOf(i);
     auto& type = rowType->childAt(i);
-    if (isRowIndexColumn(name, rowIndexColumn)) {
+    if (isSpecialColumn(name, specialColumns.rowIndex)) {
       VELOX_CHECK(type->isBigint());
+      auto* fieldSpec = spec->addField(name, i);
+      fieldSpec->setColumnType(common::ScanSpec::ColumnType::kRowIndex);
+      continue;
+    }
+    if (isSpecialColumn(name, specialColumns.rowId)) {
+      VELOX_CHECK(type->isRow() && type->size() == 5);
+      auto& rowIdType = type->asRow();
+      auto* fieldSpec = spec->addFieldRecursively(name, rowIdType, i);
+      fieldSpec->setColumnType(common::ScanSpec::ColumnType::kComposite);
+      fieldSpec->childByName(rowIdType.nameOf(0))
+          ->setColumnType(common::ScanSpec::ColumnType::kRowIndex);
       continue;
     }
     auto it = outputSubfields.find(name);
     if (it == outputSubfields.end()) {
-      auto* fieldSpec = spec->addFieldRecursively(name, *type, numChildren++);
+      auto* fieldSpec = spec->addFieldRecursively(name, *type, i);
       processFieldSpec(dataColumns, type, *fieldSpec);
       filterSubfields.erase(name);
       continue;
@@ -409,7 +412,7 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
       }
       filterSubfields.erase(it);
     }
-    auto* fieldSpec = spec->addField(name, numChildren++);
+    auto* fieldSpec = spec->addField(name, i);
     addSubfields(*type, subfieldSpecs, 1, pool, *fieldSpec);
     processFieldSpec(dataColumns, type, *fieldSpec);
     subfieldSpecs.clear();
@@ -443,11 +446,14 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
     if (isSynthesizedColumn(name, infoColumns)) {
       continue;
     }
-    VELOX_CHECK(!isRowIndexColumn(name, rowIndexColumn));
     auto fieldSpec = spec->getOrCreateChild(pair.first);
-    fieldSpec->addFilter(*pair.second);
+    VELOX_CHECK_NULL(spec->filter());
+    fieldSpec->setFilter(pair.second);
   }
 
+  if (disableStatsBasedFilterReorder) {
+    spec->disableStatsBasedFilterReorder();
+  }
   return spec;
 }
 
@@ -524,46 +530,67 @@ std::unique_ptr<dwio::common::SerDeOptions> parseSerdeParameters(
 }
 
 void configureReaderOptions(
-    dwio::common::ReaderOptions& readerOptions,
     const std::shared_ptr<const HiveConfig>& hiveConfig,
     const ConnectorQueryCtx* connectorQueryCtx,
     const std::shared_ptr<const HiveTableHandle>& hiveTableHandle,
-    const std::shared_ptr<const HiveConnectorSplit>& hiveSplit) {
+    const std::shared_ptr<const HiveConnectorSplit>& hiveSplit,
+    dwio::common::ReaderOptions& readerOptions) {
   configureReaderOptions(
-      readerOptions,
       hiveConfig,
       connectorQueryCtx,
       hiveTableHandle->dataColumns(),
       hiveSplit,
-      hiveTableHandle->tableParameters());
+      hiveTableHandle->tableParameters(),
+      readerOptions);
 }
 
 void configureReaderOptions(
-    dwio::common::ReaderOptions& readerOptions,
     const std::shared_ptr<const HiveConfig>& hiveConfig,
     const ConnectorQueryCtx* connectorQueryCtx,
     const RowTypePtr& fileSchema,
     const std::shared_ptr<const HiveConnectorSplit>& hiveSplit,
-    const std::unordered_map<std::string, std::string>& tableParameters) {
+    const std::unordered_map<std::string, std::string>& tableParameters,
+    dwio::common::ReaderOptions& readerOptions) {
   auto sessionProperties = connectorQueryCtx->sessionProperties();
-  readerOptions.setLoadQuantum(hiveConfig->loadQuantum());
-  readerOptions.setMaxCoalesceBytes(hiveConfig->maxCoalescedBytes());
-  readerOptions.setMaxCoalesceDistance(hiveConfig->maxCoalescedDistanceBytes());
+  readerOptions.setLoadQuantum(hiveConfig->loadQuantum(sessionProperties));
+  readerOptions.setMaxCoalesceBytes(
+      hiveConfig->maxCoalescedBytes(sessionProperties));
+  readerOptions.setMaxCoalesceDistance(
+      hiveConfig->maxCoalescedDistanceBytes(sessionProperties));
   readerOptions.setFileColumnNamesReadAsLowerCase(
       hiveConfig->isFileColumnNamesReadAsLowerCase(sessionProperties));
+  readerOptions.setAllowEmptyFile(true);
+  bool useColumnNamesForColumnMapping = false;
+  switch (hiveSplit->fileFormat) {
+    case dwio::common::FileFormat::DWRF:
+    case dwio::common::FileFormat::ORC: {
+      useColumnNamesForColumnMapping =
+          hiveConfig->isOrcUseColumnNames(sessionProperties);
+      break;
+    }
+    case dwio::common::FileFormat::PARQUET: {
+      useColumnNamesForColumnMapping =
+          hiveConfig->isParquetUseColumnNames(sessionProperties);
+      break;
+    }
+    default:
+      useColumnNamesForColumnMapping = false;
+  }
+
   readerOptions.setUseColumnNamesForColumnMapping(
-      hiveConfig->isOrcUseColumnNames(sessionProperties));
+      useColumnNamesForColumnMapping);
   readerOptions.setFileSchema(fileSchema);
   readerOptions.setFooterEstimatedSize(hiveConfig->footerEstimatedSize());
   readerOptions.setFilePreloadThreshold(hiveConfig->filePreloadThreshold());
   readerOptions.setPrefetchRowGroups(hiveConfig->prefetchRowGroups());
-  readerOptions.setNoCacheRetention(
-      hiveConfig->cacheNoRetention(sessionProperties));
+  readerOptions.setNoCacheRetention(!hiveSplit->cacheable);
   const auto& sessionTzName = connectorQueryCtx->sessionTimezone();
   if (!sessionTzName.empty()) {
     const auto timezone = tz::locateZone(sessionTzName);
     readerOptions.setSessionTimezone(timezone);
   }
+  readerOptions.setAdjustTimestampToTimezone(
+      connectorQueryCtx->adjustTimestampToTimezone());
   readerOptions.setSelectiveNimbleReaderEnabled(
       connectorQueryCtx->selectiveNimbleReaderEnabled());
 
@@ -605,7 +632,10 @@ void configureRowReaderOptions(
   if (hiveConfig && sessionProperties) {
     rowReaderOptions.setTimestampPrecision(static_cast<TimestampPrecision>(
         hiveConfig->readTimestampUnit(sessionProperties)));
+    rowReaderOptions.setPreserveFlatMapsInMemory(
+        hiveConfig->preserveFlatMapsInMemory(sessionProperties));
   }
+  rowReaderOptions.setSerdeParameters(hiveSplit->serdeParameters);
 }
 
 namespace {
@@ -613,12 +643,19 @@ namespace {
 bool applyPartitionFilter(
     const TypePtr& type,
     const std::string& partitionValue,
-    common::Filter* filter) {
+    bool isPartitionDateDaysSinceEpoch,
+    const common::Filter* filter,
+    bool asLocalTime) {
   if (type->isDate()) {
-    const auto result = util::fromDateString(
-        StringView(partitionValue), util::ParseMode::kPrestoCast);
-    VELOX_CHECK(!result.hasError());
-    return applyFilter(*filter, result.value());
+    int32_t result = 0;
+    // days_since_epoch partition values are integers in string format. Eg.
+    // Iceberg partition values.
+    if (isPartitionDateDaysSinceEpoch) {
+      result = folly::to<int32_t>(partitionValue);
+    } else {
+      result = DATE()->toDays(static_cast<folly::StringPiece>(partitionValue));
+    }
+    return applyFilter(*filter, result);
   }
 
   switch (type->kind()) {
@@ -634,6 +671,15 @@ bool applyPartitionFilter(
     }
     case TypeKind::BOOLEAN: {
       return applyFilter(*filter, folly::to<bool>(partitionValue));
+    }
+    case TypeKind::TIMESTAMP: {
+      auto result = util::fromTimestampString(
+          StringView(partitionValue), util::TimestampParseMode::kPrestoCast);
+      VELOX_CHECK(!result.hasError());
+      if (asLocalTime) {
+        result.value().toGMT(Timestamp::defaultTimezone());
+      }
+      return applyFilter(*filter, result.value());
     }
     case TypeKind::VARCHAR: {
       return applyFilter(*filter, partitionValue);
@@ -652,8 +698,9 @@ bool testFilters(
     const std::string& filePath,
     const std::unordered_map<std::string, std::optional<std::string>>&
         partitionKeys,
-    const std::unordered_map<std::string, std::shared_ptr<HiveColumnHandle>>&
-        partitionKeysHandle) {
+    const std::unordered_map<std::string, HiveColumnHandlePtr>&
+        partitionKeysHandle,
+    bool asLocalTime) {
   const auto totalRows = reader->numberOfRows();
   const auto& fileTypeWithId = reader->typeWithId();
   const auto& rowType = reader->rowType();
@@ -673,7 +720,9 @@ bool testFilters(
           return applyPartitionFilter(
               handlesIter->second->dataType(),
               iter->second.value(),
-              child->filter());
+              handlesIter->second->isPartitionDateValueDaysSinceEpoch(),
+              child->filter(),
+              asLocalTime);
         }
         // Column is missing, most likely due to schema evolution. Or it's a
         // partition key but the partition value is NULL.
@@ -710,28 +759,43 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
     const dwio::common::ReaderOptions& readerOpts,
     const ConnectorQueryCtx* connectorQueryCtx,
     std::shared_ptr<io::IoStatistics> ioStats,
+    std::shared_ptr<filesystems::File::IoStats> fsStats,
     folly::Executor* executor) {
   if (connectorQueryCtx->cache()) {
     return std::make_unique<dwio::common::CachedBufferedInput>(
         fileHandle.file,
         dwio::common::MetricsLog::voidLog(),
-        fileHandle.uuid.id(),
+        fileHandle.uuid,
         connectorQueryCtx->cache(),
         Connector::getTracker(
             connectorQueryCtx->scanId(), readerOpts.loadQuantum()),
-        fileHandle.groupId.id(),
+        fileHandle.groupId,
         ioStats,
+        std::move(fsStats),
         executor,
         readerOpts);
+  }
+  if (readerOpts.fileFormat() == dwio::common::FileFormat::NIMBLE) {
+    // Nimble streams (in case of single chunk) are compressed as whole and need
+    // to be fully fetched in order to do decompression, so there is no point to
+    // fetch them by quanta.  Just use BufferedInput to fetch streams as whole
+    // to reduce memory footprint.
+    return std::make_unique<dwio::common::BufferedInput>(
+        fileHandle.file,
+        readerOpts.memoryPool(),
+        dwio::common::MetricsLog::voidLog(),
+        ioStats.get(),
+        fsStats.get());
   }
   return std::make_unique<dwio::common::DirectBufferedInput>(
       fileHandle.file,
       dwio::common::MetricsLog::voidLog(),
-      fileHandle.uuid.id(),
+      fileHandle.uuid,
       Connector::getTracker(
           connectorQueryCtx->scanId(), readerOpts.loadQuantum()),
-      fileHandle.groupId.id(),
+      fileHandle.groupId,
       std::move(ioStats),
+      std::move(fsStats),
       executor,
       readerOpts);
 }
@@ -809,7 +873,7 @@ core::TypedExprPtr extractFiltersFromRemainingFilter(
     const core::TypedExprPtr& expr,
     core::ExpressionEvaluator* evaluator,
     bool negated,
-    SubfieldFilters& filters,
+    common::SubfieldFilters& filters,
     double& sampleRate) {
   auto* call = dynamic_cast<const core::CallTypedExpr*>(expr.get());
   if (call == nullptr) {
@@ -818,8 +882,9 @@ core::TypedExprPtr extractFiltersFromRemainingFilter(
   common::Filter* oldFilter = nullptr;
   try {
     common::Subfield subfield;
-    if (auto filter = exec::leafCallToSubfieldFilter(
-            *call, subfield, evaluator, negated)) {
+    if (auto filter = exec::ExprToSubfieldFilterParser::getInstance()
+                          ->leafCallToSubfieldFilter(
+                              *call, subfield, evaluator, negated)) {
       if (auto it = filters.find(subfield); it != filters.end()) {
         oldFilter = it->second.get();
         filter = filter->mergeWith(oldFilter);
@@ -865,151 +930,8 @@ core::TypedExprPtr extractFiltersFromRemainingFilter(
   return expr;
 }
 
-namespace {
-
-#ifdef VELOX_ENABLE_PARQUET
-std::optional<TimestampUnit> getTimestampUnit(
-    const config::ConfigBase& config,
-    const char* configKey) {
-  if (const auto unit = config.get<uint8_t>(configKey)) {
-    VELOX_CHECK(
-        unit == 0 /*second*/ || unit == 3 /*milli*/ || unit == 6 /*micro*/ ||
-            unit == 9 /*nano*/,
-        "Invalid timestamp unit: {}",
-        unit.value());
-    return std::optional(static_cast<TimestampUnit>(unit.value()));
-  }
-  return std::nullopt;
-}
-
-std::optional<std::string> getTimestampTimeZone(
-    const config::ConfigBase& config,
-    const char* configKey) {
-  if (const auto timezone = config.get<std::string>(configKey)) {
-    return timezone.value();
-  }
-  return std::nullopt;
-}
-
-void updateParquetWriterOptions(
-    const std::shared_ptr<const HiveConfig>& hiveConfig,
-    const config::ConfigBase* sessionProperties,
-    std::shared_ptr<dwio::common::WriterOptions>& writerOptions) {
-  auto parquetWriterOptions =
-      std::dynamic_pointer_cast<parquet::WriterOptions>(writerOptions);
-  VELOX_CHECK_NOT_NULL(
-      parquetWriterOptions,
-      "Parquet writer expected a Parquet WriterOptions object.");
-
-  if (!parquetWriterOptions->parquetWriteTimestampUnit) {
-    parquetWriterOptions->parquetWriteTimestampUnit =
-        getTimestampUnit(
-            *sessionProperties,
-            parquet::WriterOptions::kParquetSessionWriteTimestampUnit)
-            .has_value()
-        ? getTimestampUnit(
-              *sessionProperties,
-              parquet::WriterOptions::kParquetSessionWriteTimestampUnit)
-        : getTimestampUnit(
-              *hiveConfig->config(),
-              parquet::WriterOptions::kParquetSessionWriteTimestampUnit);
-  }
-
-  if (!parquetWriterOptions->parquetWriteTimestampTimeZone) {
-    parquetWriterOptions->parquetWriteTimestampTimeZone =
-        getTimestampTimeZone(
-            *sessionProperties, core::QueryConfig::kSessionTimezone)
-            .has_value()
-        ? getTimestampTimeZone(
-              *sessionProperties, core::QueryConfig::kSessionTimezone)
-        : getTimestampTimeZone(
-              *hiveConfig->config(), core::QueryConfig::kSessionTimezone);
-  }
-
-  writerOptions = std::move(parquetWriterOptions);
-}
-#endif
-
-void updateDWRFWriterOptions(
-    const std::shared_ptr<const HiveConfig>& hiveConfig,
-    const config::ConfigBase* sessionProperties,
-    std::shared_ptr<dwio::common::WriterOptions>& writerOptions) {
-  auto dwrfWriterOptions =
-      std::dynamic_pointer_cast<dwrf::WriterOptions>(writerOptions);
-  VELOX_CHECK_NOT_NULL(
-      dwrfWriterOptions, "DWRF writer expected a DWRF WriterOptions object.");
-  std::map<std::string, std::string> configs;
-
-  if (writerOptions->compressionKind.has_value()) {
-    configs.emplace(
-        dwrf::Config::COMPRESSION.key,
-        std::to_string(writerOptions->compressionKind.value()));
-  }
-
-  configs.emplace(
-      dwrf::Config::STRIPE_SIZE.key,
-      std::to_string(hiveConfig->orcWriterMaxStripeSize(sessionProperties)));
-
-  configs.emplace(
-      dwrf::Config::MAX_DICTIONARY_SIZE.key,
-      std::to_string(
-          hiveConfig->orcWriterMaxDictionaryMemory(sessionProperties)));
-
-  configs.emplace(
-      dwrf::Config::INTEGER_DICTIONARY_ENCODING_ENABLED.key,
-      std::to_string(hiveConfig->isOrcWriterIntegerDictionaryEncodingEnabled(
-          sessionProperties)));
-  configs.emplace(
-      dwrf::Config::STRING_DICTIONARY_ENCODING_ENABLED.key,
-      std::to_string(hiveConfig->isOrcWriterStringDictionaryEncodingEnabled(
-          sessionProperties)));
-
-  configs.emplace(
-      dwrf::Config::COMPRESSION_BLOCK_SIZE_MIN.key,
-      std::to_string(
-          hiveConfig->orcWriterMinCompressionSize(sessionProperties)));
-
-  configs.emplace(
-      dwrf::Config::LINEAR_STRIPE_SIZE_HEURISTICS.key,
-      std::to_string(
-          hiveConfig->orcWriterLinearStripeSizeHeuristics(sessionProperties)));
-
-  configs.emplace(
-      dwrf::Config::ZLIB_COMPRESSION_LEVEL.key,
-      std::to_string(
-          hiveConfig->orcWriterZLIBCompressionLevel(sessionProperties)));
-
-  configs.emplace(
-      dwrf::Config::ZSTD_COMPRESSION_LEVEL.key,
-      std::to_string(
-          hiveConfig->orcWriterZSTDCompressionLevel(sessionProperties)));
-
-  dwrfWriterOptions->config = dwrf::Config::fromMap(configs);
-  writerOptions = std::move(dwrfWriterOptions);
-}
-
-} // namespace
-
-void updateWriterOptionsFromHiveConfig(
-    dwio::common::FileFormat fileFormat,
-    const std::shared_ptr<const HiveConfig>& hiveConfig,
-    const config::ConfigBase* sessionProperties,
-    std::shared_ptr<dwio::common::WriterOptions>& writerOptions) {
-  switch (fileFormat) {
-    case dwio::common::FileFormat::DWRF:
-      updateDWRFWriterOptions(hiveConfig, sessionProperties, writerOptions);
-      break;
-    case dwio::common::FileFormat::PARQUET:
-#ifdef VELOX_ENABLE_PARQUET
-      updateParquetWriterOptions(hiveConfig, sessionProperties, writerOptions);
-#endif
-      break;
-    case dwio::common::FileFormat::NIMBLE:
-      // No-op for now.
-      break;
-    default:
-      VELOX_UNSUPPORTED("{}", fileFormat);
-  }
+std::string makeUuid() {
+  return boost::lexical_cast<std::string>(boost::uuids::random_generator()());
 }
 
 } // namespace facebook::velox::connector::hive

@@ -27,6 +27,7 @@ class ScanSpec;
 namespace facebook::velox::parquet {
 
 StructColumnReader::StructColumnReader(
+    const dwio::common::ColumnReaderOptions& columnReaderOptions,
     const TypePtr& requestedType,
     const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
     ParquetParams& params,
@@ -35,14 +36,22 @@ StructColumnReader::StructColumnReader(
   auto& childSpecs = scanSpec_->stableChildren();
   for (auto i = 0; i < childSpecs.size(); ++i) {
     auto childSpec = childSpecs[i];
-    if (childSpecs[i]->isConstant()) {
+    if (childSpec->isConstant() || isChildMissing(*childSpec)) {
+      childSpec->setSubscript(kConstantChildSpecSubscript);
+      continue;
+    }
+    if (!childSpecs[i]->readFromFile()) {
       continue;
     }
     auto childFileType = fileType_->childByName(childSpec->fieldName());
     auto childRequestedType =
         requestedType_->asRow().findChild(childSpec->fieldName());
     addChild(ParquetColumnReader::build(
-        childRequestedType, childFileType, params, *childSpec));
+        columnReaderOptions,
+        childRequestedType,
+        childFileType,
+        params,
+        *childSpec));
 
     childSpecs[i]->setSubscript(children_.size() - 1);
   }
@@ -97,7 +106,7 @@ StructColumnReader::findBestLeaf() {
 }
 
 void StructColumnReader::read(
-    vector_size_t offset,
+    int64_t offset,
     const RowSet& rows,
     const uint64_t* /*incomingNulls*/) {
   ensureRepDefs(*this, offset + rows.back() + 1 - readOffset_);
@@ -141,7 +150,7 @@ void StructColumnReader::enqueueRowGroup(
   }
 }
 
-void StructColumnReader::seekToRowGroup(uint32_t index) {
+void StructColumnReader::seekToRowGroup(int64_t index) {
   SelectiveStructColumnReader::seekToRowGroup(index);
   BufferPtr noBuffer;
   formatData_->as<ParquetData>().setNulls(noBuffer, 0);
@@ -170,7 +179,7 @@ void StructColumnReader::seekToEndOfPresetNulls() {
 }
 
 void StructColumnReader::setNullsFromRepDefs(PageReader& pageReader) {
-  if (levelInfo_.def_level == 0) {
+  if (levelInfo_.defLevel == 0) {
     return;
   }
   auto repDefRange = pageReader.repDefRange();

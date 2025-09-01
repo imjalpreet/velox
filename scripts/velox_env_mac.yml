@@ -22,7 +22,7 @@ variables:
   CXX: clang++
 
 dependencies:
-# tools
+  # tools
   - binutils
   - bison
   - clangxx=14 # pin to something recent'ish to avoid warings on upgrade
@@ -36,8 +36,9 @@ dependencies:
   - openjdk=8.*
   - python=3.8
   - sysroot_linux-64=2.17
-# dependencies
+  # dependencies
   - aws-sdk-cpp
+  - azure-identity-cpp
   - azure-storage-blobs-cpp
   - boost-cpp
   - bzip2
@@ -55,7 +56,6 @@ dependencies:
   - libsodium
   - libtool
   - lz4-c
-  - lzo
   - openssl=1.1.*
   - re2
   - snappy
@@ -63,4 +63,3 @@ dependencies:
   - xz
   - zlib
   - zstd
-

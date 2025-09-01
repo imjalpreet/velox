@@ -32,13 +32,6 @@
 namespace facebook::velox {
 namespace {
 
-void populateSimpleFunctionSignatures(FunctionSignatureMap& map) {
-  const auto& simpleFunctions = exec::simpleFunctions();
-  for (const auto& functionName : simpleFunctions.getFunctionNames()) {
-    map[functionName] = simpleFunctions.getFunctionSignatures(functionName);
-  }
-}
-
 void populateVectorFunctionSignatures(FunctionSignatureMap& map) {
   auto vectorFunctions = exec::vectorFunctionFactories();
   vectorFunctions.withRLock([&map](const auto& locked) {
@@ -58,10 +51,31 @@ void populateVectorFunctionSignatures(FunctionSignatureMap& map) {
 } // namespace
 
 FunctionSignatureMap getFunctionSignatures() {
-  FunctionSignatureMap result;
-  populateSimpleFunctionSignatures(result);
+  const auto& simpleFunctions = exec::simpleFunctions();
+  FunctionSignatureMap result = simpleFunctions.getFunctionSignatureMap();
   populateVectorFunctionSignatures(result);
   return result;
+}
+
+std::vector<const exec::FunctionSignature*> getFunctionSignatures(
+    const std::string& functionName) {
+  // Some functions have both simple and vector implementations (for different
+  // signatures). Collect all signatures.
+  // Check simple functions first.
+  auto signatures = exec::simpleFunctions().getFunctionSignatures(functionName);
+
+  // Check vector functions.
+  auto& vectorFunctions = exec::vectorFunctionFactories();
+  vectorFunctions.withRLock([&](const auto& functions) {
+    auto it = functions.find(functionName);
+    if (it != functions.end()) {
+      for (const auto& signature : it->second.signatures) {
+        signatures.push_back(signature.get());
+      }
+    }
+  });
+
+  return signatures;
 }
 
 FunctionSignatureMap getVectorFunctionSignatures() {
@@ -84,8 +98,8 @@ std::optional<bool> isDeterministic(const std::string& functionName) {
     return std::nullopt;
   }
 
-  for (const auto& [metadata, _] : simpleFunctions) {
-    if (!metadata.deterministic) {
+  for (const auto& [metadata_2, _] : simpleFunctions) {
+    if (!metadata_2.deterministic) {
       return false;
     }
   }
@@ -105,6 +119,22 @@ TypePtr resolveFunction(
 
   // Check if VectorFunctions has this function name + signature.
   return resolveVectorFunction(functionName, argTypes);
+}
+
+TypePtr resolveFunctionWithCoercions(
+    const std::string& functionName,
+    const std::vector<TypePtr>& argTypes,
+    std::vector<TypePtr>& coercions) {
+  // Check if this is a simple function.
+  if (auto resolvedFunction =
+          exec::simpleFunctions().resolveFunctionWithCoercions(
+              functionName, argTypes, coercions)) {
+    return resolvedFunction->type();
+  }
+
+  // Check if VectorFunctions has this function name + signature.
+  return exec::resolveVectorFunctionWithCoercions(
+      functionName, argTypes, coercions);
 }
 
 std::optional<std::pair<TypePtr, exec::VectorFunctionMetadata>>
@@ -158,6 +188,12 @@ resolveVectorFunctionWithMetadata(
     const std::string& functionName,
     const std::vector<TypePtr>& argTypes) {
   return exec::resolveVectorFunctionWithMetadata(functionName, argTypes);
+}
+
+void removeFunction(const std::string& functionName) {
+  exec::mutableSimpleFunctions().removeFunction(functionName);
+  exec::vectorFunctionFactories().withWLock(
+      [&](auto& functionMap) { functionMap.erase(functionName); });
 }
 
 } // namespace facebook::velox

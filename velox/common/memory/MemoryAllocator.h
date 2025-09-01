@@ -87,7 +87,7 @@ struct Stats {
   /// power of 2 >= the allocation size.
   static constexpr int32_t kNumSizes = 20;
   Stats() {
-    for (auto i = 0; i < sizes.size(); ++i) {
+    for (size_t i = 0; i < sizes.size(); ++i) {
       sizes[i].size = 1 << i;
     }
   }
@@ -341,6 +341,8 @@ class MemoryAllocator : public std::enable_shared_from_this<MemoryAllocator> {
 
   virtual MachinePageCount numMapped() const = 0;
 
+  virtual MachinePageCount numExternalMapped() const = 0;
+
   virtual Stats stats() const {
     return stats_;
   }
@@ -502,6 +504,14 @@ class MemoryAllocator : public std::enable_shared_from_this<MemoryAllocator> {
   // system by 'this' (via madvise calls).
   std::atomic<MachinePageCount> numMapped_{0};
 
+  // Number of pages allocated and explicitly mmap'd by the
+  // application via allocateContiguous, outside of
+  // 'sizeClasses'. These pages are counted in 'numAllocated_' and
+  // 'numMapped_'. Allocation requests are decided against
+  // 'numAllocated_' and 'numMapped_'. This counter is informational
+  // only.
+  std::atomic<MachinePageCount> numExternalMapped_{0};
+
   // Indicates if the failure injection is persistent or transient.
   //
   // NOTE: this is only used for testing purpose.
@@ -518,7 +528,7 @@ struct fmt::formatter<facebook::velox::memory::MemoryAllocator::InjectedFailure>
     : fmt::formatter<int> {
   auto format(
       facebook::velox::memory::MemoryAllocator::InjectedFailure s,
-      format_context& ctx) {
+      format_context& ctx) const {
     return formatter<int>::format(static_cast<int>(s), ctx);
   }
 };

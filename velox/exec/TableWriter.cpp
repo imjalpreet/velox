@@ -16,7 +16,7 @@
 
 #include "velox/exec/TableWriter.h"
 
-#include "HashAggregation.h"
+#include "velox/exec/HashAggregation.h"
 #include "velox/exec/Task.h"
 
 namespace facebook::velox::exec {
@@ -24,7 +24,7 @@ namespace facebook::velox::exec {
 TableWriter::TableWriter(
     int32_t operatorId,
     DriverCtx* driverCtx,
-    const std::shared_ptr<const core::TableWriteNode>& tableWriteNode)
+    const core::TableWriteNodePtr& tableWriteNode)
     : Operator(
           driverCtx,
           tableWriteNode->outputType(),
@@ -43,18 +43,23 @@ TableWriter::TableWriter(
           tableWriteNode->insertTableHandle()->connectorId())),
       insertTableHandle_(
           tableWriteNode->insertTableHandle()->connectorInsertTableHandle()),
-      commitStrategy_(tableWriteNode->commitStrategy()) {
+      commitStrategy_(tableWriteNode->commitStrategy()),
+      createTimeUs_(getCurrentTimeNano()) {
   setConnectorMemoryReclaimer();
   if (tableWriteNode->outputType()->size() == 1) {
-    VELOX_USER_CHECK_NULL(tableWriteNode->aggregationNode());
+    VELOX_USER_CHECK(!tableWriteNode->columnStatsSpec().has_value());
   } else {
     VELOX_USER_CHECK(tableWriteNode->outputType()->equivalent(
-        *(TableWriteTraits::outputType(tableWriteNode->aggregationNode()))));
+        *(TableWriteTraits::outputType(tableWriteNode->columnStatsSpec()))));
   }
 
-  if (tableWriteNode->aggregationNode() != nullptr) {
-    aggregation_ = std::make_unique<HashAggregation>(
-        operatorId, driverCtx, tableWriteNode->aggregationNode());
+  if (tableWriteNode->columnStatsSpec().has_value()) {
+    statsCollector_ = std::make_unique<ColumnStatsCollector>(
+        tableWriteNode->columnStatsSpec().value(),
+        tableWriteNode->sources()[0]->outputType(),
+        &operatorCtx_->driverCtx()->queryConfig(),
+        operatorCtx_->pool(),
+        &nonReclaimableSection_);
   }
   const auto& connectorId = tableWriteNode->insertTableHandle()->connectorId();
   connector_ = connector::getConnector(connectorId);
@@ -63,32 +68,45 @@ TableWriter::TableWriter(
       planNodeId(),
       connectorPool_,
       spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr);
+  setTypeMappings(tableWriteNode);
+}
 
-  auto names = tableWriteNode->columnNames();
-  auto types = tableWriteNode->columns()->children();
+void TableWriter::setTypeMappings(
+    const core::TableWriteNodePtr& tableWriteNode) {
+  auto outputNames = tableWriteNode->columnNames();
+  auto outputTypes = tableWriteNode->columns()->children();
 
   const auto& inputType = tableWriteNode->sources()[0]->outputType();
 
-  inputMapping_.reserve(types.size());
+  // Ids that map input to output columns.
+  inputMapping_.reserve(outputTypes.size());
+  std::vector<TypePtr> inputTypes;
+
+  // Generate mappings between input and output types. Note that column names
+  // must match, but in some case the types won't, for example, when writing a
+  // struct (ROW) as a flat map (MAP).
   for (const auto& name : tableWriteNode->columns()->names()) {
-    inputMapping_.emplace_back(inputType->getChildIdx(name));
+    auto idx = inputType->getChildIdx(name);
+    inputMapping_.emplace_back(idx);
+    inputTypes.emplace_back(inputType->childAt(idx));
   }
 
-  mappedType_ = ROW(std::move(names), std::move(types));
+  mappedOutputType_ = ROW(folly::copy(outputNames), std::move(outputTypes));
+  mappedInputType_ = ROW(std::move(outputNames), std::move(inputTypes));
 }
 
 void TableWriter::initialize() {
   Operator::initialize();
   VELOX_CHECK_NULL(dataSink_);
   createDataSink();
-  if (aggregation_ != nullptr) {
-    aggregation_->initialize();
+  if (statsCollector_ != nullptr) {
+    statsCollector_->initialize();
   }
 }
 
 void TableWriter::createDataSink() {
   dataSink_ = connector_->createDataSink(
-      mappedType_,
+      mappedOutputType_,
       insertTableHandle_,
       connectorQueryCtx_.get(),
       commitStrategy_);
@@ -115,6 +133,13 @@ std::vector<std::string> TableWriter::closeDataSink() {
   return dataSink_->close();
 }
 
+bool TableWriter::finishDataSink() {
+  // We only expect finish on a non-closed data sink.
+  VELOX_CHECK(!closed_);
+  VELOX_CHECK_NOT_NULL(dataSink_);
+  return dataSink_->finish();
+}
+
 void TableWriter::addInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
@@ -122,13 +147,13 @@ void TableWriter::addInput(RowVectorPtr input) {
 
   std::vector<VectorPtr> mappedChildren;
   mappedChildren.reserve(inputMapping_.size());
-  for (auto i : inputMapping_) {
+  for (const auto i : inputMapping_) {
     mappedChildren.emplace_back(input->childAt(i));
   }
 
-  auto mappedInput = std::make_shared<RowVector>(
+  const auto mappedInput = std::make_shared<RowVector>(
       input->pool(),
-      mappedType_,
+      mappedInputType_,
       input->nulls(),
       input->size(),
       mappedChildren,
@@ -138,16 +163,24 @@ void TableWriter::addInput(RowVectorPtr input) {
   numWrittenRows_ += input->size();
   updateStats(dataSink_->stats());
 
-  if (aggregation_ != nullptr) {
-    aggregation_->addInput(input);
+  if (statsCollector_ != nullptr) {
+    statsCollector_->addInput(input);
   }
 }
 
 void TableWriter::noMoreInput() {
   Operator::noMoreInput();
-  if (aggregation_ != nullptr) {
-    aggregation_->noMoreInput();
+  if (statsCollector_ != nullptr) {
+    statsCollector_->noMoreInput();
   }
+}
+
+BlockingReason TableWriter::isBlocked(ContinueFuture* future) {
+  if (blockingFuture_.valid()) {
+    *future = std::move(blockingFuture_);
+    return blockingReason_;
+  }
+  return BlockingReason::kNotBlocked;
 }
 
 RowVectorPtr TableWriter::getOutput() {
@@ -156,13 +189,19 @@ RowVectorPtr TableWriter::getOutput() {
     return nullptr;
   }
 
-  if (aggregation_ != nullptr && !aggregation_->isFinished()) {
+  if (statsCollector_ != nullptr && !statsCollector_->finished()) {
     const std::string commitContext = createTableCommitContext(false);
     return TableWriteTraits::createAggregationStatsOutput(
         outputType_,
-        aggregation_->getOutput(),
+        statsCollector_->getOutput(),
         StringView(commitContext),
         pool());
+  }
+
+  if (!finishDataSink()) {
+    blockingReason_ = BlockingReason::kYield;
+    blockingFuture_ = ContinueFuture{folly::Unit{}};
+    return nullptr;
   }
 
   finished_ = true;
@@ -191,7 +230,7 @@ RowVectorPtr TableWriter::getOutput() {
   // 1. Set rows column.
   FlatVectorPtr<int64_t> writtenRowsVector =
       BaseVector::create<FlatVector<int64_t>>(BIGINT(), numOutputRows, pool());
-  writtenRowsVector->set(0, (int64_t)numWrittenRows_);
+  writtenRowsVector->set(0, static_cast<int64_t>(numWrittenRows_));
   for (int idx = 1; idx < numOutputRows; ++idx) {
     writtenRowsVector->setNull(idx, true);
   }
@@ -218,7 +257,7 @@ RowVectorPtr TableWriter::getOutput() {
       writtenRowsVector, fragmentsVector, commitContextVector};
 
   // 4. Set null statistics columns.
-  if (aggregation_ != nullptr) {
+  if (statsCollector_ != nullptr) {
     for (int i = TableWriteTraits::kStatsChannel; i < outputType_->size();
          ++i) {
       columns.push_back(BaseVector::createNullConstant(
@@ -242,6 +281,8 @@ std::string TableWriter::createTableCommitContext(bool lastOutput) {
 }
 
 void TableWriter::updateStats(const connector::DataSink::Stats& stats) {
+  const auto currentTimeNs = getCurrentTimeNano();
+  VELOX_CHECK_GE(currentTimeNs, createTimeUs_);
   {
     auto lockedStats = stats_.wlock();
     lockedStats->physicalWrittenBytes = stats.numWrittenBytes;
@@ -251,28 +292,47 @@ void TableWriter::updateStats(const connector::DataSink::Stats& stats) {
       VELOX_CHECK(stats.spillStats.empty());
       return;
     }
+    if (stats.numWrittenFiles != 0) {
+      lockedStats->addRuntimeStat(
+          kNumWrittenFiles, RuntimeCounter(stats.numWrittenFiles));
+    }
+    if (stats.writeIOTimeUs != 0) {
+      lockedStats->addRuntimeStat(
+          kWriteIOTime,
+          RuntimeCounter(
+              stats.writeIOTimeUs * 1000, RuntimeCounter::Unit::kNanos));
+    }
+    if (stats.recodeTimeNs != 0) {
+      lockedStats->addRuntimeStat(
+          kWriteRecodeTime,
+          RuntimeCounter(stats.recodeTimeNs, RuntimeCounter::Unit::kNanos));
+    }
+    if (stats.compressionTimeNs != 0) {
+      lockedStats->addRuntimeStat(
+          kWriteCompressionTime,
+          RuntimeCounter(
+              stats.compressionTimeNs, RuntimeCounter::Unit::kNanos));
+    }
     lockedStats->addRuntimeStat(
-        "numWrittenFiles", RuntimeCounter(stats.numWrittenFiles));
-    lockedStats->addRuntimeStat(
-        "writeIOTime",
+        kRunningWallNanos,
         RuntimeCounter(
-            stats.writeIOTimeUs * 1000, RuntimeCounter::Unit::kNanos));
+            currentTimeNs - createTimeUs_, RuntimeCounter::Unit::kNanos));
   }
   if (!stats.spillStats.empty()) {
-    *spillStats_.wlock() += stats.spillStats;
+    *spillStats_->wlock() += stats.spillStats;
   }
 }
 
 void TableWriter::close() {
-  Operator::close();
   if (!closed_) {
     // Abort the data sink if the query has already failed and no need for
     // regular close.
     abortDataSink();
   }
-  if (aggregation_ != nullptr) {
-    aggregation_->close();
+  if (statsCollector_ != nullptr) {
+    statsCollector_->close();
   }
+  Operator::close();
 }
 
 void TableWriter::setConnectorMemoryReclaimer() {
@@ -416,15 +476,17 @@ const TypePtr& TableWriteTraits::contextColumnType() {
   return kContextType;
 }
 
-const RowTypePtr TableWriteTraits::outputType(
-    const std::shared_ptr<core::AggregationNode>& aggregationNode) {
+// static.
+RowTypePtr TableWriteTraits::outputType(
+    const std::optional<core::ColumnStatsSpec>& columnStatsSpec) {
   static const auto kOutputTypeWithoutStats =
       ROW({rowCountColumnName(), fragmentColumnName(), contextColumnName()},
           {rowCountColumnType(), fragmentColumnType(), contextColumnType()});
-  if (aggregationNode == nullptr) {
+  if (!columnStatsSpec.has_value()) {
     return kOutputTypeWithoutStats;
   }
-  return kOutputTypeWithoutStats->unionWith(aggregationNode->outputType());
+  return kOutputTypeWithoutStats->unionWith(
+      ColumnStatsCollector::outputType(columnStatsSpec.value()));
 }
 
 folly::dynamic TableWriteTraits::getTableCommitContext(

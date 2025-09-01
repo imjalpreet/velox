@@ -15,8 +15,8 @@
  */
 
 #pragma once
-#include "velox/common/base/RawVector.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/common/memory/RawVector.h"
 #include "velox/common/process/ProcessBase.h"
 #include "velox/common/process/TraceHistory.h"
 #include "velox/dwio/common/FormatData.h"
@@ -161,16 +161,13 @@ class SelectiveColumnReader {
   // from a downstream operator.
   virtual void resetFilterCaches();
 
-  // Seeks to offset and reads the rows in 'rows' and applies
-  // filters and value processing as given by 'scanSpec supplied at
-  // construction. 'offset' is relative to start of stripe. 'rows' are
-  // relative to 'offset', so that row 0 is the 'offset'th row from
-  // start of stripe. 'rows' is expected to stay constant
-  // between this and the next call to read.
-  virtual void read(
-      vector_size_t offset,
-      const RowSet& rows,
-      const uint64_t* incomingNulls) = 0;
+  // Seeks to offset and reads the rows in 'rows' and applies filters and value
+  // processing as given by 'scanSpec supplied at construction. 'offset' is
+  // relative to start of stripe. 'rows' are relative to 'offset', so that row 0
+  // is the 'offset'th row from start of stripe. 'rows' is expected to stay
+  // constant between this and the next call to read.
+  virtual void
+  read(int64_t offset, const RowSet& rows, const uint64_t* incomingNulls) = 0;
 
   virtual uint64_t skip(uint64_t numValues) {
     return formatData_->skip(numValues);
@@ -185,22 +182,19 @@ class SelectiveColumnReader {
   // read(). If 'this' has no filter, returns 'rows' passed to last
   // read().
   const RowSet outputRows() const {
-    if (scanSpec_->hasFilter() || hasDeletion()) {
-      return outputRows_;
-    }
-    return inputRows_;
+    return useOutputRows() ? outputRows_ : inputRows_;
   }
 
   // Advances to 'offset', so that the next item to be read is the
   // offset-th from the start of stripe.
-  virtual void seekTo(vector_size_t offset, bool readsNullsOnly);
+  virtual void seekTo(int64_t offset, bool readsNullsOnly);
 
   /// Positions this at the start of 'index'th row group. Interpretation of
   /// 'index' depends on format. Clears counts of skipped enclosing struct nulls
   /// for formats where nulls are recorded at each nesting level, i.e. not
   /// rep-def.
-  virtual void seekToRowGroup(uint32_t index) {
-    VELOX_TRACE_HISTORY_PUSH("seekToRowGroup %u", index);
+  virtual void seekToRowGroup(int64_t index) {
+    VELOX_TRACE_HISTORY_PUSH("seekToRowGroup %" PRId64, index);
     numParentNulls_ = 0;
     parentNullsRecordedTo_ = 0;
   }
@@ -231,7 +225,7 @@ class SelectiveColumnReader {
 
   template <typename T>
   T* mutableValues(int32_t size) {
-    DCHECK(values_->capacity() >= (numValues_ + size) * sizeof(T));
+    VELOX_DCHECK_GE(values_->capacity(), (numValues_ + size) * sizeof(T));
     return reinterpret_cast<T*>(rawValues_) + numValues_;
   }
 
@@ -340,7 +334,7 @@ class SelectiveColumnReader {
   template <typename T>
   inline void addValue(T value) {
     static_assert(
-        std::is_pod_v<T>,
+        std::is_standard_layout_v<T>,
         "General case of addValue is only for primitive types");
     VELOX_DCHECK_NOT_NULL(rawValues_);
     VELOX_DCHECK_LE((numValues_ + 1) * sizeof(T), values_->capacity());
@@ -361,11 +355,11 @@ class SelectiveColumnReader {
     return readOffset_;
   }
 
-  void setReadOffset(vector_size_t readOffset) {
+  void setReadOffset(int64_t readOffset) {
     readOffset_ = readOffset;
   }
 
-  virtual void setReadOffsetRecursive(int32_t readOffset) {
+  virtual void setReadOffsetRecursive(int64_t readOffset) {
     setReadOffset(readOffset);
   }
 
@@ -448,7 +442,7 @@ class SelectiveColumnReader {
   /// level rows and represents all null parents at any enclosing level. 'nulls'
   /// is nullptr if there are no parent nulls.
   void addParentNulls(
-      int32_t firstRowInNulls,
+      int64_t firstRowInNulls,
       const uint64_t* nulls,
       const RowSet& rows);
 
@@ -456,14 +450,13 @@ class SelectiveColumnReader {
   // any level there are between top level row 'from' and 'to'. If
   // called many times, the 'from' of the next should be the 'to' of
   // the previous.
-  void
-  addSkippedParentNulls(vector_size_t from, vector_size_t to, int32_t numNulls);
+  void addSkippedParentNulls(int64_t from, int64_t to, int32_t numNulls);
 
   static constexpr int8_t kNoValueSize = -1;
   static constexpr uint32_t kRowGroupNotSet = ~0;
 
   template <typename T>
-  void ensureValuesCapacity(vector_size_t numRows);
+  void ensureValuesCapacity(vector_size_t numRows, bool preserveData = false);
 
   // Prepares the result buffer for nulls for reading 'rows'. Leaves
   // 'extraSpace' bits worth of space in the nulls buffer.
@@ -497,20 +490,43 @@ class SelectiveColumnReader {
     return StringView(data, value.size());
   }
 
-  // Whether output rows should be filled when there is no column projected out
-  // and there is delete mutation.  Used for row number generation.  The case
-  // for no delete mutation is handled more efficiently outside column reader in
-  // `RowReader::readWithRowNumber'.
-  virtual void setFillMutatedOutputRows(bool /*value*/) {
+  virtual void setCurrentRowNumber(int64_t /*value*/) {
     VELOX_UNREACHABLE("Only struct reader supports this method");
+  }
+
+  memory::MemoryPool* memoryPool() const {
+    return memoryPool_;
   }
 
  protected:
   template <typename T>
   void prepareRead(
-      vector_size_t offset,
+      int64_t offset,
       const RowSet& rows,
       const uint64_t* incomingNulls);
+
+  // Read nulls and inMap bits for the column.  Usually this is called as part
+  // of prepareRead; in case of NullColumnReader, we don't call prepareRead, so
+  // we need to call this separately.
+  void readNulls(
+      int64_t offset,
+      vector_size_t numRows,
+      const uint64_t* incomingNulls) {
+    const bool readsNullsOnly = this->readsNullsOnly();
+    seekTo(offset, readsNullsOnly);
+    if (isFlatMapValue_) {
+      if (!nullsInReadRange_) {
+        nullsInReadRange_ = std::move(flatMapValueNullsInReadRange_);
+      }
+    } else if (nullsInReadRange_ && !nullsInReadRange_->unique()) {
+      nullsInReadRange_.reset();
+    }
+    formatData_->readNulls(
+        numRows, incomingNulls, nullsInReadRange_, readsNullsOnly);
+    if (isFlatMapValue_ && nullsInReadRange_) {
+      flatMapValueNullsInReadRange_ = nullsInReadRange_;
+    }
+  }
 
   virtual bool readsNullsOnly() const {
     return scanSpec_->readsNullsOnly();
@@ -600,6 +616,10 @@ class SelectiveColumnReader {
                              : resultNulls_;
   }
 
+  bool useOutputRows() const {
+    return scanSpec_->hasFilter() || hasDeletion();
+  }
+
   memory::MemoryPool* const memoryPool_;
 
   // The requested data type
@@ -618,7 +638,7 @@ class SelectiveColumnReader {
 
   // Row number after last read row, relative to the ORC stripe or Parquet
   // Rowgroup start.
-  vector_size_t readOffset_ = 0;
+  int64_t readOffset_ = 0;
 
   // Number of parent nulls between 'readOffset_' and 'parentNullsRecordedTo_'.
   // When skipping, subtract the parent nulls from the skip distance because the
@@ -682,9 +702,9 @@ class SelectiveColumnReader {
   // returned as the null flags of the vector in getValues().
   bool returnReaderNulls_ = false;
   // Total writable bytes in 'rawStringBuffer_'.
-  int32_t rawStringSize_ = 0;
+  int64_t rawStringSize_ = 0;
   // Number of written bytes in 'rawStringBuffer_'.
-  uint32_t rawStringUsed_ = 0;
+  int64_t rawStringUsed_ = 0;
 
   // True if last read() added any nulls.
   bool anyNulls_ = false;

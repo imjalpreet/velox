@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/expression/CastExpr.h"
 #include <limits>
 #include "velox/buffer/Buffer.h"
 #include "velox/common/base/VeloxException.h"
@@ -25,6 +26,7 @@
 #include "velox/functions/prestosql/tests/CastBaseTest.h"
 #include "velox/functions/prestosql/tests/utils/FunctionBaseTest.h"
 #include "velox/type/Type.h"
+#include "velox/type/tests/utils/CustomTypesForTesting.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/TypeAliases.h"
 
@@ -548,8 +550,44 @@ TEST_F(CastExprTest, stringToTimestamp) {
       "1970-01-01 00:00:00-02:00",
       "1970-01-01 00:00:00 +02",
       "1970-01-01 00:00:00 -0101",
+      // Fully specified offset.
+      "1970-01-02 00:00:00 +01:01:01.001",
+      "1970-01-01 00:00:00 -01:01:01.001",
+      // Offset with two digit milliseconds.
+      "1970-01-02 00:00:00 +01:01:01.01",
+      "1970-01-01 00:00:00 -01:01:01.01",
+      // Offset with one digit milliseconds.
+      "1970-01-02 00:00:00 +01:01:01.1",
+      "1970-01-01 00:00:00 -01:01:01.1",
+      // Offset without milliseconds.
+      "1970-01-02 00:00:00 +01:01:01",
+      "1970-01-01 00:00:00 -01:01:01",
+      // Offset without seconds.
+      "1970-01-02 00:00:00 +23:01",
+      "1970-01-01 00:00:00 -23:01",
+      // Offset without minutes.
+      "1970-01-02 00:00:00 +23",
+      "1970-01-01 00:00:00 -23",
+      // Upper and lower limits of offsets.
+      "2000-01-01 12:13:14.123+23:59:59.999",
+      "2000-01-01 12:13:14.123-23:59:59.999",
+      // Comma instead of period for decimal in offset.
+      "1970-01-01 00:00:00 -01:01:01,001",
+      // Trailing spaces after offset.
+      "1970-01-02 00:00:00 +01:01:01.001   ",
+      // Overflow of nanoseconds in offset.
+      "1970-01-01 00:00:00.999 -01:01:01.002",
+      // Underflow of nanoseconds in offset.
+      "1970-01-02 00:00:00.001 +01:01:01.002",
+      // No optional separators
+      "1970-01-01 00:00:00 -010101001",
+      // Maximum timestamp.
+      "73326-09-11 20:14:45.247",
+      // Minimum timestamp.
+      "-69387-12-31 23:59:59.999",
       std::nullopt,
   };
+
   std::vector<std::optional<Timestamp>> expected{
       Timestamp(0, 0),
       Timestamp(10800, 0),
@@ -559,6 +597,27 @@ TEST_F(CastExprTest, stringToTimestamp) {
       Timestamp(7200, 0),
       Timestamp(-7200, 0),
       Timestamp(3660, 0),
+      Timestamp(82738, 999000000),
+      Timestamp(3661, 1000000),
+      Timestamp(82738, 990000000),
+      Timestamp(3661, 10000000),
+      Timestamp(82738, 900000000),
+      Timestamp(3661, 100000000),
+      Timestamp(82739, 0),
+      Timestamp(3661, 0),
+      Timestamp(3540, 0),
+      Timestamp(82860, 0),
+      Timestamp(3600, 0),
+      Timestamp(82800, 0),
+      Timestamp(946642394, 124000000),
+      Timestamp(946815194, 122000000),
+      Timestamp(3661, 1000000),
+      Timestamp(82738, 999000000),
+      Timestamp(3662, 1000000),
+      Timestamp(82738, 999000000),
+      Timestamp(3661, 1000000),
+      Timestamp(2251799813685, 247000000),
+      Timestamp(-2251777881601, 999000000),
       std::nullopt,
   };
   testCast<std::string, Timestamp>("timestamp", input, expected);
@@ -571,37 +630,129 @@ TEST_F(CastExprTest, stringToTimestamp) {
       "1970-01-01 00:00 +01:00",
       "1970-01-01 00:00 America/Sao_Paulo",
       "2000-01-01 12:21:56Z",
-  };
+      "2000-01-01 12:21:56+01:01:01",
+      "2045-12-31 18:00:00",
+      // Maximum timestamp.
+      "73326-09-11 13:14:45.247",
+      // Minimum timestamp.
+      "-69387-12-31 16:07:01.999",
+      // Test going back and forth across DST boundaries.
+      "2024-03-10 09:59:59 -00:00:02",
+      "2024-03-10 10:00:01 +00:00:02",
+      "2024-11-03 08:59:59 -00:00:02",
+      "2024-11-03 09:00:01 +00:00:02",
+      // Test going back and forth across DST boundaries in the distant future.
+      "2100-03-14 09:59:59 -00:00:02",
+      "2100-03-14 10:00:01 +00:00:02",
+      "2100-11-07 09:59:59 -00:00:02",
+      "2100-11-07 10:00:01 +00:00:02",
+      // Test going back and forth across DST boundaries in the distant future
+      // in a time zone with DST.
+      "32767-03-12 01:59:00",
+      "32767-03-12 03:00:00",
+      "32767-03-12 03:01:00",
+      "32767-11-05 01:59:00",
+      "32767-11-05 02:00:00",
+      "32767-11-05 02:01:00",
+      // Test going back and forth across DST boundaries in years around when
+      // the forever rules take effect (starting in 2007).
+      "2009-03-08 01:59:00",
+      "2009-03-08 03:00:00",
+      "2009-03-08 03:01:00",
+      "2009-11-01 01:59:00",
+      "2009-11-01 02:00:00",
+      "2009-11-01 02:01:00",
+      "2008-03-09 01:59:00",
+      "2008-03-09 03:00:00",
+      "2008-03-09 03:01:00",
+      "2008-11-02 01:59:00",
+      "2008-11-02 02:00:00",
+      "2008-11-02 02:01:00",
+      "2007-03-11 01:59:00",
+      "2007-03-11 03:00:00",
+      "2007-03-11 03:01:00",
+      "2007-11-04 01:59:00",
+      "2007-11-04 02:00:00",
+      "2007-11-04 02:01:00"};
   expected = {
       Timestamp(28800, 0),
       Timestamp(0, 0),
       Timestamp(-3600, 0),
       Timestamp(10800, 0),
       Timestamp(946729316, 0),
-  };
+      Timestamp(946725655, 0),
+      Timestamp(2398384800, 0),
+      Timestamp(2251799813685, 247000000),
+      Timestamp(-2251777881601, 999000000),
+      Timestamp(1710064801, 0),
+      Timestamp(1710064799, 0),
+      Timestamp(1730624401, 0),
+      Timestamp(1730624399, 0),
+      Timestamp(4108701601, 0),
+      Timestamp(4108701599, 0),
+      Timestamp(4129264801, 0),
+      Timestamp(4129264799, 0),
+      Timestamp(971865511140, 0),
+      Timestamp(971865511200, 0),
+      Timestamp(971865511260, 0),
+      Timestamp(971886070740, 0),
+      Timestamp(971886074400, 0),
+      Timestamp(971886074460, 0),
+      Timestamp(1236506340, 0),
+      Timestamp(1236506400, 0),
+      Timestamp(1236506460, 0),
+      Timestamp(1257065940, 0),
+      Timestamp(1257069600, 0),
+      Timestamp(1257069660, 0),
+      Timestamp(1205056740, 0),
+      Timestamp(1205056800, 0),
+      Timestamp(1205056860, 0),
+      Timestamp(1225616340, 0),
+      Timestamp(1225620000, 0),
+      Timestamp(1225620060, 0),
+      Timestamp(1173607140, 0),
+      Timestamp(1173607200, 0),
+      Timestamp(1173607260, 0),
+      Timestamp(1194166740, 0),
+      Timestamp(1194170400, 0),
+      Timestamp(1194170460, 0)};
   testCast<std::string, Timestamp>("timestamp", input, expected);
 
   // Test invalid inputs.
   VELOX_ASSERT_THROW(
       (evaluateOnce<Timestamp, std::string>(
           "cast(c0 as timestamp)", "1970-01-01T00:00")),
-      "Cannot cast VARCHAR '1970-01-01T00:00' to TIMESTAMP. Unable to parse timestamp value");
+      "Cannot cast VARCHAR '1970-01-01T00:00' to TIMESTAMP. Unknown timezone value: \"T00:00\"");
   VELOX_ASSERT_THROW(
       (evaluateOnce<Timestamp, std::string>(
-          "cast(c0 as timestamp)", "201915-04-23 11:46:00.000")),
+          "cast(c0 as timestamp)", "292278994-04-23 11:46:00.000")),
       "Timepoint is outside of supported year range");
+  //   Only one white space is allowed before the offset
+  //   string.
   VELOX_ASSERT_THROW(
       (evaluateOnce<Timestamp, std::string>(
-          "try_cast(c0 as timestamp)", "201915-04-23 11:46:00.000")),
-      "Timepoint is outside of supported year range");
+          "cast(c0 as timestamp)", "2000-01-01 00:00:00  +01:01:01")),
+      "Cannot cast VARCHAR '2000-01-01 00:00:00  +01:01:01' to TIMESTAMP. Unknown timezone value: \"\"");
+  // Hour must be in the ragne [0, 23].
   VELOX_ASSERT_THROW(
       (evaluateOnce<Timestamp, std::string>(
-          "cast(c0 as timestamp)", "2045-12-31 18:00:00")),
-      "Unable to convert timezone 'America/Los_Angeles' past 2037-11-01 09:00:00");
+          "cast(c0 as timestamp)", "2000-01-01 00:00:00 +24")),
+      "Cannot cast VARCHAR '2000-01-01 00:00:00 +24' to TIMESTAMP. Unknown timezone value: \"+24\"");
+  // Minute must be in the range [0, 59].
   VELOX_ASSERT_THROW(
       (evaluateOnce<Timestamp, std::string>(
-          "try_cast(c0 as timestamp)", "2045-12-31 18:00:00")),
-      "Unable to convert timezone 'America/Los_Angeles' past 2037-11-01 09:00:00");
+          "cast(c0 as timestamp)", "2000-01-01 00:00:00 +01:60")),
+      "Cannot cast VARCHAR '2000-01-01 00:00:00 +01:60' to TIMESTAMP. Unknown timezone value: \"+01:60\"");
+  // Second must be in the range [0, 59].
+  VELOX_ASSERT_THROW(
+      (evaluateOnce<Timestamp, std::string>(
+          "cast(c0 as timestamp)", "2000-01-01 00:00:00 +01:01:60")),
+      "Cannot cast VARCHAR '2000-01-01 00:00:00 +01:01:60' to TIMESTAMP. Unknown timezone value: \"+01:01:60\"");
+  // Millisecond must be in the range [0, 999].
+  VELOX_ASSERT_THROW(
+      (evaluateOnce<Timestamp, std::string>(
+          "cast(c0 as timestamp)", "2000-01-01 00:00:00 +01:01:01.1000")),
+      "Cannot cast VARCHAR '2000-01-01 00:00:00 +01:01:01.1000' to TIMESTAMP. Unknown timezone value: \"+01:01:01.1000\"");
 
   setLegacyCast(true);
   input = {
@@ -690,6 +841,7 @@ TEST_F(CastExprTest, timestampToString) {
           Timestamp(0, 0),
           Timestamp(946729316, 123),
           Timestamp(-50049331622, 0),
+          Timestamp(253405036800, 0),
           Timestamp(-62480038022, 0),
           std::nullopt,
       },
@@ -697,27 +849,10 @@ TEST_F(CastExprTest, timestampToString) {
           "1969-12-31 16:00:00.000",
           "2000-01-01 04:21:56.000",
           "0384-01-01 00:00:00.000",
+          "10000-02-01 08:00:00.000",
           "-0010-02-01 02:00:00.000",
           std::nullopt,
       });
-
-  // Ensure external/date throws since it doesn't know how to convert large
-  // timestamps.
-  auto mustThrow = [&]() {
-    return testCast<Timestamp, std::string>(
-        "string", {Timestamp(253405036800, 0)}, {"10000-02-01 08:00:00.000"});
-  };
-  VELOX_ASSERT_THROW(
-      mustThrow(), "Unable to convert timezone 'America/Los_Angeles' past");
-
-  // try_cast should also throw since it's runtime error.
-  auto tryCastMustThrow = [&]() {
-    return testTryCast<Timestamp, std::string>(
-        "string", {Timestamp(253405036800, 0)}, {"10000-02-01 08:00:00.000"});
-  };
-  VELOX_ASSERT_THROW(
-      tryCastMustThrow(),
-      "Unable to convert timezone 'America/Los_Angeles' past");
 }
 
 TEST_F(CastExprTest, dateToTimestamp) {
@@ -744,6 +879,7 @@ TEST_F(CastExprTest, timestampToDate) {
       Timestamp(0, 0),
       Timestamp(946684800, 0),
       Timestamp(1257724800, 0),
+      Timestamp(2534050368, 0),
       std::nullopt,
   };
 
@@ -754,6 +890,7 @@ TEST_F(CastExprTest, timestampToDate) {
           0,
           10957,
           14557,
+          29329,
           std::nullopt,
       },
       TIMESTAMP(),
@@ -767,28 +904,11 @@ TEST_F(CastExprTest, timestampToDate) {
           -1,
           10956,
           14556,
+          29328,
           std::nullopt,
       },
       TIMESTAMP(),
       DATE());
-
-  // Ensure external/date throws since it doesn't know how to convert large
-  // timestamps.
-  auto mustThrow = [&]() {
-    return testCast<Timestamp, int32_t>(
-        "date", {Timestamp(253405036800, 0)}, {0});
-  };
-  VELOX_ASSERT_THROW(
-      mustThrow(), "Unable to convert timezone 'America/Los_Angeles' past");
-
-  // try_cast should also throw since it's runtime error.
-  auto tryCastMustThrow = [&]() {
-    return testTryCast<Timestamp, int32_t>(
-        "date", {Timestamp(253405036800, 0)}, {0});
-  };
-  VELOX_ASSERT_THROW(
-      tryCastMustThrow(),
-      "Unable to convert timezone 'America/Los_Angeles' past");
 }
 
 TEST_F(CastExprTest, timestampInvalid) {
@@ -1024,8 +1144,7 @@ TEST_F(CastExprTest, primitiveInvalidCornerCases) {
         "bigint",
         {"٣"},
         "Unicode characters are not supported for conversion to integer types",
-        VARCHAR(),
-        true);
+        VARCHAR());
   }
 
   // To floating-point.
@@ -1279,7 +1398,8 @@ TEST_F(CastExprTest, mapCast) {
 
     SelectivityVector rows(5);
     rows.setValid(2, false);
-    mapVector->setOffsetAndSize(2, 100, 100);
+    mapVector->setOffsetAndSize(2, 100, 1);
+    mapVector->setOffsetAndSize(51, 2, 1);
     std::vector<VectorPtr> results(1);
 
     auto rowVector = makeRowVector({mapVector});
@@ -1364,15 +1484,16 @@ TEST_F(CastExprTest, arrayCast) {
   {
     // Array with all inner elements null.
     auto sizeAtLocal = [](vector_size_t /* row */) { return 5; };
-    auto arrayVector = vectorMaker_.arrayVector<int32_t>(
+    auto nullElementsArrayVector = vectorMaker_.arrayVector<int32_t>(
         kVectorSize, sizeAtLocal, nullptr, nullptr, nullEvery(1));
 
     SelectivityVector rows(5);
     rows.setValid(2, false);
-    arrayVector->setOffsetAndSize(2, 100, 10);
+    nullElementsArrayVector->setOffsetAndSize(2, 100, 5);
+    nullElementsArrayVector->setOffsetAndSize(20, 10, 5);
     std::vector<VectorPtr> results(1);
 
-    auto rowVector = makeRowVector({arrayVector});
+    auto rowVector = makeRowVector({nullElementsArrayVector});
     auto castExpr =
         makeTypedExpr("cast (c0 as bigint[])", asRowType(rowVector->type()));
     exec::ExprSet exprSet({castExpr}, &execCtx_);
@@ -1547,10 +1668,10 @@ TEST_F(CastExprTest, testNullOnFailure) {
   auto expected = makeNullableFlatVector<int32_t>(
       {1, 2, std::nullopt, std::nullopt, std::nullopt});
 
-  // nullOnFailure is true, so we should return null instead of throwing.
+  // isTryCast is true, so we should return null instead of throwing.
   testCast(input, expected, true);
 
-  // nullOnFailure is false, so we should throw.
+  // isTryCast is false, so we should throw.
   EXPECT_THROW(testCast(input, expected, false), VeloxUserError);
 }
 
@@ -1720,7 +1841,7 @@ TEST_F(CastExprTest, decimalToDecimal) {
       testCast(longFlat, expectedShort),
       "Cannot cast DECIMAL '-1000.000' to DECIMAL(6, 4)");
 
-  // nullOnFailure is true.
+  // isTryCast is true.
   testCast(longFlat, expectedShort, true);
 
   // long to short, big numbers.
@@ -1959,7 +2080,7 @@ TEST_F(CastExprTest, varcharToDecimal) {
       VARCHAR(),
       DECIMAL(38, 0),
       {"0.0444a"},
-      "Cannot cast VARCHAR '0.0444a' to DECIMAL(38, 0). Value is not a number. Chars 'a' are invalid.");
+      "Cannot cast VARCHAR '0.0444a' to DECIMAL(38, 0). Value is not a number.");
 
   testThrow<std::string>(
       VARCHAR(),
@@ -1992,29 +2113,29 @@ TEST_F(CastExprTest, varcharToDecimal) {
       VARCHAR(),
       DECIMAL(38, 0),
       {"23e-5d"},
-      "Cannot cast VARCHAR '23e-5d' to DECIMAL(38, 0). Value is not a number. Non-digit character 'd' is not allowed in the exponent part.");
+      "Cannot cast VARCHAR '23e-5d' to DECIMAL(38, 0). Value is not a number. Non-digit character is not allowed in the exponent part.");
 
   // Whitespaces.
   testThrow<std::string>(
       VARCHAR(),
       DECIMAL(38, 0),
       {"1. 23"},
-      "Cannot cast VARCHAR '1. 23' to DECIMAL(38, 0). Value is not a number. Chars ' 23' are invalid.");
+      "Cannot cast VARCHAR '1. 23' to DECIMAL(38, 0). Value is not a number.");
   testThrow<std::string>(
       VARCHAR(),
       DECIMAL(12, 2),
       {"-3E+ 2"},
-      "Cannot cast VARCHAR '-3E+ 2' to DECIMAL(12, 2). Value is not a number. Non-digit character ' ' is not allowed in the exponent part.");
+      "Cannot cast VARCHAR '-3E+ 2' to DECIMAL(12, 2). Value is not a number. Non-digit character is not allowed in the exponent part.");
   testThrow<std::string>(
       VARCHAR(),
       DECIMAL(38, 0),
       {"1.23 "},
-      "Cannot cast VARCHAR '1.23 ' to DECIMAL(38, 0). Value is not a number. Chars ' ' are invalid.");
+      "Cannot cast VARCHAR '1.23 ' to DECIMAL(38, 0). Value is not a number.");
   testThrow<std::string>(
       VARCHAR(),
       DECIMAL(12, 2),
       {"-3E+2 "},
-      "Cannot cast VARCHAR '-3E+2 ' to DECIMAL(12, 2). Value is not a number. Non-digit character ' ' is not allowed in the exponent part.");
+      "Cannot cast VARCHAR '-3E+2 ' to DECIMAL(12, 2). Value is not a number. Non-digit character is not allowed in the exponent part.");
   testThrow<std::string>(
       VARCHAR(),
       DECIMAL(38, 0),
@@ -2030,7 +2151,7 @@ TEST_F(CastExprTest, varcharToDecimal) {
       VARCHAR(),
       DECIMAL(12, 2),
       {"-3E+2.1"},
-      "Cannot cast VARCHAR '-3E+2.1' to DECIMAL(12, 2). Value is not a number. Non-digit character '.' is not allowed in the exponent part.");
+      "Cannot cast VARCHAR '-3E+2.1' to DECIMAL(12, 2). Value is not a number. Non-digit character is not allowed in the exponent part.");
 
   testThrow<std::string>(
       VARCHAR(),
@@ -2043,6 +2164,18 @@ TEST_F(CastExprTest, varcharToDecimal) {
       DECIMAL(12, 2),
       {"-3E-"},
       "Cannot cast VARCHAR '-3E-' to DECIMAL(12, 2). Value is not a number. The exponent part only contains sign.");
+
+  testThrow<std::string>(
+      VARCHAR(),
+      DECIMAL(12, 2),
+      {"9e"},
+      "Cannot cast VARCHAR '9e' to DECIMAL(12, 2). Value is not a number. The exponent part is empty.");
+
+  testThrow<std::string>(
+      VARCHAR(),
+      DECIMAL(12, 2),
+      {"09{xi+yD"},
+      "Cannot cast VARCHAR '09{xi+yD' to DECIMAL(12, 2). Value is not a number. Chars are invalid.");
 }
 
 TEST_F(CastExprTest, castInTry) {
@@ -2694,5 +2827,153 @@ TEST_F(CastExprTest, intervalDayTimeToVarchar) {
       "Cast from VARCHAR to INTERVAL DAY TO SECOND is not supported");
 }
 
+class BigintTypeWithCustomComparisonCastOperator final
+    : public exec::CastOperator {
+  BigintTypeWithCustomComparisonCastOperator() = default;
+
+ public:
+  static std::shared_ptr<const CastOperator> get() {
+    VELOX_CONSTEXPR_SINGLETON BigintTypeWithCustomComparisonCastOperator
+        kInstance;
+    return {std::shared_ptr<const CastOperator>{}, &kInstance};
+  }
+
+  bool isSupportedFromType(const TypePtr& other) const override {
+    return true;
+  }
+
+  bool isSupportedToType(const TypePtr& other) const override {
+    return true;
+  }
+
+  void castTo(
+      const BaseVector& input,
+      exec::EvalCtx& context,
+      const SelectivityVector& rows,
+      const TypePtr& resultType,
+      VectorPtr& result) const override {
+    VELOX_FAIL("Cast to BigintTypeWithCustomComparison should not be called");
+  }
+
+  void castFrom(
+      const BaseVector& input,
+      exec::EvalCtx& context,
+      const SelectivityVector& rows,
+      const TypePtr& resultType,
+      VectorPtr& result) const override {
+    VELOX_FAIL("Cast from BigintTypeWithCustomComparison should not be called");
+  }
+};
+
+class BigintTypeWithCustomComparisonTypeFactory : public CustomTypeFactory {
+ public:
+  TypePtr getType(const std::vector<TypeParameter>& parameters) const override {
+    VELOX_CHECK(parameters.empty());
+    return BIGINT_TYPE_WITH_CUSTOM_COMPARISON();
+  }
+
+  // Type casting from and to TimestampWithTimezone is not supported yet.
+  exec::CastOperatorPtr getCastOperator() const override {
+    return BigintTypeWithCustomComparisonCastOperator::get();
+  }
+
+  AbstractInputGeneratorPtr getInputGenerator(
+      const InputGeneratorConfig& config) const override {
+    return nullptr;
+  }
+};
+
+TEST_F(CastExprTest, skipUnnecessaryChildrenOfComplexTypes) {
+  // bigint type with custom comparison is registered with a custom cast
+  // operator that always throws, we use this to ensure the children of complex
+  // types are not cast if they are already the right type.
+  //
+  // We use bigint type with custom comparison so that we can leverage an
+  // existing custom type that was written for testing purposes.
+  SCOPE_EXIT {
+    unregisterCustomType(BIGINT_TYPE_WITH_CUSTOM_COMPARISON()->name());
+  };
+
+  VELOX_CHECK(
+      registerCustomType(
+          BIGINT_TYPE_WITH_CUSTOM_COMPARISON()->name(),
+          std::make_unique<const BigintTypeWithCustomComparisonTypeFactory>()),
+      "Failed to register custom type 'bigint type with custom comparison'");
+
+  const auto valuesThatThrowOnCast = makeFlatVector<int64_t>(
+      10,
+      [](vector_size_t row) { return row; },
+      nullptr,
+      BIGINT_TYPE_WITH_CUSTOM_COMPARISON());
+  // We make an exact copy of the Vector, this is necessary so that if it's
+  // possible the Type pointers are different we get Vectors with different Type
+  // pointers (in practice this isn't possible for primitive types, this is just
+  // for completeness).
+  const auto castedValuesThatThrowOnCast = makeFlatVector<int64_t>(
+      10,
+      [](vector_size_t row) { return row; },
+      nullptr,
+      BIGINT_TYPE_WITH_CUSTOM_COMPARISON());
+  const auto arrayOfValuesThatThrowOnCast =
+      makeArrayVector({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, valuesThatThrowOnCast);
+  // Again make an exact copy of the Vector, in this case, because the type is
+  // complex, the Vectors actually do have different Type pointers.
+  const auto castedArrayOfValuesThatThrowOnCast =
+      makeArrayVector({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, valuesThatThrowOnCast);
+  const auto valuesToCast =
+      makeFlatVector<int32_t>(10, [](vector_size_t row) { return row; });
+  // Make an exact copy of the Vector with a different type (bigint instead of
+  // int).
+  const auto castedValuesToCast =
+      makeFlatVector<int64_t>(10, [](vector_size_t row) { return row; });
+
+  setCastMatchStructByName(true);
+  // Casting a row skips fields that don't need to change.
+  {
+    const auto rowVector = makeRowVector(
+        {valuesThatThrowOnCast, arrayOfValuesThatThrowOnCast, valuesToCast});
+    const auto expectedRowVector = makeRowVector(
+        {castedValuesThatThrowOnCast,
+         castedArrayOfValuesThatThrowOnCast,
+         castedValuesToCast});
+    testCast(rowVector, expectedRowVector);
+  }
+  // Casting a map skips primitve keys that don't need to change.
+  {
+    const auto mapVector =
+        makeMapVector({0, 2, 4, 6, 8}, valuesThatThrowOnCast, valuesToCast);
+    const auto expectedMapVector = makeMapVector(
+        {0, 2, 4, 6, 8}, castedValuesThatThrowOnCast, castedValuesToCast);
+    testCast(mapVector, expectedMapVector);
+  }
+  // Casting a map skips complex keys that don't need to change.
+  {
+    const auto mapVector = makeMapVector(
+        {0, 2, 4, 6, 8}, arrayOfValuesThatThrowOnCast, valuesToCast);
+    const auto expectedMapVector = makeMapVector(
+        {0, 2, 4, 6, 8},
+        castedArrayOfValuesThatThrowOnCast,
+        castedValuesToCast);
+    testCast(mapVector, expectedMapVector);
+  }
+  // Casting a map skips primitve values that don't need to change.
+  {
+    const auto mapVector =
+        makeMapVector({0, 2, 4, 6, 8}, valuesToCast, valuesThatThrowOnCast);
+    const auto expectedMapVector = makeMapVector(
+        {0, 2, 4, 6, 8}, castedValuesToCast, castedValuesThatThrowOnCast);
+    testCast(mapVector, expectedMapVector);
+  }
+  // Casting a map skips complex values that don't need to change.
+  {
+    const auto mapVector = makeMapVector(
+        {0, 2, 4, 6, 8}, valuesToCast, arrayOfValuesThatThrowOnCast);
+    const auto expectedMapVector = makeMapVector(
+        {0, 2, 4, 6, 8},
+        castedValuesToCast,
+        castedArrayOfValuesThatThrowOnCast);
+    testCast(mapVector, expectedMapVector);
+  }
+}
 } // namespace
 } // namespace facebook::velox::test

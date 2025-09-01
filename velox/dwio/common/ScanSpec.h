@@ -18,10 +18,12 @@
 
 #include "velox/common/base/SelectivityInfo.h"
 #include "velox/dwio/common/MetadataFilter.h"
+#include "velox/dwio/common/Mutation.h"
 #include "velox/type/Filter.h"
 #include "velox/type/Subfield.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
+#include "velox/vector/ConstantVector.h"
 #include "velox/vector/LazyVector.h"
 
 #include <vector>
@@ -36,9 +38,18 @@ namespace common {
 // Describes the filtering and value extraction for a
 // SelectiveColumnReader. This is owned by the TableScan Operator and
 // is passed to SelectiveColumnReaders at construction.  This is
-// mutable by readers to reflect filter order and other adaptation.
+// mutable by readers to reflect filter order and other adaptations.
 class ScanSpec {
  public:
+  enum class ColumnType : int8_t {
+    kRegular, // Read from file or constant
+    kRowIndex, // Row number in the file starting from 0
+    kComposite, // A struct with all children not read from file
+  };
+
+  // Convert ColumnType to its string name representation.
+  static std::string_view columnTypeString(ColumnType columnType);
+
   static constexpr column_index_t kNoChannel = ~0;
   static constexpr const char* kMapKeysFieldName = "keys";
   static constexpr const char* kMapValuesFieldName = "values";
@@ -49,17 +60,15 @@ class ScanSpec {
   // Filter to apply. If 'this' corresponds to a struct/list/map, this
   // can only be isNull or isNotNull, other filtering is given by
   // 'children'.
-  common::Filter* filter() const {
-    return filter_.get();
+  const common::Filter* filter() const {
+    return filterDisabled_ ? nullptr : filter_.get();
   }
 
   // Sets 'filter_'. May be used at initialization or when adding a
   // pushed down filter, e.g. top k cutoff.
-  void setFilter(std::unique_ptr<Filter> filter) {
+  void setFilter(std::shared_ptr<Filter> filter) {
     filter_ = std::move(filter);
   }
-
-  void addFilter(const Filter&);
 
   void setMaxArrayElementsCount(vector_size_t count) {
     maxArrayElementsCount_ = count;
@@ -76,7 +85,7 @@ class ScanSpec {
   }
 
   int numMetadataFilters() const {
-    return metadataFilters_.size();
+    return filterDisabled_ ? 0 : metadataFilters_.size();
   }
 
   const MetadataFilter::LeafNode* metadataFilterNodeAt(int i) const {
@@ -97,8 +106,26 @@ class ScanSpec {
     constantValue_ = value;
   }
 
+  template <typename T>
+  void setConstantValue(T val, TypePtr type, memory::MemoryPool* pool) {
+    constantValue_ = std::make_shared<ConstantVector<T>>(
+        pool, 1, false, std::move(type), std::move(val));
+  }
+
   bool isConstant() const {
     return constantValue_ != nullptr;
+  }
+
+  void setColumnType(ColumnType value) {
+    columnType_ = value;
+  }
+
+  ColumnType columnType() const {
+    return columnType_;
+  }
+
+  bool readFromFile() const {
+    return columnType_ == ColumnType::kRegular && !isConstant();
   }
 
   // Name of the value in its container, i.e. field name in struct or
@@ -125,10 +152,8 @@ class ScanSpec {
     subscript_ = subscript;
   }
 
-  // True if the value is returned from scan. Fields can have
-  // 'extractValues_' set and not be projected out if these are only
-  // used in filter functions. A runtime pushdown of a filter function
-  // may cause this to become false at run time.
+  // True if the value is returned from scan.  A runtime pushdown of a filter
+  // function may cause this to become false at run time.
   bool projectOut() const {
     return projectOut_;
   }
@@ -137,22 +162,8 @@ class ScanSpec {
     projectOut_ = projectOut;
   }
 
-  // Whether the value is extracted, to be collected with
-  // getValues(). If this corresponds to a container, e.g. struct,
-  // list, map of which at least one value is extracted, this is true.
-  // A runtime pushdown may make this false, e.g. if a hash probe
-  // changes into an IN predicate. This is true while 'projectOut_' is
-  // false for columns that are used in filter functions.
-  bool extractValues() const {
-    return extractValues_;
-  }
-
-  void setExtractValues(bool extractValues) {
-    extractValues_ = extractValues;
-  }
-
   bool keepValues() const {
-    return extractValues_ || projectOut_;
+    return projectOut_ || deltaUpdate_;
   }
 
   // Position in the RowVector returned by the top level scan. Applies
@@ -222,12 +233,11 @@ class ScanSpec {
   // apply to Nimble format leaf nodes, because nulls are mixed in the encoding
   // with actual values.
   bool readsNullsOnly() const {
-    if (filter_) {
-      if (filter_->kind() == FilterKind::kIsNull) {
+    if (auto* filter = this->filter()) {
+      if (filter->kind() == FilterKind::kIsNull) {
         return true;
       }
-      if (filter_->kind() == FilterKind::kIsNotNull && !projectOut_ &&
-          !extractValues_) {
+      if (filter->kind() == FilterKind::kIsNotNull && !projectOut_) {
         return true;
       }
     }
@@ -249,6 +259,12 @@ class ScanSpec {
   // This may change as a result of runtime adaptation.
   bool hasFilter() const;
 
+  /// Similar as hasFilter() but also return true even there is a filter on
+  /// constant.  Used by delta updated columns because these columns will have
+  /// delta update on constants which makes them no longer constant.  This
+  /// method also ignores filterDisabled_.
+  bool hasFilterApplicableToConstant() const;
+
   /// Assume this field is read as null constant vector (usually due to missing
   /// field), check if any filter in the struct subtree would make the whole
   /// vector to be filtered out.  Return false when the whole vector should be
@@ -265,10 +281,6 @@ class ScanSpec {
     if (doReorder) {
       reorder();
     }
-  }
-
-  void setEnableFilterReorder(bool enableFilterReorder) {
-    enableFilterReorder_ = enableFilterReorder;
   }
 
   // Returns the child which produces values for 'channel'. Throws if not found.
@@ -328,6 +340,36 @@ class ScanSpec {
   template <typename F>
   void visit(const Type& type, F&& f);
 
+  dwio::common::DeltaColumnUpdater* deltaUpdate() const {
+    return deltaUpdate_;
+  }
+
+  void setDeltaUpdate(dwio::common::DeltaColumnUpdater* update) {
+    deltaUpdate_ = update;
+    enableFilterInSubTree(update == nullptr);
+  }
+
+  void resetDeltaUpdates() {
+    for (auto& child : children_) {
+      // Only top level columns can have delta updates.
+      if (child->deltaUpdate_) {
+        child->setDeltaUpdate(nullptr);
+      }
+    }
+  }
+
+  /// Apply filter to the first `size' rows of input `vector' and set the passed
+  /// bits in `result'.  `size' is usually the size of top most RowVector, since
+  /// the child could be larger in some suboptimal/corrupted cases and we do not
+  /// want to crash the process for it.
+  ///
+  /// This method is used by non-selective reader and delta update, so it
+  /// ignores the filterDisabled_ state.
+  void applyFilter(
+      const BaseVector& vector,
+      vector_size_t size,
+      uint64_t* result) const;
+
   bool isFlatMapAsStruct() const {
     return isFlatMapAsStruct_;
   }
@@ -336,8 +378,28 @@ class ScanSpec {
     isFlatMapAsStruct_ = value;
   }
 
+  /// Disable stats based filter reordering.
+  void disableStatsBasedFilterReorder() {
+    disableStatsBasedFilterReorder_ = true;
+    for (auto& child : children_) {
+      child->disableStatsBasedFilterReorder();
+    }
+  }
+
+  bool statsBasedFilterReorderDisabled() const {
+    return disableStatsBasedFilterReorder_;
+  }
+
  private:
   void reorder();
+
+  void enableFilterInSubTree(bool value);
+
+  bool compareTimeToDropValue(
+      const std::shared_ptr<ScanSpec>& x,
+      const std::shared_ptr<ScanSpec>& y);
+
+  bool disableStatsBasedFilterReorder_{false};
 
   // Serializes stableChildren().
   std::mutex mutex_;
@@ -362,11 +424,15 @@ class ScanSpec {
 
   VectorPtr constantValue_;
   bool projectOut_ = false;
-  bool extractValues_ = false;
+
+  ColumnType columnType_ = ColumnType::kRegular;
+
   // True if a string dictionary or flat map in this field should be
   // returned as flat.
   bool makeFlat_ = false;
-  std::unique_ptr<common::Filter> filter_;
+  std::shared_ptr<const common::Filter> filter_;
+  bool filterDisabled_ = false;
+  dwio::common::DeltaColumnUpdater* deltaUpdate_ = nullptr;
 
   // Filters that will be only used for row group filtering based on metadata.
   // The conjunctions among these filters are tracked in MetadataFilter, with
@@ -377,24 +443,9 @@ class ScanSpec {
       metadataFilters_;
 
   SelectivityInfo selectivity_;
-  // Sort children by filtering efficiency.
-  bool enableFilterReorder_ = true;
-
-  // Specification of action on child fields. This is filled in as
-  // follows: Top level ScanSpec: All top level fields mentioned are
-  // specified.  Nested struct/map/list: If filter-only,
-  // projectOut/extractvalues are false in both container and children
-  // and filtered subfields are represented.  If all children are
-  // extracted and some are filtered: The container has
-  // projectOut/extractValues set and filtered children, if any, are
-  // in 'children_'. The filtered children have extractValues
-  // false. If only some children are materialized (subfield pruning),
-  // then the materialized children and filtered children are
-  // represented in 'children_' and the materialized ones have
-  // extractValues true.  Having at least one child with extractValues
-  // true differentiates pruning from the case of extracting all children.
 
   std::vector<std::shared_ptr<ScanSpec>> children_;
+
   // Read-only copy of children, not subject to reordering. Used when
   // asynchronously constructing reader trees for read-ahead, while
   // 'children_' is reorderable by a running scan.
@@ -453,7 +504,7 @@ void ScanSpec::visit(const Type& type, F&& f) {
 // Returns false if no value from a range defined by stats can pass the
 // filter. True, otherwise.
 bool testFilter(
-    common::Filter* filter,
+    const common::Filter* filter,
     dwio::common::ColumnStatistics* stats,
     uint64_t totalRows,
     const TypePtr& type);
@@ -461,3 +512,14 @@ bool testFilter(
 } // namespace common
 } // namespace velox
 } // namespace facebook
+
+template <>
+struct fmt::formatter<facebook::velox::common::ScanSpec::ColumnType>
+    : formatter<std::string_view> {
+  auto format(
+      facebook::velox::common::ScanSpec::ColumnType columnType,
+      format_context& ctx) const {
+    return formatter<std::string_view>::format(
+        facebook::velox::common::ScanSpec::columnTypeString(columnType), ctx);
+  }
+};

@@ -14,7 +14,7 @@
 
 add_executable(velox_wave_vector_test VectorTest.cpp)
 
-add_test(veloxwave__vector_test velox_wave_vector_test)
+add_test(veloxwave_vector_test velox_wave_vector_test)
 
 target_link_libraries(
   velox_wave_vector_test
@@ -36,4 +36,4 @@ target_link_libraries(
   gflags::gflags
   glog::glog
   fmt::fmt
-  ${FILESYSTEM})
+)

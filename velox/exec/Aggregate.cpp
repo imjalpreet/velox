@@ -34,6 +34,11 @@ bool isPartialOutput(core::AggregationNode::Step step) {
       step == core::AggregationNode::Step::kIntermediate;
 }
 
+bool isPartialInput(core::AggregationNode::Step step) {
+  return step == core::AggregationNode::Step::kIntermediate ||
+      step == core::AggregationNode::Step::kFinal;
+}
+
 AggregateFunctionMap& aggregateFunctions() {
   static AggregateFunctionMap functions;
   return functions;
@@ -79,23 +84,29 @@ AggregateRegistrationResult registerAggregateFunction(
     registered.mainFunction = inserted;
   }
 
-  // Register the aggregate as a window function also.
-  registerAggregateWindowFunction(sanitizedName);
+  // If the aggregate is not a companion function, also register it as a window
+  // function.
+  if (!metadata.companionFunction) {
+    registerAggregateWindowFunction(sanitizedName);
+  }
 
   // Register companion function if needed.
   if (registerCompanionFunctions) {
+    auto companionMetadata = metadata;
+    companionMetadata.companionFunction = true;
+
     registered.partialFunction =
         CompanionFunctionsRegistrar::registerPartialFunction(
-            name, signatures, overwrite);
+            name, signatures, companionMetadata, overwrite);
     registered.mergeFunction =
         CompanionFunctionsRegistrar::registerMergeFunction(
-            name, signatures, overwrite);
+            name, signatures, companionMetadata, overwrite);
     registered.extractFunction =
         CompanionFunctionsRegistrar::registerExtractFunction(
             name, signatures, overwrite);
     registered.mergeExtractFunction =
         CompanionFunctionsRegistrar::registerMergeExtractFunction(
-            name, signatures, overwrite);
+            name, signatures, companionMetadata, overwrite);
   }
   return registered;
 }
@@ -139,6 +150,15 @@ std::vector<AggregateRegistrationResult> registerAggregateFunction(
         overwrite);
   }
   return registrationResults;
+}
+
+const AggregateFunctionMetadata& getAggregateFunctionMetadata(
+    const std::string& name) {
+  const auto sanitizedName = sanitizeName(name);
+  if (auto func = getAggregateFunctionEntry(sanitizedName)) {
+    return func->metadata;
+  }
+  VELOX_USER_FAIL("Aggregate function not found: {}", name);
 }
 
 std::unordered_map<
@@ -275,39 +295,30 @@ std::unique_ptr<Aggregate> Aggregate::create(
     const std::vector<TypePtr>& argTypes,
     const TypePtr& resultType,
     const core::QueryConfig& config) {
+  // TODO(timaou, kletkavrubashku): Reneable the validation once "regr_slope"
+  // signature is fixed
+  //
+  // Validate the result type. if (isPartialOutput(step)) {
+  //   auto intermediateType = Aggregate::intermediateType(name, argTypes);
+  //   VELOX_CHECK(
+  //       resultType->equivalent(*intermediateType),
+  //       "Intermediate type mismatch. Expected: {}, actual: {}",
+  //       intermediateType->toString(),
+  //       resultType->toString());
+  // } else {
+  //   auto finalType = Aggregate::finalType(name, argTypes);
+  //   VELOX_CHECK(
+  //       resultType->equivalent(*finalType),
+  //       "Final type mismatch. Expected: {}, actual: {}",
+  //       finalType->toString(),
+  //       resultType->toString());
+  // }
   // Lookup the function in the new registry first.
   if (auto func = getAggregateFunctionEntry(name)) {
     return func->factory(step, argTypes, resultType, config);
   }
 
   VELOX_USER_FAIL("Aggregate function not registered: {}", name);
-}
-
-// static
-TypePtr Aggregate::intermediateType(
-    const std::string& name,
-    const std::vector<TypePtr>& argTypes) {
-  auto signatures = getAggregateFunctionSignatures(name);
-  if (!signatures.has_value()) {
-    VELOX_USER_FAIL("Aggregate function not registered: {}", name);
-  }
-  for (auto& signature : signatures.value()) {
-    SignatureBinder binder(*signature, argTypes);
-    if (binder.tryBind()) {
-      auto type = binder.tryResolveType(signature->intermediateType());
-      VELOX_USER_CHECK(
-          type,
-          "Cannot resolve intermediate type for aggregate function {}",
-          toString(name, argTypes));
-      return type;
-    }
-  }
-
-  std::stringstream error;
-  error << "Aggregate function signature is not supported: "
-        << toString(name, argTypes)
-        << ". Supported signatures: " << toString(signatures.value()) << ".";
-  VELOX_USER_FAIL(error.str());
 }
 
 void Aggregate::setLambdaExpressions(

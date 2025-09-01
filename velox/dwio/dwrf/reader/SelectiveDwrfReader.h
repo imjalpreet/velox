@@ -26,6 +26,7 @@ namespace facebook::velox::dwrf {
 class SelectiveDwrfReader {
  public:
   static std::unique_ptr<dwio::common::SelectiveColumnReader> build(
+      const dwio::common::ColumnReaderOptions& columnReaderOptions,
       const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       DwrfParams& params,
@@ -35,6 +36,7 @@ class SelectiveDwrfReader {
   /// Compatibility wrapper for tests. Takes the components of DwrfParams as
   /// separate.
   static std::unique_ptr<dwio::common::SelectiveColumnReader> build(
+      const dwio::common::ColumnReaderOptions& columnReaderOptions,
       const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       StripeStreams& stripe,
@@ -44,32 +46,14 @@ class SelectiveDwrfReader {
       FlatMapContext flatMapContext = {},
       bool isRoot = false) {
     auto params = DwrfParams(stripe, streamLabels, stats, flatMapContext);
-    return build(requestedType, fileType, params, *scanSpec, isRoot);
+    return build(
+        columnReaderOptions,
+        requestedType,
+        fileType,
+        params,
+        *scanSpec,
+        isRoot);
   }
 };
 
-class SelectiveColumnReaderFactory : public ColumnReaderFactory {
- public:
-  explicit SelectiveColumnReaderFactory(
-      std::shared_ptr<common::ScanSpec> scanSpec)
-      : scanSpec_(scanSpec) {}
-
-  std::unique_ptr<dwio::common::SelectiveColumnReader> buildSelective(
-      const TypePtr& requestedType,
-      const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
-      StripeStreams& stripe,
-      const StreamLabels& streamLabels,
-      dwio::common::ColumnReaderStatistics& stats,
-      FlatMapContext flatMapContext = {}) {
-    auto params =
-        DwrfParams(stripe, streamLabels, stats, std::move(flatMapContext));
-    auto reader =
-        SelectiveDwrfReader::build(requestedType, fileType, params, *scanSpec_);
-    reader->setIsTopLevel();
-    return reader;
-  }
-
- private:
-  std::shared_ptr<common::ScanSpec> const scanSpec_;
-};
 } // namespace facebook::velox::dwrf

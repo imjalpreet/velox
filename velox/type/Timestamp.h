@@ -81,6 +81,8 @@ struct Timestamp {
  public:
   static constexpr int64_t kMillisecondsInSecond = 1'000;
   static constexpr int64_t kMicrosecondsInMillisecond = 1'000;
+  static constexpr int64_t kMicrosecondsInSecond =
+      kMicrosecondsInMillisecond * kMillisecondsInSecond;
   static constexpr int64_t kNanosecondsInMicrosecond = 1'000;
   static constexpr int64_t kNanosecondsInMillisecond = 1'000'000;
   static constexpr int64_t kNanosInSecond =
@@ -116,6 +118,9 @@ struct Timestamp {
   /// Creates a timestamp from the number of days since the Julian epoch
   /// and the number of nanoseconds.
   static Timestamp fromDaysAndNanos(int32_t days, int64_t nanos);
+
+  // date is the number of days since unix epoch.
+  static Timestamp fromDate(int32_t date);
 
   // Returns the current unix timestamp (ms precision).
   static Timestamp now();
@@ -153,15 +158,14 @@ struct Timestamp {
 
   // Keep it in header for getting inlined.
   int64_t toMillis() const {
-    // We use int128_t to make sure the computation does not overflows since
+    // We use int128_t to make sure the computation does not overflow since
     // there are cases such that seconds*1000 does not fit in int64_t,
-    // but seconds*1000 + nanos does, an example is TimeStamp::minMillis().
+    // but seconds*1000 + nanos does, an example is Timestamp::minMillis().
 
-    // If the final result does not fit in int64_tw we throw.
+    // If the final result does not fit in int64_t we throw.
     __int128_t result =
         (__int128_t)seconds_ * 1'000 + (int64_t)(nanos_ / 1'000'000);
-    if (result < std::numeric_limits<int64_t>::min() ||
-        result > std::numeric_limits<int64_t>::max()) {
+    if (result < INT64_MIN || result > INT64_MAX) {
       VELOX_USER_FAIL(
           "Could not convert Timestamp({}, {}) to milliseconds",
           seconds_,
@@ -180,19 +184,36 @@ struct Timestamp {
 
   // Keep it in header for getting inlined.
   int64_t toMicros() const {
-    // When an integer overflow occurs in the calculation,
-    // an exception will be thrown.
-    try {
-      return checkedPlus(
-          checkedMultiply(seconds_, (int64_t)1'000'000),
-          (int64_t)(nanos_ / 1'000));
-    } catch (const std::exception& e) {
+    // We use int128_t to make sure the computation does not overflows since
+    // there are cases such that a negative seconds*1000000 does not fit in
+    // int64_t, but seconds*1000000 + nanos does. An example is
+    // Timestamp(-9223372036855, 224'192'000).
+
+    // If the final result does not fit in int64_t we throw.
+    __int128_t result = static_cast<__int128_t>(seconds_) * 1'000'000 +
+        static_cast<int64_t>(nanos_ / 1'000);
+    if (result < INT64_MIN || result > INT64_MAX) {
       VELOX_USER_FAIL(
-          "Could not convert Timestamp({}, {}) to microseconds, {}",
+          "Could not convert Timestamp({}, {}) to microseconds",
           seconds_,
-          nanos_,
-          e.what());
+          nanos_);
     }
+    return result;
+  }
+
+  Timestamp toPrecision(const TimestampPrecision& precision) const {
+    uint64_t nanos = nanos_;
+    switch (precision) {
+      case TimestampPrecision::kMilliseconds:
+        nanos = nanos / 1'000'000 * 1'000'000;
+        break;
+      case TimestampPrecision::kMicroseconds:
+        nanos = nanos / 1'000 * 1'000;
+        break;
+      case TimestampPrecision::kNanoseconds:
+        break;
+    }
+    return Timestamp(seconds_, nanos);
   }
 
   /// Exports the current timestamp as a std::chrono::time_point of millisecond
@@ -356,33 +377,8 @@ struct Timestamp {
   /// A default time zone that is same across the process.
   static const tz::TimeZone& defaultTimezone();
 
-  bool operator==(const Timestamp& b) const {
-    return seconds_ == b.seconds_ && nanos_ == b.nanos_;
-  }
-
-  bool operator!=(const Timestamp& b) const {
-    return seconds_ != b.seconds_ || nanos_ != b.nanos_;
-  }
-
-  bool operator<(const Timestamp& b) const {
-    return seconds_ < b.seconds_ ||
-        (seconds_ == b.seconds_ && nanos_ < b.nanos_);
-  }
-
-  bool operator<=(const Timestamp& b) const {
-    return seconds_ < b.seconds_ ||
-        (seconds_ == b.seconds_ && nanos_ <= b.nanos_);
-  }
-
-  bool operator>(const Timestamp& b) const {
-    return seconds_ > b.seconds_ ||
-        (seconds_ == b.seconds_ && nanos_ > b.nanos_);
-  }
-
-  bool operator>=(const Timestamp& b) const {
-    return seconds_ > b.seconds_ ||
-        (seconds_ == b.seconds_ && nanos_ >= b.nanos_);
-  }
+  bool operator==(const Timestamp& b) const = default;
+  auto operator<=>(const Timestamp& b) const = default;
 
   void operator++() {
     if (nanos_ < kMaxNanos) {
@@ -505,7 +501,7 @@ struct formatter<facebook::velox::TimestampToStringOptions::Precision>
     : formatter<int> {
   auto format(
       facebook::velox::TimestampToStringOptions::Precision s,
-      format_context& ctx) {
+      format_context& ctx) const {
     return formatter<int>::format(static_cast<int>(s), ctx);
   }
 };
@@ -514,7 +510,7 @@ struct formatter<facebook::velox::TimestampToStringOptions::Mode>
     : formatter<int> {
   auto format(
       facebook::velox::TimestampToStringOptions::Mode s,
-      format_context& ctx) {
+      format_context& ctx) const {
     return formatter<int>::format(static_cast<int>(s), ctx);
   }
 };

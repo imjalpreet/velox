@@ -18,7 +18,7 @@
 #include <folly/container/F14Set.h>
 
 #include <velox/type/Filter.h>
-#include "velox/common/base/RawVector.h"
+#include "velox/common/memory/RawVector.h"
 #include "velox/exec/Operator.h"
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/VectorTypeUtils.h"
@@ -293,6 +293,7 @@ class VectorHasher {
       case TypeKind::BIGINT:
       case TypeKind::VARCHAR:
       case TypeKind::VARBINARY:
+      case TypeKind::TIMESTAMP:
         return true;
       default:
         return false;
@@ -330,6 +331,10 @@ class VectorHasher {
   template <typename T>
   inline int64_t toInt64(T value) const {
     return value;
+  }
+
+  inline int64_t toInt64(Timestamp timestamp) const {
+    return timestamp.toMillis();
   }
 
   // Sets the data statistics from 'other'. Does not set the mapping mode.
@@ -457,7 +462,7 @@ class VectorHasher {
     }
 
     bool inRange = true;
-    rows.template testSelected([&](vector_size_t row) {
+    rows.testSelected([&](vector_size_t row) {
       auto int64Value = toInt64(values[row]);
       if (int64Value > max_ || int64Value < min_) {
         inRange = false;
@@ -540,7 +545,7 @@ class VectorHasher {
     return *reinterpret_cast<const T*>(group + offset);
   }
 
-  template <TypeKind Kind>
+  template <bool typeProvidesCustomComparison, TypeKind Kind>
   void hashValues(const SelectivityVector& rows, bool mix, uint64_t* result);
 
   const column_index_t channel_;
@@ -662,8 +667,27 @@ inline uint64_t VectorHasher::lookupValueId(StringView value) const {
 }
 
 template <>
+inline uint64_t VectorHasher::lookupValueId(Timestamp timestamp) const {
+  return timestamp.getNanos() % 1'000'000 != 0
+      ? kUnmappable
+      : lookupValueId(timestamp.toMillis());
+}
+
+template <>
 inline uint64_t VectorHasher::valueId(bool value) {
   return value ? 2 : 1;
+}
+template <>
+inline uint64_t VectorHasher::valueId(Timestamp value) {
+  if (FOLLY_UNLIKELY(
+          value.getNanos() % Timestamp::kNanosecondsInMillisecond != 0)) {
+    // The timestamp is in nanosecond or microsecond precision. The values are
+    // not mappable to milliseconds without precision loss.
+    setRangeOverflow();
+    setDistinctOverflow();
+    return kUnmappable;
+  }
+  return valueId(value.toMillis());
 }
 
 template <>
@@ -671,7 +695,7 @@ inline bool VectorHasher::tryMapToRange(
     const bool* values,
     const SelectivityVector& rows,
     uint64_t* result) {
-  rows.template applyToSelected([&](vector_size_t row) {
+  rows.applyToSelected([&](vector_size_t row) {
     auto hash = valueId(values[row]);
     result[row] = multiplier_ == 1 ? hash : result[row] + multiplier_ * hash;
   });
@@ -708,6 +732,10 @@ bool VectorHasher::makeValueIdsDecoded<bool, false>(
 std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
     const RowTypePtr& rowType,
     const std::vector<core::FieldAccessTypedExprPtr>& keys);
+
+std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
+    const RowTypePtr& rowType,
+    const std::vector<column_index_t>& keyChannels);
 
 } // namespace facebook::velox::exec
 

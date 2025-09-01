@@ -14,22 +14,23 @@
  * limitations under the License.
  */
 
-#include "velox/connectors/hive/HiveConnectorSplit.h"
+#include "velox/connectors/hive/HiveConnector.h"
 #include "velox/exec/WindowFunction.h"
-#include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/parse/TypeResolver.h"
+#include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <gtest/gtest.h>
 
-using namespace facebook::velox;
-using namespace facebook::velox::common::test;
-
 using facebook::velox::exec::test::PlanBuilder;
 
-class PlanNodeToStringTest : public testing::Test, public test::VectorTestBase {
+namespace facebook::velox::exec {
+namespace {
+
+class PlanNodeToStringTest : public testing::Test,
+                             public velox::test::VectorTestBase {
  public:
   PlanNodeToStringTest() {
     functions::prestosql::registerAllScalarFunctions();
@@ -51,7 +52,7 @@ class PlanNodeToStringTest : public testing::Test, public test::VectorTestBase {
 
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   RowVectorPtr data_;
@@ -74,16 +75,16 @@ TEST_F(PlanNodeToStringTest, recursive) {
 
 TEST_F(PlanNodeToStringTest, detailed) {
   ASSERT_EQ(
-      "-- Project[4][expressions: (out3:BIGINT, plus(cast ROW[\"out1\"] as BIGINT,10))] -> out3:BIGINT\n",
+      "-- Project[4][expressions: (out3:BIGINT, plus(cast(ROW[\"out1\"] as BIGINT),10))] -> out3:BIGINT\n",
       plan_->toString(true, false));
 }
 
 TEST_F(PlanNodeToStringTest, recursiveAndDetailed) {
   ASSERT_EQ(
-      "-- Project[4][expressions: (out3:BIGINT, plus(cast ROW[\"out1\"] as BIGINT,10))] -> out3:BIGINT\n"
-      "  -- Filter[3][expression: lt(mod(cast ROW[\"out1\"] as BIGINT,10),8)] -> out1:SMALLINT, out2:BIGINT\n"
-      "    -- Project[2][expressions: (out1:SMALLINT, ROW[\"c0\"]), (out2:BIGINT, plus(mod(cast ROW[\"c0\"] as BIGINT,100),mod(cast ROW[\"c1\"] as BIGINT,50)))] -> out1:SMALLINT, out2:BIGINT\n"
-      "      -- Filter[1][expression: lt(mod(cast ROW[\"c0\"] as BIGINT,10),9)] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n"
+      "-- Project[4][expressions: (out3:BIGINT, plus(cast(ROW[\"out1\"] as BIGINT),10))] -> out3:BIGINT\n"
+      "  -- Filter[3][expression: lt(mod(cast(ROW[\"out1\"] as BIGINT),10),8)] -> out1:SMALLINT, out2:BIGINT\n"
+      "    -- Project[2][expressions: (out1:SMALLINT, ROW[\"c0\"]), (out2:BIGINT, plus(mod(cast(ROW[\"c0\"] as BIGINT),100),mod(cast(ROW[\"c1\"] as BIGINT),50)))] -> out1:SMALLINT, out2:BIGINT\n"
+      "      -- Filter[1][expression: lt(mod(cast(ROW[\"c0\"] as BIGINT),10),9)] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n"
       "        -- Values[0][5 rows in 1 vectors] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
       plan_->toString(true, true));
 }
@@ -101,7 +102,7 @@ TEST_F(PlanNodeToStringTest, withContext) {
       plan_->toString(false, false, addContext));
 
   ASSERT_EQ(
-      "-- Project[4][expressions: (out3:BIGINT, plus(cast ROW[\"out1\"] as BIGINT,10))] -> out3:BIGINT\n"
+      "-- Project[4][expressions: (out3:BIGINT, plus(cast(ROW[\"out1\"] as BIGINT),10))] -> out3:BIGINT\n"
       "   Context for 4\n",
       plan_->toString(true, false, addContext));
 
@@ -119,13 +120,13 @@ TEST_F(PlanNodeToStringTest, withContext) {
       plan_->toString(false, true, addContext));
 
   ASSERT_EQ(
-      "-- Project[4][expressions: (out3:BIGINT, plus(cast ROW[\"out1\"] as BIGINT,10))] -> out3:BIGINT\n"
+      "-- Project[4][expressions: (out3:BIGINT, plus(cast(ROW[\"out1\"] as BIGINT),10))] -> out3:BIGINT\n"
       "   Context for 4\n"
-      "  -- Filter[3][expression: lt(mod(cast ROW[\"out1\"] as BIGINT,10),8)] -> out1:SMALLINT, out2:BIGINT\n"
+      "  -- Filter[3][expression: lt(mod(cast(ROW[\"out1\"] as BIGINT),10),8)] -> out1:SMALLINT, out2:BIGINT\n"
       "     Context for 3\n"
-      "    -- Project[2][expressions: (out1:SMALLINT, ROW[\"c0\"]), (out2:BIGINT, plus(mod(cast ROW[\"c0\"] as BIGINT,100),mod(cast ROW[\"c1\"] as BIGINT,50)))] -> out1:SMALLINT, out2:BIGINT\n"
+      "    -- Project[2][expressions: (out1:SMALLINT, ROW[\"c0\"]), (out2:BIGINT, plus(mod(cast(ROW[\"c0\"] as BIGINT),100),mod(cast(ROW[\"c1\"] as BIGINT),50)))] -> out1:SMALLINT, out2:BIGINT\n"
       "       Context for 2\n"
-      "      -- Filter[1][expression: lt(mod(cast ROW[\"c0\"] as BIGINT,10),9)] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n"
+      "      -- Filter[1][expression: lt(mod(cast(ROW[\"c0\"] as BIGINT),10),9)] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n"
       "         Context for 1\n"
       "        -- Values[0][5 rows in 1 vectors] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n"
       "           Context for 0\n",
@@ -147,7 +148,7 @@ TEST_F(PlanNodeToStringTest, withMultiLineContext) {
       plan_->toString(false, false, addContext));
 
   ASSERT_EQ(
-      "-- Project[4][expressions: (out3:BIGINT, plus(cast ROW[\"out1\"] as BIGINT,10))] -> out3:BIGINT\n"
+      "-- Project[4][expressions: (out3:BIGINT, plus(cast(ROW[\"out1\"] as BIGINT),10))] -> out3:BIGINT\n"
       "   Context for 4: line 1\n"
       "   Context for 4: line 2\n",
       plan_->toString(true, false, addContext));
@@ -589,52 +590,85 @@ TEST_F(PlanNodeToStringTest, localPartition) {
 }
 
 TEST_F(PlanNodeToStringTest, partitionedOutput) {
-  auto plan =
-      PlanBuilder().values({data_}).partitionedOutput({"c0"}, 4).planNode();
+  for (auto serdeKind : std::vector<VectorSerde::Kind>{
+           VectorSerde::Kind::kPresto,
+           VectorSerde::Kind::kCompactRow,
+           VectorSerde::Kind::kUnsafeRow}) {
+    SCOPED_TRACE(fmt::format("serdeKind: {}", serdeKind));
+    auto plan =
+        PlanBuilder()
+            .values({data_})
+            .partitionedOutput({"c0"}, 4, /*outputLayout=*/{}, serdeKind)
+            .planNode();
 
-  ASSERT_EQ("-- PartitionedOutput[1]\n", plan->toString());
-  ASSERT_EQ(
-      "-- PartitionedOutput[1][partitionFunction: HASH(c0) with 4 partitions] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
-      plan->toString(true, false));
+    ASSERT_EQ("-- PartitionedOutput[1]\n", plan->toString());
+    ASSERT_EQ(
+        fmt::format(
+            "-- PartitionedOutput[1][partitionFunction: HASH(c0) with 4 partitions {}] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
+            serdeKind),
+        plan->toString(true, false));
 
-  plan = PlanBuilder().values({data_}).partitionedOutputBroadcast().planNode();
+    plan = PlanBuilder()
+               .values({data_})
+               .partitionedOutputBroadcast(/*outputLayout=*/{}, serdeKind)
+               .planNode();
 
-  ASSERT_EQ("-- PartitionedOutput[1]\n", plan->toString());
-  ASSERT_EQ(
-      "-- PartitionedOutput[1][BROADCAST] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
-      plan->toString(true, false));
+    ASSERT_EQ("-- PartitionedOutput[1]\n", plan->toString());
+    ASSERT_EQ(
+        fmt::format(
+            "-- PartitionedOutput[1][BROADCAST {}] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
+            serdeKind),
+        plan->toString(true, false));
 
-  plan = PlanBuilder().values({data_}).partitionedOutput({}, 1).planNode();
+    plan = PlanBuilder()
+               .values({data_})
+               .partitionedOutput({}, 1, /*outputLayout=*/{}, serdeKind)
+               .planNode();
 
-  ASSERT_EQ("-- PartitionedOutput[1]\n", plan->toString());
-  ASSERT_EQ(
-      "-- PartitionedOutput[1][SINGLE] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
-      plan->toString(true, false));
+    ASSERT_EQ("-- PartitionedOutput[1]\n", plan->toString());
+    ASSERT_EQ(
+        fmt::format(
+            "-- PartitionedOutput[1][SINGLE {}] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
+            serdeKind),
+        plan->toString(true, false));
 
-  plan = PlanBuilder()
-             .values({data_})
-             .partitionedOutput({"c1", "c2"}, 5, true)
-             .planNode();
+    plan = PlanBuilder()
+               .values({data_})
+               .partitionedOutput(
+                   {"c1", "c2"}, 5, true, /*outputLayout=*/{}, serdeKind)
+               .planNode();
 
-  ASSERT_EQ("-- PartitionedOutput[1]\n", plan->toString());
-  ASSERT_EQ(
-      "-- PartitionedOutput[1][partitionFunction: HASH(c1, c2) with 5 partitions replicate nulls and any] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
-      plan->toString(true, false));
+    ASSERT_EQ("-- PartitionedOutput[1]\n", plan->toString());
+    ASSERT_EQ(
+        fmt::format(
+            "-- PartitionedOutput[1][partitionFunction: HASH(c1, c2) with 5 partitions replicate nulls and any {}] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
+            serdeKind),
+        plan->toString(true, false));
 
-  auto hiveSpec = std::make_shared<connector::hive::HivePartitionFunctionSpec>(
-      4,
-      std::vector<int>{0, 1, 0, 1},
-      std::vector<column_index_t>{1, 2},
-      std::vector<VectorPtr>{});
+    auto hiveSpec =
+        std::make_shared<connector::hive::HivePartitionFunctionSpec>(
+            4,
+            std::vector<int>{0, 1, 0, 1},
+            std::vector<column_index_t>{1, 2},
+            std::vector<VectorPtr>{});
 
-  plan = PlanBuilder()
-             .values({data_})
-             .partitionedOutput({"c1", "c2"}, 2, false, hiveSpec)
-             .planNode();
-  ASSERT_EQ("-- PartitionedOutput[1]\n", plan->toString());
-  ASSERT_EQ(
-      "-- PartitionedOutput[1][partitionFunction: HIVE((1, 2) buckets: 4) with 2 partitions] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
-      plan->toString(true, false));
+    plan = PlanBuilder()
+               .values({data_})
+               .partitionedOutput(
+                   {"c1", "c2"},
+                   2,
+                   false,
+                   hiveSpec,
+                   /*outputLayout=*/{},
+                   serdeKind)
+               .planNode();
+    ASSERT_EQ("-- PartitionedOutput[1]\n", plan->toString());
+    ASSERT_EQ(
+        fmt::format(
+            "-- PartitionedOutput[1][partitionFunction: HIVE((1, 2) buckets: 4) with 2 partitions {}] -> c0:SMALLINT, c1:INTEGER, c2:BIGINT\n",
+            serdeKind),
+        plan->toString(true, false));
+  }
 }
 
 TEST_F(PlanNodeToStringTest, localMerge) {
@@ -662,12 +696,43 @@ TEST_F(PlanNodeToStringTest, localMerge) {
 }
 
 TEST_F(PlanNodeToStringTest, exchange) {
-  auto plan =
-      PlanBuilder().exchange(ROW({"a", "b"}, {BIGINT(), VARCHAR()})).planNode();
+  for (auto serdeKind : std::vector<VectorSerde::Kind>{
+           VectorSerde::Kind::kPresto,
+           VectorSerde::Kind::kCompactRow,
+           VectorSerde::Kind::kUnsafeRow}) {
+    SCOPED_TRACE(fmt::format("serdeKind: {}", serdeKind));
 
-  ASSERT_EQ("-- Exchange[0]\n", plan->toString());
-  ASSERT_EQ(
-      "-- Exchange[0][] -> a:BIGINT, b:VARCHAR\n", plan->toString(true, false));
+    auto plan = PlanBuilder()
+                    .exchange(ROW({"a", "b"}, {BIGINT(), VARCHAR()}), serdeKind)
+                    .planNode();
+
+    ASSERT_EQ("-- Exchange[0]\n", plan->toString());
+    ASSERT_EQ(
+        fmt::format("-- Exchange[0][{}] -> a:BIGINT, b:VARCHAR\n", serdeKind),
+        plan->toString(true, false));
+  }
+}
+
+TEST_F(PlanNodeToStringTest, mergeExchange) {
+  for (auto serdeKind : std::vector<VectorSerde::Kind>{
+           VectorSerde::Kind::kPresto,
+           VectorSerde::Kind::kCompactRow,
+           VectorSerde::Kind::kUnsafeRow}) {
+    SCOPED_TRACE(fmt::format("serdeKind: {}", serdeKind));
+
+    auto plan =
+        PlanBuilder()
+            .mergeExchange(
+                ROW({"a", "b"}, {BIGINT(), VARCHAR()}), {"a"}, serdeKind)
+            .planNode();
+
+    ASSERT_EQ("-- MergeExchange[0]\n", plan->toString());
+    ASSERT_EQ(
+        fmt::format(
+            "-- MergeExchange[0][a ASC NULLS LAST, {}] -> a:BIGINT, b:VARCHAR\n",
+            serdeKind),
+        plan->toString(true, false));
+  }
 }
 
 TEST_F(PlanNodeToStringTest, tableScan) {
@@ -690,7 +755,7 @@ TEST_F(PlanNodeToStringTest, tableScan) {
         "range filters: [(discount, DoubleRange: [0.050000, 0.070000] no nulls), "
         "(quantity, DoubleRange: (-inf, 24.000000) no nulls), "
         "(shipdate, BytesRange: [1994-01-01, 1994-12-31] no nulls)], "
-        "remaining filter: (not(like(ROW[\"comment\"],\"%special%request%\")))] "
+        "remaining filter: (not(like(ROW[\"comment\"],%special%request%)))] "
         "-> discount:DOUBLE, quantity:DOUBLE, shipdate:VARCHAR, comment:VARCHAR\n";
     ASSERT_EQ(output, plan->toString(true, false));
   }
@@ -701,7 +766,7 @@ TEST_F(PlanNodeToStringTest, tableScan) {
             .planNode();
 
     ASSERT_EQ(
-        "-- TableScan[0][table: hive_table, remaining filter: (not(like(ROW[\"comment\"],\"%special%request%\")))] "
+        "-- TableScan[0][table: hive_table, remaining filter: (not(like(ROW[\"comment\"],%special%request%)))] "
         "-> discount:DOUBLE, quantity:DOUBLE, shipdate:VARCHAR, comment:VARCHAR\n",
         plan->toString(true, false));
   }
@@ -862,37 +927,57 @@ TEST_F(PlanNodeToStringTest, rowNumber) {
       plan->toString(true, false));
 }
 
-TEST_F(PlanNodeToStringTest, topNRowNumber) {
+namespace {
+void topNRankPlanNodeToStringTest(std::string_view function) {
   auto rowType = ROW({"a", "b"}, {BIGINT(), VARCHAR()});
   auto plan = PlanBuilder()
                   .tableScan(rowType)
-                  .topNRowNumber({}, {"a DESC"}, 10, false)
+                  .topNRank(function, {}, {"a DESC"}, 10, false)
                   .planNode();
 
   ASSERT_EQ("-- TopNRowNumber[1]\n", plan->toString());
   ASSERT_EQ(
-      "-- TopNRowNumber[1][order by (a DESC NULLS LAST) limit 10] -> a:BIGINT, b:VARCHAR\n",
+      fmt::format(
+          "-- TopNRowNumber[1][{} order by (a DESC NULLS LAST) limit 10] -> a:BIGINT, b:VARCHAR\n",
+          function),
       plan->toString(true, false));
 
   plan = PlanBuilder()
              .tableScan(rowType)
-             .topNRowNumber({}, {"a DESC"}, 10, true)
+             .topNRank(function, {}, {"a DESC"}, 10, true)
              .planNode();
 
   ASSERT_EQ("-- TopNRowNumber[1]\n", plan->toString());
   ASSERT_EQ(
-      "-- TopNRowNumber[1][order by (a DESC NULLS LAST) limit 10] -> a:BIGINT, b:VARCHAR, row_number:BIGINT\n",
+      fmt::format(
+          "-- TopNRowNumber[1][{} order by (a DESC NULLS LAST) limit 10] -> a:BIGINT, b:VARCHAR, row_number:BIGINT\n",
+          function),
       plan->toString(true, false));
 
   plan = PlanBuilder()
              .tableScan(rowType)
-             .topNRowNumber({"a"}, {"b"}, 10, false)
+             .topNRank(function, {"a"}, {"b"}, 10, false)
              .planNode();
 
   ASSERT_EQ("-- TopNRowNumber[1]\n", plan->toString());
   ASSERT_EQ(
-      "-- TopNRowNumber[1][partition by (a) order by (b ASC NULLS LAST) limit 10] -> a:BIGINT, b:VARCHAR\n",
+      fmt::format(
+          "-- TopNRowNumber[1][{} partition by (a) order by (b ASC NULLS LAST) limit 10] -> a:BIGINT, b:VARCHAR\n",
+          function),
       plan->toString(true, false));
+}
+} // namespace
+
+TEST_F(PlanNodeToStringTest, topNRowNumber) {
+  topNRankPlanNodeToStringTest("row_number");
+}
+
+TEST_F(PlanNodeToStringTest, topNRank) {
+  topNRankPlanNodeToStringTest("rank");
+}
+
+TEST_F(PlanNodeToStringTest, topNDenseRank) {
+  topNRankPlanNodeToStringTest("dense_rank");
 }
 
 TEST_F(PlanNodeToStringTest, markDistinct) {
@@ -906,3 +991,6 @@ TEST_F(PlanNodeToStringTest, markDistinct) {
       "-- MarkDistinct[1][a, b] -> a:VARCHAR, b:BIGINT, c:BIGINT, marker:BOOLEAN\n",
       op->toString(true, false));
 }
+
+} // namespace
+} // namespace facebook::velox::exec

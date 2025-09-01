@@ -17,13 +17,11 @@
 #pragma once
 
 #include "velox/expression/CastHooks.h"
+#include "velox/expression/ExprConstants.h"
 #include "velox/expression/FunctionCallToSpecialForm.h"
 #include "velox/expression/SpecialForm.h"
 
 namespace facebook::velox::exec {
-
-constexpr folly::StringPiece kCast = "cast";
-constexpr folly::StringPiece kTryCast = "try_cast";
 
 /// Custom operator for casts from and to custom types.
 class CastOperator {
@@ -52,6 +50,16 @@ class CastOperator {
       const TypePtr& resultType,
       VectorPtr& result) const = 0;
 
+  virtual void castTo(
+      const BaseVector& input,
+      exec::EvalCtx& context,
+      const SelectivityVector& rows,
+      const TypePtr& resultType,
+      VectorPtr& result,
+      const std::shared_ptr<CastHooks>& /* hooks */) const {
+    castTo(input, context, rows, resultType, result);
+  }
+
   /// Casts a vector of the custom type to another type. This function should
   /// not throw when processing input rows, but report errors via
   /// context.setError().
@@ -77,15 +85,16 @@ class CastExpr : public SpecialForm {
       TypePtr type,
       ExprPtr&& expr,
       bool trackCpuUsage,
-      bool nullOnFailure,
+      bool isTryCast,
       std::shared_ptr<CastHooks> hooks)
       : SpecialForm(
+            SpecialFormKind::kCast,
             type,
             std::vector<ExprPtr>({expr}),
-            nullOnFailure ? kTryCast.data() : kCast.data(),
+            isTryCast ? expression::kTryCast : expression::kCast,
             false /* supportsFlatNoNullsFastPath */,
             trackCpuUsage),
-        nullOnFailure_(nullOnFailure),
+        isTryCast_(isTryCast),
         hooks_(std::move(hooks)) {}
 
   void evalSpecialForm(
@@ -293,12 +302,12 @@ class CastExpr : public SpecialForm {
       exec::EvalCtx& context,
       const BaseVector& input);
 
-  bool nullOnFailure() const {
-    return nullOnFailure_;
+  bool isTryCast() const {
+    return isTryCast_;
   }
 
   bool setNullInResultAtError() const {
-    return nullOnFailure() && inTopLevel;
+    return isTryCast() && (inTopLevel || hooks_->applyTryCastRecursively());
   }
 
   CastOperatorPtr getCastOperator(const TypePtr& type);
@@ -306,7 +315,7 @@ class CastExpr : public SpecialForm {
   // Custom cast operators for to and from top-level as well as nested types.
   folly::F14FastMap<std::string, CastOperatorPtr> castOperators_;
 
-  bool nullOnFailure_;
+  bool isTryCast_;
   std::shared_ptr<CastHooks> hooks_;
 
   bool inTopLevel = false;

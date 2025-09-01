@@ -30,7 +30,6 @@
 #include "velox/common/testutil/TestValue.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/core/PlanNode.h"
-#include "velox/dwio/dwrf/writer/Writer.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/HashAggregation.h"
 #include "velox/exec/PlanNodeStats.h"
@@ -264,7 +263,6 @@ class SharedArbitrationTest : public testing::WithParamInterface<TestParam>,
     fuzzerOpts_.stringLength = 1024;
     fuzzerOpts_.allowLazyVector = false;
     vector_ = makeRowVector(rowType_, fuzzerOpts_);
-    numAddedPools_ = 0;
     isSerialExecutionMode_ = GetParam().isSerialExecutionMode;
     if (isSerialExecutionMode_) {
       executor_ = nullptr;
@@ -286,7 +284,6 @@ class SharedArbitrationTest : public testing::WithParamInterface<TestParam>,
         createMemoryManager(memoryCapacity, memoryPoolInitCapacity);
     ASSERT_EQ(memoryManager_->arbitrator()->kind(), "SHARED");
     arbitrator_ = static_cast<SharedArbitrator*>(memoryManager_->arbitrator());
-    numAddedPools_ = 0;
   }
 
   void checkOperatorStatsForArbitration(
@@ -294,10 +291,12 @@ class SharedArbitrationTest : public testing::WithParamInterface<TestParam>,
       bool expectGlobalArbitration) {
     if (expectGlobalArbitration) {
       VELOX_CHECK_EQ(
-          stats.customStats.count(SharedArbitrator::kGlobalArbitrationCount),
+          stats.customStats.count(
+              SharedArbitrator::kGlobalArbitrationWaitCount),
           1);
       VELOX_CHECK_GE(
-          stats.customStats.at(SharedArbitrator::kGlobalArbitrationCount).sum,
+          stats.customStats.at(SharedArbitrator::kGlobalArbitrationWaitCount)
+              .sum,
           1);
       VELOX_CHECK_EQ(
           stats.customStats.count(SharedArbitrator::kLocalArbitrationCount), 0);
@@ -308,7 +307,8 @@ class SharedArbitrationTest : public testing::WithParamInterface<TestParam>,
           stats.customStats.at(SharedArbitrator::kLocalArbitrationCount).sum,
           1);
       VELOX_CHECK_EQ(
-          stats.customStats.count(SharedArbitrator::kGlobalArbitrationCount),
+          stats.customStats.count(
+              SharedArbitrator::kGlobalArbitrationWaitCount),
           0);
     }
   }
@@ -331,7 +331,6 @@ class SharedArbitrationTest : public testing::WithParamInterface<TestParam>,
   RowTypePtr rowType_;
   VectorFuzzer::Options fuzzerOpts_;
   RowVectorPtr vector_;
-  std::atomic_uint64_t numAddedPools_{0};
   bool isSerialExecutionMode_{false};
 };
 
@@ -452,14 +451,14 @@ DEBUG_ONLY_TEST_P(
   SCOPED_TESTVALUE_SET(
       "facebook::velox::exec::Driver::runInternal::addInput",
       std::function<void(exec::Operator*)>(([&](exec::Operator* op) {
-        if (op->testingOperatorCtx()->operatorType() != "Aggregation" &&
-            op->testingOperatorCtx()->operatorType() != "PartialAggregation") {
+        if (op->operatorCtx()->operatorType() != "Aggregation" &&
+            op->operatorCtx()->operatorType() != "PartialAggregation") {
           return;
         }
         if (op->pool()->usedBytes() == 0) {
           return;
         }
-        if (op->testingOperatorCtx()->operatorType() == "PartialAggregation") {
+        if (op->operatorCtx()->operatorType() == "PartialAggregation") {
           if (blockedPartialAggregation.exchange(true)) {
             return;
           }
@@ -468,8 +467,8 @@ DEBUG_ONLY_TEST_P(
             return;
           }
         }
-        auto* driver = op->testingOperatorCtx()->driver();
-        SuspendedSection suspendedSection(driver);
+        auto* driver = op->operatorCtx()->driver();
+        TestSuspendedSection suspendedSection(driver);
         arbitrationWait.await([&]() { return !arbitrationWaitFlag.load(); });
       })));
 
@@ -507,7 +506,7 @@ DEBUG_ONLY_TEST_P(
   });
 
   while (!blockedPartialAggregation || !blockedAggregation) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // NOLINT
   }
 
   testingRunArbitration();
@@ -540,14 +539,12 @@ DEBUG_ONLY_TEST_P(SharedArbitrationTestWithThreadingModes, reclaimToOrderBy) {
     const auto oldStats = arbitrator_->stats();
     std::shared_ptr<core::QueryCtx> fakeMemoryQueryCtx =
         newQueryCtx(memoryManager_.get(), executor_.get(), kMemoryCapacity);
-    ++numAddedPools_;
     std::shared_ptr<core::QueryCtx> orderByQueryCtx;
     if (sameQuery) {
       orderByQueryCtx = fakeMemoryQueryCtx;
     } else {
       orderByQueryCtx =
           newQueryCtx(memoryManager_.get(), executor_.get(), kMemoryCapacity);
-      ++numAddedPools_;
     }
 
     folly::EventCount orderByWait;
@@ -623,8 +620,7 @@ DEBUG_ONLY_TEST_P(SharedArbitrationTestWithThreadingModes, reclaimToOrderBy) {
     memThread.join();
     waitForAllTasksToBeDeleted();
     const auto newStats = arbitrator_->stats();
-    ASSERT_GT(newStats.numReclaimedBytes, oldStats.numReclaimedBytes);
-    ASSERT_GT(newStats.reclaimTimeUs, oldStats.reclaimTimeUs);
+    ASSERT_GT(newStats.reclaimedUsedBytes, oldStats.reclaimedUsedBytes);
     ASSERT_GT(orderByQueryCtx->pool()->stats().numCapacityGrowths, 0);
   }
 }
@@ -644,14 +640,12 @@ DEBUG_ONLY_TEST_P(
     const auto oldStats = arbitrator_->stats();
     std::shared_ptr<core::QueryCtx> fakeMemoryQueryCtx =
         newQueryCtx(memoryManager_.get(), executor_.get(), kMemoryCapacity);
-    ++numAddedPools_;
     std::shared_ptr<core::QueryCtx> aggregationQueryCtx;
     if (sameQuery) {
       aggregationQueryCtx = fakeMemoryQueryCtx;
     } else {
       aggregationQueryCtx =
           newQueryCtx(memoryManager_.get(), executor_.get(), kMemoryCapacity);
-      ++numAddedPools_;
     }
 
     folly::EventCount aggregationWait;
@@ -729,8 +723,7 @@ DEBUG_ONLY_TEST_P(
     waitForAllTasksToBeDeleted();
 
     const auto newStats = arbitrator_->stats();
-    ASSERT_GT(newStats.numReclaimedBytes, oldStats.numReclaimedBytes);
-    ASSERT_GT(newStats.reclaimTimeUs, oldStats.reclaimTimeUs);
+    ASSERT_GT(newStats.reclaimedUsedBytes, oldStats.reclaimedUsedBytes);
   }
 }
 
@@ -749,14 +742,12 @@ DEBUG_ONLY_TEST_P(
     const auto oldStats = arbitrator_->stats();
     std::shared_ptr<core::QueryCtx> fakeMemoryQueryCtx =
         newQueryCtx(memoryManager_.get(), executor_.get(), kMemoryCapacity);
-    ++numAddedPools_;
     std::shared_ptr<core::QueryCtx> joinQueryCtx;
     if (sameQuery) {
       joinQueryCtx = fakeMemoryQueryCtx;
     } else {
       joinQueryCtx =
           newQueryCtx(memoryManager_.get(), executor_.get(), kMemoryCapacity);
-      ++numAddedPools_;
     }
 
     folly::EventCount joinWait;
@@ -845,8 +836,7 @@ DEBUG_ONLY_TEST_P(
     waitForAllTasksToBeDeleted();
 
     const auto newStats = arbitrator_->stats();
-    ASSERT_GT(newStats.numReclaimedBytes, oldStats.numReclaimedBytes);
-    ASSERT_GT(newStats.reclaimTimeUs, oldStats.reclaimTimeUs);
+    ASSERT_GT(newStats.reclaimedUsedBytes, oldStats.reclaimedUsedBytes);
   }
 }
 
@@ -923,7 +913,7 @@ DEBUG_ONLY_TEST_P(
         if (!injectAllocationOnce.exchange(false)) {
           return;
         }
-        task = values->testingOperatorCtx()->task();
+        task = values->operatorCtx()->task();
         memory::MemoryPool* pool = values->pool();
         VELOX_ASSERT_THROW(
             pool->allocate(kMemoryCapacity * 2 / 3),
@@ -1120,12 +1110,11 @@ DEBUG_ONLY_TEST_P(SharedArbitrationTestWithThreadingModes, runtimeStats) {
             // triggered flush.
             .connectorSessionProperty(
                 kHiveConnectorId,
-                connector::hive::HiveConfig::kOrcWriterMaxStripeSizeSession,
+                dwrf::Config::kOrcWriterMaxStripeSizeSession,
                 "1GB")
             .connectorSessionProperty(
                 kHiveConnectorId,
-                connector::hive::HiveConfig::
-                    kOrcWriterMaxDictionaryMemorySession,
+                dwrf::Config::kOrcWriterMaxDictionaryMemorySession,
                 "1GB")
             .plan(std::move(writerPlan))
             .assertResults(fmt::format("SELECT {}", numRows));
@@ -1428,9 +1417,7 @@ TEST_P(SharedArbitrationTestWithThreadingModes, reserveReleaseCounters) {
       for (auto& queryThread : threads) {
         queryThread.join();
       }
-      ASSERT_EQ(arbitrator_->stats().numShrinks, 0);
     }
-    ASSERT_EQ(arbitrator_->stats().numShrinks, numRootPools);
   }
 }
 

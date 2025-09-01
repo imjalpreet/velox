@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 #include "velox/exec/SortedAggregations.h"
-#include "velox/common/base/RawVector.h"
+#include "velox/common/memory/RawVector.h"
 
 namespace facebook::velox::exec {
 
@@ -51,10 +51,10 @@ struct RowPointers {
   }
 
   void read(folly::Range<char**> rows) {
-    auto stream = HashStringAllocator::prepareRead(firstBlock);
+    HashStringAllocator::InputStream stream(firstBlock);
 
     for (auto i = 0; i < size; ++i) {
-      rows[i] = reinterpret_cast<char*>(stream->read<uintptr_t>());
+      rows[i] = reinterpret_cast<char*>(stream.read<uintptr_t>());
     }
   }
 };
@@ -63,7 +63,8 @@ struct RowPointers {
 SortedAggregations::SortedAggregations(
     const std::vector<const AggregateInfo*>& aggregates,
     const RowTypePtr& inputType,
-    memory::MemoryPool* pool) {
+    memory::MemoryPool* pool)
+    : pool_(pool) {
   // Collect inputs and sorting keys from all aggregates.
   std::unordered_set<column_index_t> allInputs;
   for (const auto* aggregate : aggregates) {
@@ -366,7 +367,7 @@ vector_size_t SortedAggregations::extractSingleGroup(
 void SortedAggregations::extractValues(
     folly::Range<char**> groups,
     const RowVectorPtr& result) {
-  raw_vector<int32_t> temp;
+  raw_vector<int32_t> indices(pool_);
   SelectivityVector rows;
   std::vector<char*> groupRows;
   for (const auto& [sortingSpec, aggregates] : aggregates_) {
@@ -403,6 +404,7 @@ void SortedAggregations::extractValues(
         const auto numRows =
             extractSingleGroup(groupRows, *aggregate, aggregateInputs);
         if (numRows == 0) {
+          firstInputColumn += aggregateInputs.size();
           // Mask must be false for all 'groupRows'.
           continue;
         }
@@ -431,7 +433,7 @@ void SortedAggregations::extractValues(
       aggregate->function->initializeNewGroups(
           groups.data(),
           folly::Range<const int32_t*>(
-              iota(groups.size(), temp), groups.size()));
+              iota(groups.size(), indices), groups.size()));
     }
   }
 }

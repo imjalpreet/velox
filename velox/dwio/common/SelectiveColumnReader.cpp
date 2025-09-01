@@ -50,7 +50,14 @@ SelectiveColumnReader::SelectiveColumnReader(
       requestedType_(requestedType),
       fileType_(fileType),
       formatData_(params.toFormatData(fileType, scanSpec)),
-      scanSpec_(&scanSpec) {}
+      scanSpec_(&scanSpec),
+      outputRows_(memoryPool_),
+      valueRows_(memoryPool_),
+      outerNonNullRows_(memoryPool_),
+      innerNonNullRows_(memoryPool_) {
+  scanState_.rowsCopy = raw_vector<vector_size_t>(memoryPool_);
+  scanState_.filterCache = raw_vector<uint8_t>(memoryPool_);
+}
 
 void SelectiveColumnReader::filterRowGroups(
     uint64_t rowGroupSize,
@@ -65,7 +72,7 @@ const std::vector<SelectiveColumnReader*>& SelectiveColumnReader::children()
   return empty;
 }
 
-void SelectiveColumnReader::seekTo(vector_size_t offset, bool readsNullsOnly) {
+void SelectiveColumnReader::seekTo(int64_t offset, bool readsNullsOnly) {
   if (offset == readOffset_) {
     return;
   }
@@ -455,7 +462,7 @@ void SelectiveColumnReader::resetFilterCaches() {
 }
 
 void SelectiveColumnReader::addParentNulls(
-    int32_t firstRowInNulls,
+    int64_t firstRowInNulls,
     const uint64_t* nulls,
     const RowSet& rows) {
   const int32_t firstNullIndex =
@@ -466,8 +473,8 @@ void SelectiveColumnReader::addParentNulls(
 }
 
 void SelectiveColumnReader::addSkippedParentNulls(
-    vector_size_t from,
-    vector_size_t to,
+    int64_t from,
+    int64_t to,
     int32_t numNulls) {
   auto rowsPerRowGroup = formatData_->rowsPerRowGroup();
   if (rowsPerRowGroup.has_value() &&

@@ -28,10 +28,12 @@ velox_link_libraries(
     velox_type_fbhive
     velox_vector
     Folly::folly
-    fmt::fmt)
+    fmt::fmt
+)
 
 add_subdirectory(common)
 add_subdirectory(catalog)
 add_subdirectory(dwrf)
 add_subdirectory(orc)
 add_subdirectory(parquet)
+add_subdirectory(text)

@@ -21,11 +21,10 @@ namespace facebook::velox::wave {
 using namespace connector::hive;
 
 WaveHiveDataSource::WaveHiveDataSource(
-    const std::shared_ptr<HiveTableHandle>& hiveTableHandle,
+    const HiveTableHandlePtr& hiveTableHandle,
     const std::shared_ptr<common::ScanSpec>& scanSpec,
     const RowTypePtr& readerOutputType,
-    std::unordered_map<std::string, std::shared_ptr<HiveColumnHandle>>*
-        partitionKeys,
+    std::unordered_map<std::string, HiveColumnHandlePtr>* partitionKeys,
     FileHandleFactory* fileHandleFactory,
     folly::Executor* executor,
     const connector::ConnectorQueryCtx* connectorQueryCtx,
@@ -60,6 +59,7 @@ void WaveHiveDataSource::setFromDataSource(
   split_ = std::move(source->split_);
   if (source->splitReader_ && source->splitReader_->emptySplit()) {
     runtimeStats_.skippedSplits += source->runtimeStats_.skippedSplits;
+    runtimeStats_.processedSplits += source->runtimeStats_.processedSplits;
     runtimeStats_.skippedSplitBytes += source->runtimeStats_.skippedSplitBytes;
     return;
   }
@@ -166,11 +166,10 @@ void WaveHiveDataSource::registerConnector() {
           ->newConnector("wavemock", config, nullptr);
   connector::registerConnector(hiveConnector);
   connector::hive::HiveDataSource::registerWaveDelegateHook(
-      [](const std::shared_ptr<HiveTableHandle>& hiveTableHandle,
+      [](const HiveTableHandlePtr& hiveTableHandle,
          const std::shared_ptr<common::ScanSpec>& scanSpec,
          const RowTypePtr& readerOutputType,
-         std::unordered_map<std::string, std::shared_ptr<HiveColumnHandle>>*
-             partitionKeys,
+         std::unordered_map<std::string, HiveColumnHandlePtr>* partitionKeys,
          FileHandleFactory* fileHandleFactory,
          folly::Executor* executor,
          const connector::ConnectorQueryCtx* connectorQueryCtx,
@@ -182,7 +181,6 @@ void WaveHiveDataSource::registerConnector() {
             hiveTableHandle,
             scanSpec,
             readerOutputType,
-
             partitionKeys,
             fileHandleFactory,
             executor,

@@ -17,16 +17,22 @@
 #include "velox/expression/EvalCtx.h"
 #include <exception>
 #include "velox/common/testutil/TestValue.h"
-#include "velox/core/QueryConfig.h"
-#include "velox/expression/Expr.h"
 #include "velox/expression/PeeledEncoding.h"
+#include "velox/vector/LazyVector.h"
 
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
 
-EvalCtx::EvalCtx(core::ExecCtx* execCtx, ExprSet* exprSet, const RowVector* row)
-    : execCtx_(execCtx), exprSet_(exprSet), row_(row) {
+EvalCtx::EvalCtx(
+    core::ExecCtx* execCtx,
+    ExprSet* exprSet,
+    const RowVector* row,
+    bool lazyDereference)
+    : execCtx_(execCtx),
+      exprSet_(exprSet),
+      row_(row),
+      lazyDereference_(lazyDereference) {
   // TODO Change the API to replace raw pointers with non-const references.
   // Sanity check inputs to prevent crashes.
   VELOX_CHECK_NOT_NULL(execCtx);
@@ -44,8 +50,12 @@ EvalCtx::EvalCtx(core::ExecCtx* execCtx, ExprSet* exprSet, const RowVector* row)
 }
 
 EvalCtx::EvalCtx(core::ExecCtx* execCtx)
-    : execCtx_(execCtx), exprSet_(nullptr), row_(nullptr) {
+    : execCtx_(execCtx),
+      exprSet_(nullptr),
+      row_(nullptr),
+      lazyDereference_(false) {
   VELOX_CHECK_NOT_NULL(execCtx);
+  inputFlatNoNulls_ = false;
 }
 
 void EvalCtx::saveAndReset(ContextSaver& saver, const SelectivityVector& rows) {
@@ -113,7 +123,6 @@ void EvalCtx::copyError(
     vector_size_t fromIndex,
     EvalErrorsPtr& to,
     vector_size_t toIndex) const {
-  const auto fromSize = from.size();
   if (from.hasErrorAt(fromIndex)) {
     ensureErrorsVectorSize(to, toIndex + 1);
     to->copyError(from, fromIndex, toIndex);
@@ -294,6 +303,7 @@ const VectorPtr& EvalCtx::getField(int32_t index) const {
 VectorPtr EvalCtx::ensureFieldLoaded(
     int32_t index,
     const SelectivityVector& rows) {
+  VELOX_CHECK(!lazyDereference_);
   auto field = getField(index);
   if (isLazyNotLoaded(*field)) {
     const auto& rowsToLoad = isFinalSelection_ ? rows : *finalSelection_;
@@ -333,7 +343,7 @@ VectorPtr extendSizeByWrappingInDictionary(
   VELOX_DCHECK(
       !vector->type()->isPrimitiveType(), "Only used for complex types.");
   BufferPtr indices = allocateIndices(targetSize, context.pool());
-  auto rawIndices = indices->asMutable<vector_size_t>();
+  auto* rawIndices = indices->asMutable<vector_size_t>();
   // Only fill in indices for existing rows in the vector.
   std::iota(rawIndices, rawIndices + currentSize, 0);
   // A nulls buffer is required otherwise wrapInDictionary() can return a
@@ -377,7 +387,7 @@ void EvalCtx::addNulls(
   // or do nothing otherwise.
   if (result->isConstantEncoding() && result->isNullAt(0)) {
     if (result->size() < rows.end()) {
-      if (result.unique()) {
+      if (result.use_count() == 1) {
         result->resize(rows.end());
       } else {
         result =
@@ -389,7 +399,7 @@ void EvalCtx::addNulls(
 
   auto currentSize = result->size();
   auto targetSize = rows.end();
-  if (!result.unique() || !result->isNullsWritable()) {
+  if (result.use_count() != 1 || !result->isNullsWritable()) {
     if (result->type()->isPrimitiveType()) {
       if (currentSize < targetSize) {
         resizePrimitiveTypeVectors(result, targetSize, context);

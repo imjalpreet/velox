@@ -17,7 +17,7 @@
 #pragma once
 
 #include <algorithm>
-#include "velox/common/base/RawVector.h"
+#include "velox/common/memory/RawVector.h"
 #include "velox/common/process/ProcessBase.h"
 #include "velox/dwio/common/StreamUtil.h"
 
@@ -105,7 +105,7 @@ inline void processFixedFilter(
     ; /* no values passed, no action*/
   } else if (word == simd::allSetBitMask<T>()) {
     loadIndices(0).store_unaligned(filterHits + numValues);
-    if (is16) {
+    if (is16 && width > kIndexLaneCount) {
       // If 16 values in 'values', copy the next 8x 32 bit indices.
       loadIndices(1).store_unaligned(filterHits + numValues + kIndexLaneCount);
     }
@@ -162,7 +162,7 @@ void fixedWidthScan(
     dwio::common::SeekableInputStream& input,
     const char*& bufferStart,
     const char*& bufferEnd,
-    TFilter& filter,
+    const TFilter& filter,
     THook& hook) {
   constexpr int32_t kWidth = xsimd::batch<T>::size;
   constexpr bool is16 = sizeof(T) == 2;
@@ -264,10 +264,16 @@ void fixedWidthScan(
                 }
                 if (!hasFilter) {
                   if (hasHook) {
+#if defined(__GNUC__) && !defined(__clang__)
+                    T values2[values.size];
+                    values.store_unaligned(values2);
+                    hook.addValues(scatterRows + rowIndex, values2, kWidth);
+#else
                     hook.addValues(
                         scatterRows + rowIndex,
                         reinterpret_cast<T*>(&values),
                         kWidth);
+#endif
                   } else {
                     if (scatter) {
                       scatterDense<T>(
@@ -322,10 +328,9 @@ void fixedWidthScan(
                 }
                 if (!hasFilter) {
                   if (hasHook) {
-                    hook.addValues(
-                        scatterRows + rowIndex,
-                        reinterpret_cast<T*>(&values),
-                        width);
+                    T values2[values.size];
+                    values.store_unaligned(values2);
+                    hook.addValues(scatterRows + rowIndex, values2, width);
                   } else {
                     if (scatter) {
                       scatterDense<T>(
@@ -468,7 +473,7 @@ void processFixedWidthRun(
     T* values,
     int32_t* filterHits,
     int32_t& numValues,
-    TFilter& filter,
+    const TFilter& filter,
     THook& hook) {
   constexpr int32_t kWidth = xsimd::batch<T>::size;
   constexpr bool hasFilter =

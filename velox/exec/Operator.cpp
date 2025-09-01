@@ -19,9 +19,8 @@
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/Driver.h"
-#include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/OperatorUtils.h"
-#include "velox/exec/Task.h"
+#include "velox/exec/TraceUtil.h"
 #include "velox/expression/Expr.h"
 
 using facebook::velox::common::testutil::TestValue;
@@ -68,9 +67,13 @@ OperatorCtx::createConnectorQueryCtx(
       planNodeId,
       driverCtx_->driverId,
       driverCtx_->queryConfig().sessionTimezone(),
-      task->getCancellationToken());
+      driverCtx_->queryConfig().adjustTimestampToTimezone(),
+      task->getCancellationToken(),
+      task->queryCtx()->fsTokenProvider());
   connectorQueryCtx->setSelectiveNimbleReaderEnabled(
       driverCtx_->queryConfig().selectiveNimbleReaderEnabled());
+  connectorQueryCtx->setRowSizeTrackingEnabled(
+      driverCtx_->queryConfig().rowSizeTrackingEnabled());
   return connectorQueryCtx;
 }
 
@@ -88,6 +91,9 @@ Operator::Operator(
           operatorType)),
       outputType_(std::move(outputType)),
       spillConfig_(std::move(spillConfig)),
+      dryRun_(
+          operatorCtx_->driverCtx()->traceConfig().has_value() &&
+          operatorCtx_->driverCtx()->traceConfig()->dryRun),
       stats_(OperatorStats{
           operatorId,
           driverCtx->pipelineId,
@@ -104,10 +110,84 @@ void Operator::maybeSetReclaimer() {
       Operator::MemoryReclaimer::create(operatorCtx_->driverCtx(), this));
 }
 
+void Operator::maybeSetTracer() {
+  const auto& traceConfig = operatorCtx_->driverCtx()->traceConfig();
+  if (!traceConfig.has_value()) {
+    return;
+  }
+
+  const auto nodeId = planNodeId();
+  if (traceConfig->queryNodeId.empty() || traceConfig->queryNodeId != nodeId) {
+    return;
+  }
+
+  auto& tracedOpMap = operatorCtx_->driverCtx()->tracedOperatorMap;
+  if (const auto iter = tracedOpMap.find(operatorId());
+      iter != tracedOpMap.end()) {
+    LOG(WARNING) << "Operator " << iter->first << " with type of "
+                 << operatorType() << ", plan node " << nodeId
+                 << " might be the auxiliary operator of " << iter->second
+                 << " which has the same operator id";
+    return;
+  }
+  tracedOpMap.emplace(operatorId(), operatorType());
+
+  if (!trace::canTrace(operatorType())) {
+    VELOX_UNSUPPORTED("{} does not support tracing", operatorType());
+  }
+
+  const auto pipelineId = operatorCtx_->driverCtx()->pipelineId;
+  const auto driverId = operatorCtx_->driverCtx()->driverId;
+  LOG(INFO) << "Trace input for operator type: " << operatorType()
+            << ", operator id: " << operatorId() << ", pipeline: " << pipelineId
+            << ", driver: " << driverId << ", task: " << taskId();
+  const auto opTraceDirPath = trace::getOpTraceDirectory(
+      traceConfig->queryTraceDir, planNodeId(), pipelineId, driverId);
+  trace::createTraceDirectory(
+      opTraceDirPath,
+      operatorCtx_->driverCtx()->queryConfig().opTraceDirectoryCreateConfig());
+
+  if (dynamic_cast<SourceOperator*>(this) != nullptr) {
+    setupSplitTracer(opTraceDirPath);
+  } else {
+    setupInputTracer(opTraceDirPath);
+  }
+}
+
+void Operator::traceInput(const RowVectorPtr& input) {
+  if (FOLLY_UNLIKELY(inputTracer_ != nullptr)) {
+    inputTracer_->write(input);
+  }
+}
+
+void Operator::finishTrace() {
+  VELOX_CHECK(inputTracer_ == nullptr || splitTracer_ == nullptr);
+  if (inputTracer_ != nullptr) {
+    inputTracer_->finish();
+  }
+
+  if (splitTracer_ != nullptr) {
+    splitTracer_->finish();
+  }
+}
+
 std::vector<std::unique_ptr<Operator::PlanNodeTranslator>>&
 Operator::translators() {
   static std::vector<std::unique_ptr<PlanNodeTranslator>> translators;
   return translators;
+}
+
+void Operator::setupInputTracer(const std::string& opTraceDirPath) {
+  inputTracer_ = std::make_unique<trace::OperatorTraceInputWriter>(
+      this,
+      opTraceDirPath,
+      memory::traceMemoryPool(),
+      operatorCtx_->driverCtx()->traceConfig()->updateAndCheckTraceLimitCB);
+}
+
+void Operator::setupSplitTracer(const std::string& opTraceDirPath) {
+  splitTracer_ =
+      std::make_unique<trace::OperatorTraceSplitWriter>(this, opTraceDirPath);
 }
 
 // static
@@ -153,6 +233,7 @@ void Operator::initialize() {
       pool()->name());
   initialized_ = true;
   maybeSetReclaimer();
+  maybeSetTracer();
 }
 
 // static
@@ -260,6 +341,16 @@ OperatorStats Operator::stats(bool clear) {
   return stats;
 }
 
+void Operator::close() {
+  input_ = nullptr;
+  results_.clear();
+  recordSpillStats();
+  finishTrace();
+
+  // Release the unused memory reservation on close.
+  operatorCtx_->pool()->release();
+}
+
 vector_size_t Operator::outputBatchRows(
     std::optional<uint64_t> averageRowSize) const {
   const auto& queryConfig = operatorCtx_->task()->queryCtx()->queryConfig();
@@ -279,13 +370,18 @@ vector_size_t Operator::outputBatchRows(
   return std::max<vector_size_t>(batchSize, 1);
 }
 
+void Operator::loadLazyReclaimable(RowVectorPtr& vector) {
+  ReclaimableSectionGuard guard(this);
+  vector->loadedVector();
+}
+
 void Operator::recordBlockingTime(uint64_t start, BlockingReason reason) {
   uint64_t now =
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::high_resolution_clock::now().time_since_epoch())
           .count();
   const auto wallNanos = (now - start) * 1000;
-  const auto blockReason = blockingReasonToString(reason).substr(1);
+  const auto blockReason = BlockingReasonName::toName(reason).substr(1);
 
   auto lockedStats = stats_.wlock();
   lockedStats->blockedWallNanos += wallNanos;
@@ -297,7 +393,7 @@ void Operator::recordBlockingTime(uint64_t start, BlockingReason reason) {
 }
 
 void Operator::recordSpillStats() {
-  const auto lockedSpillStats = spillStats_.wlock();
+  const auto lockedSpillStats = spillStats_->wlock();
   auto lockedStats = stats_.wlock();
   lockedStats->spilledInputBytes += lockedSpillStats->spilledInputBytes;
   lockedStats->spilledBytes += lockedSpillStats->spilledBytes;
@@ -316,6 +412,13 @@ void Operator::recordSpillStats() {
         kSpillSortTime,
         RuntimeCounter{
             static_cast<int64_t>(lockedSpillStats->spillSortTimeNanos),
+            RuntimeCounter::Unit::kNanos});
+  }
+  if (lockedSpillStats->spillExtractVectorTimeNanos != 0) {
+    lockedStats->addRuntimeStat(
+        kSpillExtractVectorTime,
+        RuntimeCounter{
+            static_cast<int64_t>(lockedSpillStats->spillExtractVectorTimeNanos),
             RuntimeCounter::Unit::kNanos});
   }
   if (lockedSpillStats->spillSerializationTimeNanos != 0) {
@@ -420,9 +523,8 @@ column_index_t exprToChannel(
   if (dynamic_cast<const core::ConstantTypedExpr*>(expr)) {
     return kConstantChannel;
   }
-  VELOX_FAIL(
+  VELOX_UNREACHABLE(
       "Expression must be field access or constant, got: {}", expr->toString());
-  return 0; // not reached.
 }
 
 std::vector<column_index_t> calculateOutputChannels(
@@ -479,6 +581,8 @@ void OperatorStats::add(const OperatorStats& other) {
 
   finishTiming.add(other.finishTiming);
 
+  isBlockedTiming.add(other.isBlockedTiming);
+
   backgroundTiming.add(other.backgroundTiming);
 
   memoryStats.add(other.memoryStats);
@@ -488,6 +592,14 @@ void OperatorStats::add(const OperatorStats& other) {
       runtimeStats.insert(std::make_pair(name, stats));
     } else {
       runtimeStats.at(name).merge(stats);
+    }
+  }
+
+  for (const auto& [name, exprStats] : other.expressionStats) {
+    if (UNLIKELY(expressionStats.count(name) == 0)) {
+      expressionStats.insert(std::make_pair(name, exprStats));
+    } else {
+      expressionStats.at(name).add(exprStats);
     }
   }
 
@@ -527,6 +639,7 @@ void OperatorStats::clear() {
   memoryStats.clear();
 
   runtimeStats.clear();
+  expressionStats.clear();
 
   numDrivers = 0;
   spilledInputBytes = 0;
@@ -536,6 +649,25 @@ void OperatorStats::clear() {
   spilledFiles = 0;
 
   dynamicFilterStats.clear();
+}
+
+bool Operator::isDraining() const {
+  return operatorCtx_->driver() != nullptr &&
+      operatorCtx_->driver()->isDraining(operatorId());
+}
+
+bool Operator::hasDrained() const {
+  return operatorCtx_->driver()->hasDrained(operatorId());
+}
+
+void Operator::finishDrain() {
+  VELOX_CHECK(isDraining());
+  operatorCtx_->driver()->finishDrain(operatorId());
+  VELOX_CHECK(!isDraining());
+}
+
+bool Operator::shouldDropOutput() const {
+  return operatorCtx_->driver()->shouldDropOutput(operatorId());
 }
 
 std::unique_ptr<memory::MemoryReclaimer> Operator::MemoryReclaimer::create(
@@ -555,7 +687,7 @@ void Operator::MemoryReclaimer::enterArbitration() {
     return;
   }
 
-  Driver* const runningDriver = driverThreadCtx->driverCtx.driver;
+  Driver* const runningDriver = driverThreadCtx->driverCtx()->driver;
   if (!FLAGS_velox_memory_pool_capacity_transfer_across_tasks) {
     if (auto opDriver = ensureDriver()) {
       // NOTE: the current running driver might not be the driver of the
@@ -585,7 +717,7 @@ void Operator::MemoryReclaimer::leaveArbitration() noexcept {
     // is not issued from a driver thread.
     return;
   }
-  Driver* const runningDriver = driverThreadCtx->driverCtx.driver;
+  Driver* const runningDriver = driverThreadCtx->driverCtx()->driver;
   if (!FLAGS_velox_memory_pool_capacity_transfer_across_tasks) {
     if (auto opDriver = ensureDriver()) {
       VELOX_CHECK_EQ(
@@ -636,11 +768,8 @@ uint64_t Operator::MemoryReclaimer::reclaim(
       "facebook::velox::exec::Operator::MemoryReclaimer::reclaim", pool);
 
   // NOTE: we can't reclaim memory from an operator which is under
-  // non-reclaimable section, except for HashBuild operator. If it is HashBuild
-  // operator, we allow it to enter HashBuild::reclaim because there is a good
-  // chance we can release some unused reserved memory even if it's in
   // non-reclaimable section.
-  if (op_->nonReclaimableSection_ && op_->operatorType() != "HashBuild") {
+  if (op_->nonReclaimableSection_) {
     // TODO: reduce the log frequency if it is too verbose.
     ++stats.numNonReclaimableAttempts;
     RECORD_METRIC_VALUE(kMetricMemoryNonReclaimableCount);
@@ -659,12 +788,6 @@ uint64_t Operator::MemoryReclaimer::reclaim(
         {
           memory::ScopedReclaimedBytesRecorder recoder(pool, &reclaimedBytes);
           op_->reclaim(targetBytes, stats);
-        }
-        // NOTE: the parallel hash build is running at the background thread
-        // pool which won't stop during memory reclamation so the operator's
-        // memory usage might increase in such case. memory usage.
-        if (op_->operatorType() == "HashBuild") {
-          reclaimedBytes = std::max<int64_t>(0, reclaimedBytes);
         }
         VELOX_CHECK_GE(
             reclaimedBytes,
